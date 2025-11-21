@@ -7,8 +7,6 @@ app = Flask(__name__, template_folder='dashboard')
 def dashboard():
     return render_template('dashboard.html')
 
-print('hi')
-
 if __name__ == '__main__':
     app.run(debug=True)
 
