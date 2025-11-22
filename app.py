@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 import hashlib
 import hmac
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, render_template
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
@@ -33,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
-app = Flask(__name__)
+app = Flask(__name__, template_folder='dashboard')
 
 # Configuration
 MAX_CONTENT_LENGTH = 314572800  # 300 MB in bytes
@@ -274,6 +274,12 @@ def add_security_headers(response):
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     return response
+
+
+@app.route('/', methods=['GET'])
+def dashboard():
+    """Dashboard for testing the compression API."""
+    return render_template('dashboard.html')
 
 
 @app.route('/health', methods=['GET'])
