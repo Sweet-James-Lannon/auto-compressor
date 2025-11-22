@@ -217,10 +217,16 @@
         <h1>SJ PDF Compressor <span id="health-indicator"></span></h1>
         <p class="subtitle">Lossless PDF compression with cryptographic verification</p>
 
+        <!-- API Token section temporarily disabled for testing
         <div class="auth-section">
             <label for="api-token">API Token</label>
             <input type="password" id="api-token" placeholder="Enter your API token">
             <small>Required for compression. Token is stored in browser session only.</small>
+        </div>
+        -->
+        <div class="auth-section" style="background: #fff3cd;">
+            <label style="color: #856404;">Testing Mode Enabled</label>
+            <small style="color: #856404;">Authentication temporarily disabled. Re-enable in app.py and dashboard.html when done testing.</small>
         </div>
 
         <div class="upload-zone" id="upload-zone">
@@ -330,8 +336,8 @@
             }
         });
 
-        // API token input
-        apiTokenInput.addEventListener('input', updateCompressButton);
+        // API token input - TEMPORARILY DISABLED FOR TESTING
+        // apiTokenInput.addEventListener('input', updateCompressButton);
 
         function handleFileSelect(file) {
             if (!file.name.toLowerCase().endsWith('.pdf')) {
@@ -358,14 +364,18 @@
         }
 
         function updateCompressButton() {
-            compressBtn.disabled = !(selectedFile && apiTokenInput.value.trim());
+            // TEMPORARILY DISABLED FOR TESTING - Only require file selection, not token
+            compressBtn.disabled = !selectedFile;
+            // compressBtn.disabled = !(selectedFile && apiTokenInput.value.trim());
         }
 
         // Compress button
         compressBtn.addEventListener('click', compressPDF);
 
         async function compressPDF() {
-            if (!selectedFile || !apiTokenInput.value.trim()) return;
+            if (!selectedFile) return;
+            // TEMPORARILY DISABLED FOR TESTING - No token required
+            // if (!selectedFile || !apiTokenInput.value.trim()) return;
 
             const formData = new FormData();
             formData.append('pdf', selectedFile);
@@ -391,9 +401,10 @@
             try {
                 const response = await fetch('/compress', {
                     method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${apiTokenInput.value.trim()}`
-                    },
+                    // TEMPORARILY DISABLED FOR TESTING - No Authorization header
+                    // headers: {
+                    //     'Authorization': `Bearer ${apiTokenInput.value.trim()}`
+                    // },
                     body: formData
                 });
 
