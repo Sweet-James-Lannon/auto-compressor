@@ -40,7 +40,7 @@ app = Flask(__name__, template_folder='dashboard')
 # Configuration
 MAX_CONTENT_LENGTH = 314572800  # 300 MB in bytes
 UPLOAD_FOLDER = Path("./uploads")
-FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '30'))  # Default 30 seconds for law firm security
+FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '600'))  # Default 10 minutes - large PDFs need time to compress
 ALLOWED_EXTENSIONS = {'.pdf'}
 PDF_MAGIC_BYTES = b'%PDF-'
 API_TOKEN = os.environ.get('API_TOKEN')  # REQUIRED - must be set in production
@@ -440,6 +440,12 @@ def compress_endpoint():
         matter_id = request.form.get('matter_id', None)
         user_email = request.form.get('user_email', None)
 
+        # Extract compression level (iLovePDF-style: low, recommended, extreme)
+        compression_level = request.form.get('compression_level', 'recommended')
+        if compression_level not in ['low', 'recommended', 'extreme']:
+            compression_level = 'recommended'
+        logger.info(f"[{request_id}] Compression level: {compression_level}")
+
         # Generate secure UUID filename
         uuid_filename = generate_uuid_filename()
         input_file_path = UPLOAD_FOLDER / uuid_filename
@@ -471,13 +477,17 @@ def compress_endpoint():
         logger.info(f"[{request_id}] Starting compression: {uuid_filename}")
 
         try:
-            result = compress_pdf(str(input_file_path), working_dir=UPLOAD_FOLDER)
+            result = compress_pdf(
+                str(input_file_path),
+                working_dir=UPLOAD_FOLDER,
+                compression_level=compression_level
+            )
         except FileNotFoundError as e:
             logger.error(f"[{request_id}] File not found: {e}")
             return create_error_response("File processing error", 400)
         except CompressionError as e:
             logger.error(f"[{request_id}] Compression error: {e}")
-            return create_error_response("PDF compression failed", 500)
+            return create_error_response(f"PDF compression failed: {str(e)}", 500)
         except VerificationError as e:
             logger.error(f"[{request_id}] Verification error: {e}")
             return create_error_response("PDF verification failed", 500)
@@ -547,6 +557,151 @@ def compress_endpoint():
         # Files will be auto-deleted after FILE_RETENTION_SECONDS
         # No immediate cleanup to allow inspection if needed
         pass
+
+
+@app.route('/api/compress', methods=['POST'])
+def api_compress():
+    """
+    POST /api/compress - JSON-based compression endpoint for Salesforce integration.
+
+    Request:
+        - Content-Type: application/json
+        - Header: X-API-KEY: <api_key>
+        - Body: {
+            "file_name": "document.pdf",
+            "file_type": "application/pdf",
+            "file_content_base64": "<base64-encoded-pdf>",
+            "compression_level": "recommended"  // optional: low, recommended, extreme
+          }
+
+    Response (200):
+        {
+            "success": true,
+            "original_mb": 115.2,
+            "compressed_mb": 81.5,
+            "reduction_percent": 29.4,
+            "compressed_file_base64": "JVBERi0x...",
+            "original_sha256": "abc123...",
+            "compressed_sha256": "def456...",
+            "compression_method": "ghostscript"
+        }
+    """
+    # Generate request ID for tracking
+    request_id = str(uuid.uuid4())[:8]
+    client_ip = request.remote_addr or 'unknown'
+
+    logger.info(f"[{request_id}] Salesforce API compress request from {client_ip}")
+
+    # Validate API key
+    api_key = request.headers.get('X-API-KEY')
+    expected_key = os.environ.get('API_KEY')
+
+    if expected_key and api_key != expected_key:
+        logger.warning(f"[{request_id}] Invalid API key")
+        return jsonify({"success": False, "error": "Invalid API key"}), 401
+
+    # Check rate limit
+    if not check_rate_limit(client_ip):
+        logger.warning(f"[{request_id}] Rate limit exceeded for {client_ip}")
+        return jsonify({
+            "success": False,
+            "error": "Rate limit exceeded. Please try again later.",
+            "request_id": request_id
+        }), 429
+
+    input_file_path = None
+    output_file_path = None
+
+    try:
+        # Parse JSON body
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "Invalid JSON body"}), 400
+
+        file_name = data.get('file_name', 'document.pdf')
+        file_content_b64 = data.get('file_content_base64')
+        compression_level = data.get('compression_level', 'recommended')
+
+        if not file_content_b64:
+            return jsonify({"success": False, "error": "Missing file_content_base64"}), 400
+
+        # Validate compression level
+        if compression_level not in ['low', 'recommended', 'extreme']:
+            compression_level = 'recommended'
+
+        logger.info(f"[{request_id}] File: {file_name}, Level: {compression_level}")
+
+        # Decode base64 to bytes
+        try:
+            pdf_bytes = base64.b64decode(file_content_b64)
+        except Exception as e:
+            return jsonify({"success": False, "error": "Invalid base64 encoding"}), 400
+
+        # Validate PDF magic bytes
+        if not pdf_bytes[:5] == b'%PDF-':
+            return jsonify({"success": False, "error": "Invalid PDF file: missing PDF signature"}), 400
+
+        # Save to temp file
+        uuid_filename = generate_uuid_filename()
+        input_file_path = UPLOAD_FOLDER / uuid_filename
+
+        with open(input_file_path, 'wb') as f:
+            f.write(pdf_bytes)
+        track_file(input_file_path)
+
+        file_size_mb = input_file_path.stat().st_size / (1024 * 1024)
+        logger.info(f"[{request_id}] Uploaded file size: {file_size_mb:.2f}MB")
+
+        # Compress PDF
+        try:
+            result = compress_pdf(
+                str(input_file_path),
+                working_dir=UPLOAD_FOLDER,
+                compression_level=compression_level
+            )
+        except CompressionError as e:
+            logger.error(f"[{request_id}] Compression error: {e}")
+            return jsonify({"success": False, "error": f"PDF compression failed: {str(e)}"}), 500
+        except Exception as e:
+            logger.exception(f"[{request_id}] Unexpected compression error")
+            return jsonify({"success": False, "error": "Internal server error"}), 500
+
+        output_file_path = Path(result['output_path'])
+        track_file(output_file_path)
+
+        # Read compressed PDF and encode to base64
+        with open(output_file_path, 'rb') as f:
+            compressed_pdf_bytes = f.read()
+        compressed_pdf_b64 = base64.b64encode(compressed_pdf_bytes).decode('utf-8')
+
+        # Build response
+        response_data = {
+            "success": True,
+            "original_mb": result['original_size_mb'],
+            "compressed_mb": result['compressed_size_mb'],
+            "reduction_percent": result.get('reduction_percent', 0),
+            "compressed_file_base64": compressed_pdf_b64,
+            "original_sha256": result['original_hash'],
+            "compressed_sha256": result['compressed_hash'],
+            "compression_method": result.get('compression_method', 'unknown'),
+            "compression_level": compression_level,
+            "request_id": request_id
+        }
+
+        # Add note if no compression was possible
+        if result.get('note'):
+            response_data['note'] = result['note']
+
+        logger.info(
+            f"[{request_id}] API compression complete: {result['original_size_mb']:.2f}MB → "
+            f"{result['compressed_size_mb']:.2f}MB ({result.get('reduction_percent', 0):.1f}% reduction)"
+        )
+
+        return jsonify(response_data), 200
+
+    except Exception as e:
+        logger.exception(f"[{request_id}] Unexpected error in API compress endpoint")
+        return jsonify({"success": False, "error": "Internal server error"}), 500
 
 
 # Start cleanup daemon thread

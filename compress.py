@@ -220,9 +220,14 @@ def compress_with_qpdf(input_path: Path, output_path: Path) -> bool:
         raise CompressionError(f"qpdf compression failed: {str(e)}")
 
 
-def compress_pdf(input_path: str, working_dir: Optional[Path] = None) -> Dict[str, any]:
+def compress_pdf(
+    input_path: str,
+    working_dir: Optional[Path] = None,
+    compression_level: str = "recommended"
+) -> Dict[str, any]:
     """
     Main compression pipeline with intelligent method selection.
+    Follows iLovePDF-style compression levels.
 
     Tries methods in order:
     1. Ghostscript (best for scanned PDFs with JPEG images) - 10-90% reduction
@@ -231,6 +236,10 @@ def compress_pdf(input_path: str, working_dir: Optional[Path] = None) -> Dict[st
     Args:
         input_path: Path to input PDF file
         working_dir: Optional working directory (defaults to input file's directory)
+        compression_level: "low", "recommended", or "extreme"
+            - low: Minimal compression, preserve quality (pikepdf only)
+            - recommended: Balanced compression and quality
+            - extreme: Maximum compression, may reduce image quality
 
     Returns:
         Dictionary with:
@@ -245,6 +254,10 @@ def compress_pdf(input_path: str, working_dir: Optional[Path] = None) -> Dict[st
         CompressionError: If all compression methods fail
         FileNotFoundError: If input file doesn't exist
     """
+    # Validate compression level
+    if compression_level not in ["low", "recommended", "extreme"]:
+        logger.warning(f"Invalid compression level '{compression_level}', using 'recommended'")
+        compression_level = "recommended"
     input_path = Path(input_path)
 
     if not input_path.exists():
@@ -264,6 +277,7 @@ def compress_pdf(input_path: str, working_dir: Optional[Path] = None) -> Dict[st
     logger.info("COMPRESSION DIAGNOSTICS")
     logger.info(f"Input file: {input_path.name}")
     logger.info(f"Input size: {get_file_size_mb(input_path):.2f} MB")
+    logger.info(f"Compression level: {compression_level}")
 
     # Check tool availability
     try:
@@ -292,43 +306,58 @@ def compress_pdf(input_path: str, working_dir: Optional[Path] = None) -> Dict[st
         logger.info(f"Original: {original_size:.2f}MB, SHA-256: {original_hash[:16]}...")
 
         # Step 2: Try Ghostscript compression first (best for scanned PDFs)
-        logger.info("Step 2: Attempting Ghostscript compression")
-        try:
-            # Import the Ghostscript module if available
-            from compress_ghostscript import compress_legal_document, is_ghostscript_available
+        # Skip Ghostscript for "low" compression level (lossless only)
+        gs_output = working_dir / f"{input_path.stem}_compressed.pdf"
+        ghostscript_success = False
 
-            if is_ghostscript_available():
-                gs_output = working_dir / f"{input_path.stem}_compressed.pdf"
-                success, message = compress_legal_document(input_path, gs_output)
+        if compression_level != "low":
+            logger.info(f"Step 2: Attempting Ghostscript compression (level: {compression_level})")
+            try:
+                # Import the Ghostscript module if available
+                from compress_ghostscript import compress_legal_document, is_ghostscript_available
 
-                if success and gs_output.exists():
-                    # Ghostscript succeeded, calculate results
-                    compressed_hash = calculate_sha256(gs_output)
-                    compressed_size = get_file_size_mb(gs_output)
-                    reduction = ((original_size - compressed_size) / original_size) * 100
+                if is_ghostscript_available():
+                    success, message = compress_legal_document(
+                        input_path, gs_output, compression_level=compression_level
+                    )
 
-                    logger.info(f"Ghostscript compression successful: {reduction:.1f}% reduction")
+                    if success and gs_output.exists():
+                        compressed_size = get_file_size_mb(gs_output)
 
-                    # Return early with Ghostscript results
-                    return {
-                        "original_hash": original_hash,
-                        "compressed_hash": compressed_hash,
-                        "original_size_mb": round(original_size, 2),
-                        "compressed_size_mb": round(compressed_size, 2),
-                        "output_path": str(gs_output),
-                        "compression_method": "ghostscript",
-                        "reduction_percent": round(reduction, 1),
-                        "success": True
-                    }
+                        # SIZE GUARD: Only use Ghostscript output if it's actually smaller
+                        if compressed_size < original_size:
+                            compressed_hash = calculate_sha256(gs_output)
+                            reduction = ((original_size - compressed_size) / original_size) * 100
+
+                            logger.info(f"Ghostscript compression successful: {reduction:.1f}% reduction")
+                            ghostscript_success = True
+
+                            # Return early with Ghostscript results
+                            return {
+                                "original_hash": original_hash,
+                                "compressed_hash": compressed_hash,
+                                "original_size_mb": round(original_size, 2),
+                                "compressed_size_mb": round(compressed_size, 2),
+                                "output_path": str(gs_output),
+                                "compression_method": "ghostscript",
+                                "reduction_percent": round(reduction, 1),
+                                "compression_level": compression_level,
+                                "success": True
+                            }
+                        else:
+                            logger.warning(f"Ghostscript made file LARGER ({original_size:.2f}MB → {compressed_size:.2f}MB), trying pikepdf")
+                            gs_output.unlink()  # Delete the larger file
+                    else:
+                        logger.info(f"Ghostscript failed: {message}, falling back to pikepdf")
                 else:
-                    logger.info(f"Ghostscript failed: {message}, falling back to pikepdf")
-            else:
-                logger.info("Ghostscript not available, using pikepdf")
+                    logger.info("Ghostscript not available, using pikepdf")
 
-        except ImportError:
-            logger.info("Ghostscript module not found, using pikepdf")
-        except Exception as e:
-            logger.warning(f"Ghostscript attempt failed: {e}, falling back to pikepdf")
+            except ImportError:
+                logger.info("Ghostscript module not found, using pikepdf")
+            except Exception as e:
+                logger.warning(f"Ghostscript attempt failed: {e}, falling back to pikepdf")
+        else:
+            logger.info("Step 2: Skipping Ghostscript (compression_level='low' = lossless only)")
 
         # Step 3: Fallback to pikepdf compression
         logger.info("Step 3: pikepdf optimization (fallback)")
@@ -357,10 +386,34 @@ def compress_pdf(input_path: str, working_dir: Optional[Path] = None) -> Dict[st
                 final_output.unlink()
             temp_pikepdf.rename(final_output)
 
-        # Step 5: Calculate compressed hash
+        # Step 5: Calculate compressed hash and size
         logger.info("Step 5: Calculating compressed SHA-256")
-        compressed_hash = calculate_sha256(final_output)
         compressed_size = get_file_size_mb(final_output)
+        logger.info(f"Compressed size: {compressed_size:.2f}MB")
+
+        # SIZE GUARD: If compressed file is larger, return original instead
+        if compressed_size >= original_size:
+            logger.warning(f"Compression made file larger or same size ({original_size:.2f}MB → {compressed_size:.2f}MB)")
+            logger.info("Returning original file instead of larger compressed version")
+
+            # Copy original to output location
+            final_output.unlink()
+            shutil.copy2(input_path, final_output)
+
+            return {
+                "original_hash": original_hash,
+                "compressed_hash": original_hash,  # Same as original
+                "original_size_mb": round(original_size, 2),
+                "compressed_size_mb": round(original_size, 2),
+                "output_path": str(final_output),
+                "compression_method": "none",
+                "reduction_percent": 0.0,
+                "compression_level": compression_level,
+                "success": True,
+                "note": "File already optimized - no further compression possible"
+            }
+
+        compressed_hash = calculate_sha256(final_output)
         logger.info(f"Compressed: {compressed_size:.2f}MB, SHA-256: {compressed_hash[:16]}...")
 
         # Step 6: Lossless verification (for pikepdf/qpdf path)
@@ -383,6 +436,7 @@ def compress_pdf(input_path: str, working_dir: Optional[Path] = None) -> Dict[st
             "output_path": str(final_output),
             "compression_method": "pikepdf_qpdf" if qpdf_used else "pikepdf",
             "reduction_percent": round(ratio, 1),
+            "compression_level": compression_level,
             "success": True
         }
 

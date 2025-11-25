@@ -103,26 +103,38 @@ def compress_with_ghostscript(
         if not gs_cmd:
             return False, "Ghostscript command not found"
 
-        # Build Ghostscript command
+        # Build Ghostscript command with optimized settings for JPEG2000 PDFs
+        # Key: Force JPEG encoding (DCTEncode) to convert JPEG2000 which GS handles poorly
         cmd = [
             gs_cmd,
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.4",
             f"-dPDFSETTINGS={pdf_setting}",
             "-dNOPAUSE",
-            "-dQUIET",
             "-dBATCH",
-            "-dDetectDuplicateImages",  # Remove duplicate images
-            "-dCompressFonts=true",      # Compress fonts
-            "-dSubsetFonts=true",        # Subset fonts
-            f"-dJPEGQ={quality}",        # JPEG quality setting
-            f"-r{image_dpi}",            # Resolution for downsampling
+            # Image handling - force JPEG encoding (converts JPEG2000 to JPEG)
+            "-dAutoFilterColorImages=false",
+            "-dColorImageFilter=/DCTEncode",
+            "-dAutoFilterGrayImages=false",
+            "-dGrayImageFilter=/DCTEncode",
+            # Downsampling settings - threshold 1.0 forces downsampling
             "-dDownsampleColorImages=true",
-            f"-dColorImageDownsampleThreshold={1.0 if image_dpi < 300 else 1.5}",
+            "-dColorImageDownsampleType=/Bicubic",
+            f"-dColorImageResolution={image_dpi}",
+            "-dColorImageDownsampleThreshold=1.0",
             "-dDownsampleGrayImages=true",
-            f"-dGrayImageDownsampleThreshold={1.0 if image_dpi < 300 else 1.5}",
+            "-dGrayImageDownsampleType=/Bicubic",
+            f"-dGrayImageResolution={image_dpi}",
+            "-dGrayImageDownsampleThreshold=1.0",
             "-dDownsampleMonoImages=true",
-            "-dMonoImageDownsampleThreshold=2.0",
+            "-dMonoImageDownsampleType=/Bicubic",
+            f"-dMonoImageResolution={image_dpi}",
+            "-dMonoImageDownsampleThreshold=1.0",
+            # Quality and optimization
+            "-dDetectDuplicateImages=true",
+            "-dCompressFonts=true",
+            "-dSubsetFonts=true",
+            f"-dJPEGQ={quality}",
             f"-sOutputFile={output_path}",
             str(input_path)
         ]
@@ -131,12 +143,16 @@ def compress_with_ghostscript(
         logger.info(f"  - Input: {input_path.name} ({input_path.stat().st_size / 1024 / 1024:.2f} MB)")
         logger.info(f"  - Quality: {quality}%, DPI: {image_dpi}, Preset: {preset}")
 
+        # Dynamic timeout based on file size (10 seconds per MB, minimum 10 minutes)
+        file_size_mb = input_path.stat().st_size / (1024 * 1024)
+        timeout_seconds = max(600, int(file_size_mb * 10))
+
         # Run Ghostscript with timeout protection
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=600  # 10 minute timeout for large files
+            timeout=timeout_seconds
         )
 
         if result.returncode != 0:
@@ -169,29 +185,49 @@ def compress_with_ghostscript(
 
 def compress_legal_document(
     input_path: Path,
-    output_path: Path
+    output_path: Path,
+    compression_level: str = "recommended"
 ) -> Tuple[bool, str]:
     """
     Specialized compression for legal documents with medical exhibits.
     Uses optimized settings for scanned documents with OCR text.
+    Handles JPEG2000 encoded PDFs by converting to JPEG.
 
     Args:
         input_path: Input PDF path
         output_path: Output PDF path
+        compression_level: "low", "recommended", or "extreme"
 
     Returns:
         Tuple of (success: bool, message: str)
     """
-    # Aggressive settings for legal documents (Salesforce API use case):
-    # - Quality 72: More aggressive compression, still readable
-    # - DPI 120: Lower DPI for better file size, sufficient for screen viewing
-    # - Preset "ebook": Good balance for document viewing
+    # Settings based on compression level (iLovePDF-style)
+    level_settings = {
+        "low": {
+            "quality": 95,    # High quality, minimal compression
+            "image_dpi": 200,
+            "preset": "ebook"
+        },
+        "recommended": {
+            "quality": 85,    # Good balance of quality and size
+            "image_dpi": 150,
+            "preset": "ebook"
+        },
+        "extreme": {
+            "quality": 72,    # Aggressive compression for maximum size reduction
+            "image_dpi": 72,  # 72 DPI - tested to give best results for large PDFs
+            "preset": "ebook"
+        }
+    }
+
+    settings = level_settings.get(compression_level, level_settings["recommended"])
+
     return compress_with_ghostscript(
         input_path=input_path,
         output_path=output_path,
-        quality=72,      # More aggressive for better compression
-        image_dpi=120,   # Lower DPI, sufficient for screen viewing
-        preset="ebook"   # Optimized for document viewing
+        quality=settings["quality"],
+        image_dpi=settings["image_dpi"],
+        preset=settings["preset"]
     )
 
 
