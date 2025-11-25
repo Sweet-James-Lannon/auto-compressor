@@ -146,14 +146,16 @@ def compress_with_pikepdf(input_path: Path, output_path: Path) -> None:
             # Remove unreferenced resources (fonts, images, etc.)
             pdf.remove_unreferenced_resources()
 
-            # Save with nuclear compression settings
-            # Note: cannot use both normalize_content and linearize together
+            # Save with optimized compression settings
+            # linearize=False removes web optimization overhead for downloaded files
+            # recompress_flate=True recompresses streams with better settings
             pdf.save(
                 output_path,
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
-                linearize=True,
+                linearize=False,
                 compress_streams=True,
-                stream_decode_level=pikepdf.StreamDecodeLevel.generalized
+                stream_decode_level=pikepdf.StreamDecodeLevel.none,
+                recompress_flate=True
             )
 
         logger.info(f"pikepdf: {get_file_size_mb(input_path):.2f}MB → {get_file_size_mb(output_path):.2f}MB")
@@ -256,6 +258,26 @@ def compress_pdf(input_path: str, working_dir: Optional[Path] = None) -> Dict[st
         working_dir = input_path.parent
     else:
         working_dir = Path(working_dir)
+
+    # Diagnostic logging - helps debug compression method selection
+    logger.info("=" * 60)
+    logger.info("COMPRESSION DIAGNOSTICS")
+    logger.info(f"Input file: {input_path.name}")
+    logger.info(f"Input size: {get_file_size_mb(input_path):.2f} MB")
+
+    # Check tool availability
+    try:
+        from compress_ghostscript import is_ghostscript_available, get_ghostscript_version
+        gs_available = is_ghostscript_available()
+        gs_version = get_ghostscript_version() if gs_available else "N/A"
+        logger.info(f"Ghostscript available: {gs_available} (version: {gs_version})")
+    except ImportError:
+        logger.info("Ghostscript module not available")
+        gs_available = False
+
+    qpdf_available = shutil.which("qpdf") is not None
+    logger.info(f"qpdf available: {qpdf_available}")
+    logger.info("=" * 60)
 
     # Create temporary file paths
     temp_pikepdf = working_dir / f"{input_path.stem}_pikepdf.pdf"

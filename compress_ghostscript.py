@@ -14,20 +14,33 @@ logger = logging.getLogger(__name__)
 
 
 def is_ghostscript_available() -> bool:
-    """Check if Ghostscript (gs) is installed."""
-    gs_path = shutil.which("gs")
-    if gs_path:
-        logger.info(f"Ghostscript found at: {gs_path}")
-        return True
-    logger.warning("Ghostscript not found in PATH")
+    """Check if Ghostscript is installed (supports Linux/Mac/Windows)."""
+    # Try common Ghostscript binary names across platforms
+    for gs_name in ["gs", "gswin64c", "gswin32c"]:
+        gs_path = shutil.which(gs_name)
+        if gs_path:
+            logger.info(f"Ghostscript found at: {gs_path}")
+            return True
+    logger.warning("Ghostscript not found in PATH (tried: gs, gswin64c, gswin32c)")
     return False
+
+
+def get_ghostscript_command() -> Optional[str]:
+    """Get the Ghostscript command for the current platform."""
+    for gs_name in ["gs", "gswin64c", "gswin32c"]:
+        if shutil.which(gs_name):
+            return gs_name
+    return None
 
 
 def get_ghostscript_version() -> Optional[str]:
     """Get Ghostscript version if available."""
+    gs_cmd = get_ghostscript_command()
+    if not gs_cmd:
+        return None
     try:
         result = subprocess.run(
-            ["gs", "--version"],
+            [gs_cmd, "--version"],
             capture_output=True,
             text=True,
             timeout=5
@@ -85,9 +98,14 @@ def compress_with_ghostscript(
 
         pdf_setting = preset_map.get(preset, "/ebook")
 
+        # Get platform-specific Ghostscript command
+        gs_cmd = get_ghostscript_command()
+        if not gs_cmd:
+            return False, "Ghostscript command not found"
+
         # Build Ghostscript command
         cmd = [
-            "gs",
+            gs_cmd,
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.4",
             f"-dPDFSETTINGS={pdf_setting}",
@@ -164,16 +182,16 @@ def compress_legal_document(
     Returns:
         Tuple of (success: bool, message: str)
     """
-    # Optimized settings for legal documents:
-    # - Quality 85: Slight JPEG compression, barely noticeable
-    # - DPI 150: Good for screen reading and OCR
-    # - Preset "legal": Balanced for text clarity
+    # Aggressive settings for legal documents (Salesforce API use case):
+    # - Quality 72: More aggressive compression, still readable
+    # - DPI 120: Lower DPI for better file size, sufficient for screen viewing
+    # - Preset "ebook": Good balance for document viewing
     return compress_with_ghostscript(
         input_path=input_path,
         output_path=output_path,
-        quality=85,      # Slightly lower for better compression
-        image_dpi=150,   # Standard for document viewing
-        preset="legal"   # Optimized for legal documents
+        quality=72,      # More aggressive for better compression
+        image_dpi=120,   # Lower DPI, sufficient for screen viewing
+        preset="ebook"   # Optimized for document viewing
     )
 
 

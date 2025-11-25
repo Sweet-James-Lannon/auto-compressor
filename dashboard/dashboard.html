@@ -337,17 +337,61 @@
         const downloadBtn = document.getElementById('download-btn');
         const healthIndicator = document.getElementById('health-indicator');
 
+        /**
+         * Safely parse JSON response, handling HTML error pages from server.
+         * @param {Response} response - Fetch Response object
+         * @returns {Promise<{data: object|null, error: string|null}>}
+         */
+        async function safeParseJson(response) {
+            const contentType = response.headers.get('content-type') || '';
+            const responseText = await response.text();
+
+            // Check if we got HTML instead of JSON (server error page)
+            if (contentType.includes('text/html') || responseText.trim().startsWith('<')) {
+                let errorMessage = 'Server returned an unexpected response';
+
+                if (response.status === 502) {
+                    errorMessage = 'Service temporarily unavailable (Bad Gateway). Please try again.';
+                } else if (response.status === 503) {
+                    errorMessage = 'Service is currently unavailable. Please try again later.';
+                } else if (response.status === 504) {
+                    errorMessage = 'Request timed out. Try a smaller file or try again later.';
+                } else if (response.status >= 500) {
+                    errorMessage = `Server error (${response.status}). Please try again later.`;
+                } else if (response.status >= 400) {
+                    errorMessage = `Request error (${response.status}). Please check your input.`;
+                }
+
+                return { data: null, error: errorMessage };
+            }
+
+            // Try to parse as JSON
+            try {
+                const data = JSON.parse(responseText);
+                return { data, error: null };
+            } catch (parseError) {
+                console.error('JSON parse error:', parseError);
+                console.error('Response text:', responseText.substring(0, 500));
+                return {
+                    data: null,
+                    error: `Failed to parse server response. Status: ${response.status}`
+                };
+            }
+        }
+
         // Check API health on load
         fetch('/health')
-            .then(res => res.json())
-            .then(data => {
-                if (data.status === 'healthy') {
+            .then(async (res) => {
+                const { data, error } = await safeParseJson(res);
+                if (data && data.status === 'healthy') {
                     healthIndicator.innerHTML = '<span class="health-indicator healthy"></span>';
                 } else {
+                    console.warn('Health check failed:', error || 'Unknown error');
                     healthIndicator.innerHTML = '<span class="health-indicator unhealthy"></span>';
                 }
             })
-            .catch(() => {
+            .catch((err) => {
+                console.error('Health check error:', err);
                 healthIndicator.innerHTML = '<span class="health-indicator unhealthy"></span>';
             });
 
@@ -457,18 +501,31 @@
                 progressBar.style.width = '100%';
                 progressBar.textContent = '100%';
 
-                const result = await response.json();
+                // Use safe JSON parsing to handle HTML error pages
+                const { data: result, error: parseError } = await safeParseJson(response);
 
-                if (response.ok && result.success) {
+                if (parseError) {
+                    throw new Error(parseError);
+                }
+
+                if (response.ok && result && result.success) {
                     compressedPdfData = result.compressed_pdf_b64;
                     displayResults(result);
                     showStatus('Compression successful!', 'success');
                 } else {
-                    throw new Error(result.error || 'Compression failed');
+                    throw new Error(result?.error || `Compression failed (HTTP ${response.status})`);
                 }
             } catch (error) {
                 clearInterval(progressInterval);
-                showStatus(`Error: ${error.message}`, 'error');
+
+                // Provide user-friendly error messages
+                let displayMessage = error.message;
+                if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+                    displayMessage = 'Network error. Please check your connection and try again.';
+                }
+
+                showStatus(`Error: ${displayMessage}`, 'error');
+                console.error('Compression error:', error);
             } finally {
                 setTimeout(() => {
                     progressDiv.style.display = 'none';

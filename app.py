@@ -270,6 +270,31 @@ def handle_internal_error(e):
     return create_error_response("Internal server error", 500)
 
 
+@app.errorhandler(502)
+def handle_bad_gateway(e):
+    """Handle bad gateway errors."""
+    return create_error_response("Service temporarily unavailable", 502)
+
+
+@app.errorhandler(503)
+def handle_service_unavailable(e):
+    """Handle service unavailable errors."""
+    return create_error_response("Service temporarily unavailable", 503)
+
+
+@app.errorhandler(504)
+def handle_gateway_timeout(e):
+    """Handle gateway timeout errors."""
+    return create_error_response("Request timed out", 504)
+
+
+@app.errorhandler(Exception)
+def handle_generic_exception(e):
+    """Catch-all handler for any unhandled exceptions."""
+    logger.exception(f"Unhandled exception: {e}")
+    return create_error_response("An unexpected error occurred", 500)
+
+
 @app.after_request
 def add_security_headers(response):
     """Add security headers to all responses."""
@@ -304,6 +329,15 @@ def health_check():
         "upload_dir_exists": UPLOAD_FOLDER.exists(),
         "upload_dir_writable": os.access(UPLOAD_FOLDER, os.W_OK) if UPLOAD_FOLDER.exists() else False,
     }
+
+    # Check Ghostscript availability
+    try:
+        from compress_ghostscript import is_ghostscript_available, get_ghostscript_version
+        health_status["ghostscript"] = is_ghostscript_available()
+        if health_status["ghostscript"]:
+            health_status["ghostscript_version"] = get_ghostscript_version() or "unknown"
+    except ImportError:
+        health_status["ghostscript"] = False
 
     # Try to get pikepdf version
     try:
@@ -478,7 +512,8 @@ def compress_endpoint():
             "compressed_sha256": result['compressed_hash'],
             "compressed_pdf_b64": compressed_pdf_b64,
             "request_id": request_id,
-            "qpdf_used": result.get('qpdf_used', False)
+            "compression_method": result.get('compression_method', 'unknown'),
+            "reduction_percent": result.get('reduction_percent', 0)
         }
 
         # Add tracking info if provided
