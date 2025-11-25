@@ -97,26 +97,6 @@ def compress_pdf(input_path: Path, output_path: Path) -> Tuple[bool, str]:
 
         logger.info(f"Result: {file_mb:.1f}MB -> {out_mb:.1f}MB ({reduction:.1f}% reduction)")
 
-        # Clean/normalize PDF with qpdf for better email compatibility
-        import shutil
-        qpdf_cmd = shutil.which("qpdf")
-        if qpdf_cmd:
-            clean_path = output_path.with_suffix('.clean.pdf')
-            try:
-                clean_result = subprocess.run([
-                    qpdf_cmd,
-                    "--linearize",  # Optimize for web/email
-                    "--object-streams=generate",
-                    str(output_path),
-                    str(clean_path)
-                ], capture_output=True, text=True, timeout=120)
-
-                if clean_result.returncode == 0 and clean_path.exists():
-                    clean_path.replace(output_path)
-                    logger.info("PDF cleaned with qpdf for email compatibility")
-            except Exception as e:
-                logger.warning(f"qpdf cleanup failed (non-fatal): {e}")
-
         return True, f"{reduction:.1f}% reduction"
 
     except subprocess.TimeoutExpired:
