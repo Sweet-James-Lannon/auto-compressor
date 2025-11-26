@@ -1,77 +1,49 @@
 # SJ PDF Compressor
 
-**Reduce PDF file sizes by up to 90% for faster uploads and lower storage costs.**
+PDF compression service for Salesforce integration. Compresses scanned documents using Ghostscript.
 
----
-
-## What It Does (The Simple Version)
-
-This service takes large PDF files (like scanned legal documents) and makes them smaller - much smaller. A 100MB file can become 10MB while keeping the document perfectly readable.
-
-**Why it matters:**
-- Faster uploads to Salesforce
-- Lower storage costs
-- Faster email attachments
-- Better performance for case workers
-
----
-
-## Quick Start
-
-### Run Locally
+## Setup
 
 ```bash
-# Clone and setup
-git clone https://github.com/Sweet-James-Lannon/auto-compressor.git
-cd auto-compressor
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate
 pip install -r requirements.txt
-
-# Run
 python app.py
 ```
 
-Open http://localhost:5005 for the web dashboard.
+Requires Ghostscript: `brew install ghostscript` (Mac) or `apt-get install ghostscript` (Linux)
 
-### Environment Variables
+## Environment Variables
 
-Create a `.env` file (optional):
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `API_TOKEN` | Bearer token for auth | None (open) |
+| `PORT` | Server port | 5005 |
+| `FILE_RETENTION_SECONDS` | Auto-cleanup interval | 600 |
 
-```env
-API_TOKEN=your-secret-token-here  # Required for Salesforce integration
-PORT=5005                         # Default: 5005
-FILE_RETENTION_SECONDS=600        # Auto-delete files after 10 minutes
+## API
+
+### POST /compress
+
+Compresses a PDF and returns the result as base64.
+
+**Headers:**
 ```
-
----
-
-## API Reference
-
-### Health Check
-
-```http
-GET /health
-```
-
-Response:
-```json
-{
-  "status": "healthy",
-  "ghostscript": true,
-  "timestamp": "2024-11-25T14:30:00.000Z"
-}
-```
-
-### Compress PDF
-
-```http
-POST /compress
-Authorization: Bearer your-api-key
+Authorization: Bearer <your-token>
 Content-Type: multipart/form-data
 ```
 
-**Request:** Upload a PDF file with field name `pdf`
+**Request (Form Data):**
+```
+pdf: <file>
+```
+
+**Request (JSON alternative):**
+```json
+{
+  "file_content_base64": "<base64-encoded-pdf>"
+}
+```
 
 **Response:**
 ```json
@@ -89,185 +61,94 @@ Content-Type: multipart/form-data
 **Error Codes:**
 - `400` - Invalid PDF or missing file
 - `401` - Missing Authorization header
-- `403` - Invalid API key
+- `403` - Invalid token
 - `413` - File too large (max 300MB)
 - `500` - Compression failed
 
-### Download File
+### GET /health
 
-```http
-GET /download/<filename>
-```
+Returns service status and Ghostscript availability.
 
-Direct file download. Files auto-delete after 10 minutes.
+### GET /download/<filename>
 
----
+Direct file download. Files auto-delete after retention period.
 
-## Integration Examples
+## Integration Guide
+
+For n8n, Salesforce, or any custom application, you need three things:
+
+| Item | Value |
+|------|-------|
+| **Endpoint URL** | `https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net/compress` |
+| **Payload** | Form data with `pdf` field, or JSON with `file_content_base64` |
+| **Auth** | Header: `Authorization: Bearer <your-token>` |
 
 ### cURL
 
 ```bash
-curl -X POST https://your-service.azurewebsites.net/compress \
-  -H "Authorization: Bearer your-api-key" \
-  -F "pdf=@document.pdf" \
-  -o response.json
-
-# Extract the compressed PDF
-cat response.json | jq -r '.compressed_pdf_b64' | base64 -d > compressed.pdf
+curl -X POST https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net/compress \
+  -H "Authorization: Bearer your-token" \
+  -F "pdf=@document.pdf"
 ```
 
-### Salesforce (Apex)
+### Python
+
+```python
+import requests
+response = requests.post(
+    "https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net/compress",
+    headers={"Authorization": "Bearer your-token"},
+    files={"pdf": open("document.pdf", "rb")}
+)
+compressed = base64.b64decode(response.json()["compressed_pdf_b64"])
+```
+
+### Salesforce Apex
 
 ```apex
 HttpRequest req = new HttpRequest();
-req.setEndpoint('https://your-service.azurewebsites.net/compress');
+req.setEndpoint('https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net/compress');
 req.setMethod('POST');
-req.setHeader('Authorization', 'Bearer ' + apiKey);
-// ... attach PDF and send
+req.setHeader('Authorization', 'Bearer ' + API_TOKEN);
+req.setHeader('Content-Type', 'application/json');
+req.setBody('{"file_content_base64": "' + EncodingUtil.base64Encode(pdfBlob) + '"}');
+
+Http http = new Http();
+HttpResponse res = http.send(req);
+String compressedBase64 = (String)JSON.deserializeUntyped(res.getBody()).get('compressed_pdf_b64');
 ```
 
----
-
-## Technical Architecture
+## Project Structure
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  Web Dashboard                   │
-│              (dashboard/dashboard.html)          │
-└─────────────────────┬───────────────────────────┘
-                      │ HTTP
-┌─────────────────────▼───────────────────────────┐
-│                   app.py                         │
-│  • Flask routes (/health, /compress, /download) │
-│  • API key authentication                        │
-│  • File upload/cleanup management                │
-└─────────────────────┬───────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────┐
-│                 compress.py                      │
-│  • Orchestrates compression                      │
-│  • Calculates metrics                            │
-│  • Smart fallback (returns original if bigger)   │
-└─────────────────────┬───────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────┐
-│            compress_ghostscript.py               │
-│  • Ghostscript subprocess wrapper                │
-│  • 72 DPI optimization for scanned docs          │
-│  • JPEG2000 → JPEG conversion                    │
-└─────────────────────┬───────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────┐
-│              Ghostscript Binary                  │
-│        (Industry-standard PDF processor)         │
-└─────────────────────────────────────────────────┘
+app.py                  # Flask routes, auth, file handling
+compress.py             # Compression orchestration
+compress_ghostscript.py # Ghostscript wrapper
+startup.sh              # Azure startup script (installs Ghostscript)
 ```
 
-### Why Ghostscript?
+### Why startup.sh?
 
-We evaluated multiple PDF compression tools:
+Azure App Service runs on a Linux container that doesn't include Ghostscript by default. The `startup.sh` script runs on each deployment to:
+1. Install Ghostscript via `apt-get`
+2. Verify the installation
+3. Start the Flask app with gunicorn
 
-| Tool | Result |
-|------|--------|
-| **Ghostscript** | Best results for scanned legal docs. Industry standard. |
-| pikepdf | Good for lossless, struggled with JPEG2000 images |
-| qpdf | Great optimizer, but Ghostscript alone performed better |
+Without this, the `/health` endpoint would return `"ghostscript": false` and compression would fail.
 
-Ghostscript is the standard tool used by PDF software worldwide. It handles our scanned legal documents better than alternatives.
+## Technical Notes
 
-### Why 72 DPI?
+- Uses 72 DPI for scanned docs (higher DPI increases size for JPEG2000)
+- Returns original file if compression makes it larger
+- 300MB max file size
+- HTTPS handled by Azure App Service
 
-Through testing, we found that 72 DPI gives the best compression for scanned documents:
+## Deployment
 
-- **72 DPI**: 29% reduction on 115MB test file ✓
-- **150 DPI**: Made files BIGGER (JPEG2000 issue)
-- **200 DPI**: Made files BIGGER
+Deployed via GitHub Actions to Azure App Service. Push to `main` triggers auto-deploy.
 
-This happens because our documents use JPEG2000 encoding. Higher DPI settings try to preserve too much detail, actually increasing file size.
-
-### Smart Fallback
-
-If compression would make a file larger (already-optimized PDFs), we return the original file instead. See `compress.py:56-69`.
-
----
-
-## Azure Deployment
-
-### Prerequisites
-
-- Azure CLI installed
-- Resource group created
-
-### Deploy
-
-```bash
-RESOURCE_GROUP="your-resource-group"
-APP_NAME="sj-pdf-compressor"
-
-# Create App Service
-az appservice plan create \
-  --name "${APP_NAME}-plan" \
-  --resource-group $RESOURCE_GROUP \
-  --sku P1V2 --is-linux
-
-az webapp create \
-  --resource-group $RESOURCE_GROUP \
-  --plan "${APP_NAME}-plan" \
-  --name $APP_NAME \
-  --runtime "PYTHON:3.11"
-
-# Set API token
-az webapp config appsettings set \
-  --resource-group $RESOURCE_GROUP \
-  --name $APP_NAME \
-  --settings API_TOKEN="your-secure-token"
-
-# Deploy
-zip -r deploy.zip . -x "*.git*" -x "venv/*" -x "__pycache__/*"
-az webapp deployment source config-zip \
-  --resource-group $RESOURCE_GROUP \
-  --name $APP_NAME \
-  --src deploy.zip
-```
-
----
-
-## Troubleshooting
-
-### "Ghostscript not installed"
-
-The health endpoint returns `"ghostscript": false`. Install Ghostscript:
-- **Mac**: `brew install ghostscript`
-- **Ubuntu**: `apt-get install ghostscript`
-- **Azure**: Already handled by `startup.sh`
-
-### "Invalid token" (403)
-
-Check that:
-1. `API_TOKEN` environment variable is set
-2. Request includes `Authorization: Bearer your-token` header
-3. Token matches exactly (no extra spaces)
-
-### Low compression ratio
-
-Some PDFs don't compress well:
-- Already-compressed PDFs may not shrink further
-- Text-only PDFs compress less than scanned images
-- The service returns the original if compression would make it larger
-
----
-
-## Security
-
-- **Authentication**: Bearer token via `API_TOKEN` environment variable
-- **Validation**: PDF magic bytes checked (`%PDF-` signature)
-- **File limits**: 300MB maximum upload size
-- **Auto-cleanup**: Files deleted after 10 minutes (configurable)
-- **Request tracking**: Unique ID per request for debugging
-
----
+Set `API_TOKEN` in Azure Portal > Configuration > Application settings.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file.
+MIT
