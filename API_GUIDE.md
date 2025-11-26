@@ -11,7 +11,7 @@ You need two things from your Azure admin:
 | Item | Example |
 |------|---------|
 | **API URL** | `https://sj-doc-compressor.azurewebsites.net/compress` |
-| **API Key** | `your-secret-api-key-here` |
+| **API Token** | `your-secret-api-token-here` |
 
 ---
 
@@ -21,7 +21,7 @@ You need two things from your Azure admin:
 
 ```
 POST /compress
-Authorization: Bearer YOUR_API_KEY
+Authorization: Bearer YOUR_API_TOKEN
 Content-Type: multipart/form-data
 
 Body: pdf file
@@ -31,12 +31,12 @@ Body: pdf file
 
 ```bash
 curl -X POST "https://sj-doc-compressor.azurewebsites.net/compress" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
   -F "pdf=@document.pdf"
 ```
 
 Replace:
-- `YOUR_API_KEY` with your actual key
+- `YOUR_API_TOKEN` with your actual key
 - `document.pdf` with your file path
 
 ---
@@ -64,7 +64,7 @@ Replace:
 | Code | Meaning | Fix |
 |------|---------|-----|
 | 401 | Missing auth header | Add `Authorization: Bearer KEY` header |
-| 403 | Wrong API key | Check your key is correct |
+| 403 | Wrong token | Check your token is correct |
 | 400 | Invalid PDF | Make sure file is a valid PDF |
 | 413 | File too big | Max size is 300MB |
 | 500 | Server error | Try again or contact support |
@@ -79,7 +79,7 @@ Replace:
 2. **URL:** `https://sj-doc-compressor.azurewebsites.net/compress`
 3. **Authentication:** Header Auth
    - Name: `Authorization`
-   - Value: `Bearer YOUR_API_KEY`
+   - Value: `Bearer YOUR_API_TOKEN`
 4. **Body Content Type:** Form-Data
 5. **Body Parameters:**
    - Name: `pdf`
@@ -112,7 +112,7 @@ return {
 public class PDFCompressor {
 
     private static final String API_URL = 'https://sj-doc-compressor.azurewebsites.net/compress';
-    private static final String API_KEY = 'YOUR_API_KEY'; // Store in Custom Metadata
+    private static final String API_TOKEN = 'YOUR_API_TOKEN'; // Store in Custom Metadata
 
     @future(callout=true)
     public static void compressPDF(Id attachmentId) {
@@ -123,7 +123,7 @@ public class PDFCompressor {
         HttpRequest req = new HttpRequest();
         req.setEndpoint(API_URL);
         req.setMethod('POST');
-        req.setHeader('Authorization', 'Bearer ' + API_KEY);
+        req.setHeader('Authorization', 'Bearer ' + API_TOKEN);
 
         // Create multipart body
         String boundary = '----WebKitFormBoundary' + String.valueOf(DateTime.now().getTime());
@@ -166,13 +166,13 @@ import requests
 import base64
 
 API_URL = "https://sj-doc-compressor.azurewebsites.net/compress"
-API_KEY = "YOUR_API_KEY"
+API_TOKEN = "YOUR_API_TOKEN"
 
 def compress_pdf(file_path):
     with open(file_path, 'rb') as f:
         response = requests.post(
             API_URL,
-            headers={"Authorization": f"Bearer {API_KEY}"},
+            headers={"Authorization": f"Bearer {API_TOKEN}"},
             files={"pdf": f}
         )
 
@@ -205,7 +205,7 @@ const FormData = require('form-data');
 const axios = require('axios');
 
 const API_URL = 'https://sj-doc-compressor.azurewebsites.net/compress';
-const API_KEY = 'YOUR_API_KEY';
+const API_TOKEN = 'YOUR_API_TOKEN';
 
 async function compressPDF(filePath) {
   const form = new FormData();
@@ -213,7 +213,7 @@ async function compressPDF(filePath) {
 
   const response = await axios.post(API_URL, form, {
     headers: {
-      'Authorization': `Bearer ${API_KEY}`,
+      'Authorization': `Bearer ${API_TOKEN}`,
       ...form.getHeaders()
     }
   });
@@ -251,7 +251,7 @@ Should return:
 
 ```bash
 curl -X POST "https://sj-doc-compressor.azurewebsites.net/compress" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
   -F "pdf=@test.pdf" \
   -o response.json
 
@@ -264,8 +264,8 @@ cat response.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(f
 ## Need Help?
 
 1. Check the health endpoint first
-2. Verify your API key is correct
+2. Verify your API token is correct
 3. Make sure your PDF file is valid (opens locally)
 4. Check file size is under 300MB
 
-Contact the Sweet James dev team for API key issues.
+Contact the Sweet James dev team for API token issues.

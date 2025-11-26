@@ -28,23 +28,23 @@ app = Flask(__name__, template_folder='dashboard')
 MAX_CONTENT_LENGTH = 314572800  # 300 MB
 UPLOAD_FOLDER = Path("./uploads")
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '600'))
-API_KEY = os.environ.get('API_KEY')
+API_TOKEN = os.environ.get('API_TOKEN')
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 
 
-def require_api_key(f):
-    """Decorator to require API key authentication via Bearer token."""
+def require_auth(f):
+    """Decorator to require Bearer token authentication."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not API_KEY:
-            return f(*args, **kwargs)  # No key configured = open access
+        if not API_TOKEN:
+            return f(*args, **kwargs)  # No token configured = open access
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({"success": False, "error": "Missing authorization"}), 401
-        if auth_header[7:] != API_KEY:
-            return jsonify({"success": False, "error": "Invalid API key"}), 403
+        if auth_header[7:] != API_TOKEN:
+            return jsonify({"success": False, "error": "Invalid token"}), 403
         return f(*args, **kwargs)
     return decorated
 
@@ -113,7 +113,7 @@ def health():
 
 
 @app.route('/compress', methods=['POST'])
-@require_api_key
+@require_auth
 def compress():
     """
     Compress a PDF file.

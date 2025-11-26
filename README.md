@@ -39,9 +39,9 @@ Open http://localhost:5005 for the web dashboard.
 Create a `.env` file (optional):
 
 ```env
-API_KEY=your-secret-key-here    # Required for Salesforce integration
-PORT=5005                        # Default: 5005
-FILE_RETENTION_SECONDS=600       # Auto-delete files after 10 minutes
+API_TOKEN=your-secret-token-here  # Required for Salesforce integration
+PORT=5005                         # Default: 5005
+FILE_RETENTION_SECONDS=600        # Auto-delete files after 10 minutes
 ```
 
 ---
@@ -217,11 +217,11 @@ az webapp create \
   --name $APP_NAME \
   --runtime "PYTHON:3.11"
 
-# Set API key
+# Set API token
 az webapp config appsettings set \
   --resource-group $RESOURCE_GROUP \
   --name $APP_NAME \
-  --settings API_KEY="your-secure-key"
+  --settings API_TOKEN="your-secure-token"
 
 # Deploy
 zip -r deploy.zip . -x "*.git*" -x "venv/*" -x "__pycache__/*"
@@ -242,12 +242,12 @@ The health endpoint returns `"ghostscript": false`. Install Ghostscript:
 - **Ubuntu**: `apt-get install ghostscript`
 - **Azure**: Already handled by `startup.sh`
 
-### "Invalid API key" (403)
+### "Invalid token" (403)
 
 Check that:
-1. `API_KEY` environment variable is set
-2. Request includes `Authorization: Bearer your-key` header
-3. Key matches exactly (no extra spaces)
+1. `API_TOKEN` environment variable is set
+2. Request includes `Authorization: Bearer your-token` header
+3. Token matches exactly (no extra spaces)
 
 ### Low compression ratio
 
@@ -260,7 +260,7 @@ Some PDFs don't compress well:
 
 ## Security
 
-- **Authentication**: Bearer token via `API_KEY` environment variable
+- **Authentication**: Bearer token via `API_TOKEN` environment variable
 - **Validation**: PDF magic bytes checked (`%PDF-` signature)
 - **File limits**: 300MB maximum upload size
 - **Auto-cleanup**: Files deleted after 10 minutes (configurable)
