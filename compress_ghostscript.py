@@ -17,7 +17,7 @@ def get_ghostscript_command() -> Optional[str]:
     return None
 
 
-def compress_pdf(input_path: Path, output_path: Path) -> Tuple[bool, str]:
+def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[bool, str]:
     """
     Compress scanned PDF using Ghostscript at 72 DPI.
 

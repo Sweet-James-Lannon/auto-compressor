@@ -46,7 +46,7 @@ def compress_pdf(
     logger.info(f"Compressing: {input_path.name} ({original_size:.1f}MB)")
 
     # Try Ghostscript compression
-    success, message = compress_ghostscript.compress_pdf(input_path, output_path)
+    success, message = compress_ghostscript.compress_pdf_with_ghostscript(input_path, output_path)
 
     if not success:
         raise RuntimeError(f"Compression failed: {message}")

@@ -14,6 +14,7 @@ from flask import Flask, jsonify, request, render_template, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from compress import compress_pdf
+from compress_ghostscript import get_ghostscript_command
 
 # Config
 logging.basicConfig(
@@ -103,7 +104,6 @@ def dashboard():
 @app.route('/health')
 def health():
     """Health check endpoint."""
-    from compress_ghostscript import get_ghostscript_command
     gs = get_ghostscript_command()
     return jsonify({
         "status": "healthy" if gs else "degraded",
