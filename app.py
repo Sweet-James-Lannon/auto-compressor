@@ -29,7 +29,7 @@ app = Flask(__name__, template_folder='dashboard')
 
 # Constants
 MAX_CONTENT_LENGTH = 314572800  # 300 MB
-UPLOAD_FOLDER = Path("./uploads")
+UPLOAD_FOLDER = Path(__file__).parent / "uploads"  # Absolute path for Azure compatibility
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
 SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 API_TOKEN = os.environ.get('API_TOKEN')
