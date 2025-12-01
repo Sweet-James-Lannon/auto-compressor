@@ -16,5 +16,6 @@ echo "Verifying installations..."
 gs --version && echo "Ghostscript installed successfully" || echo "WARNING: Ghostscript installation failed"
 
 # Start gunicorn with production settings
+# Using single worker with threads to maintain shared memory for job queue
 echo "Starting gunicorn..."
-gunicorn --bind=0.0.0.0:8000 --timeout 300 --workers 2 app:app
+gunicorn --bind=0.0.0.0:8000 --timeout 300 --workers 1 --threads 4 app:app

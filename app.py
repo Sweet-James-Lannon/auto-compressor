@@ -1,4 +1,4 @@
-"""Flask API for PDF compression. Clean, simple, working."""
+"""Flask API for PDF compression with async processing and auto-split."""
 
 import base64
 import logging
@@ -9,12 +9,14 @@ import uuid
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
+from typing import Any, Dict
 
 from flask import Flask, jsonify, request, render_template, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from compress import compress_pdf
 from compress_ghostscript import get_ghostscript_command
+import job_queue
 
 # Config
 logging.basicConfig(
@@ -28,7 +30,8 @@ app = Flask(__name__, template_folder='dashboard')
 # Constants
 MAX_CONTENT_LENGTH = 314572800  # 300 MB
 UPLOAD_FOLDER = Path("./uploads")
-FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '600'))
+FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
+SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 API_TOKEN = os.environ.get('API_TOKEN')
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
@@ -82,6 +85,67 @@ def cleanup_daemon():
 threading.Thread(target=cleanup_daemon, daemon=True).start()
 
 
+def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
+    """Process a compression job in the background.
+
+    Args:
+        job_id: The job identifier.
+        task_data: Dict containing either 'pdf_bytes' or 'download_url'.
+    """
+    try:
+        input_path = UPLOAD_FOLDER / f"{job_id}_input.pdf"
+
+        # Get PDF bytes - either from task_data or download from URL
+        if 'pdf_bytes' in task_data:
+            pdf_bytes = task_data['pdf_bytes']
+            input_path.write_bytes(pdf_bytes)
+        elif 'download_url' in task_data:
+            job_queue.download_pdf(task_data['download_url'], input_path)
+        else:
+            raise ValueError("No PDF data provided")
+
+        track_file(input_path)
+
+        # Compress with splitting enabled
+        result = compress_pdf(
+            str(input_path),
+            working_dir=UPLOAD_FOLDER,
+            split_threshold_mb=SPLIT_THRESHOLD_MB
+        )
+
+        # Track all output files
+        for path_str in result.get('output_paths', [result['output_path']]):
+            track_file(Path(path_str))
+
+        # Build download links
+        download_links = [
+            f"/download/{Path(p).name}"
+            for p in result.get('output_paths', [result['output_path']])
+        ]
+
+        job_queue.update_job(job_id, "completed", result={
+            "was_split": result.get('was_split', False),
+            "total_parts": result.get('total_parts', 1),
+            "download_links": download_links,
+            "original_mb": result['original_size_mb'],
+            "compressed_mb": result['compressed_size_mb'],
+            "reduction_percent": result['reduction_percent'],
+            "compression_method": result['compression_method'],
+            "request_id": job_id
+        })
+
+        logger.info(f"[{job_id}] Job completed: {len(download_links)} file(s)")
+
+    except Exception as e:
+        logger.exception(f"[{job_id}] Job failed: {e}")
+        job_queue.update_job(job_id, "failed", error=str(e))
+
+
+# Configure and start job queue worker
+job_queue.set_processor(process_compression_job)
+job_queue.start_worker()
+
+
 # Error handlers
 @app.errorhandler(RequestEntityTooLarge)
 def handle_large_file(e):
@@ -116,72 +180,111 @@ def health():
 @require_auth
 def compress():
     """
-    Compress a PDF file.
+    Compress a PDF file asynchronously.
 
     Accepts:
+    - application/json with 'file_download_link' (URL to download PDF)
+    - application/json with 'file_content_base64' (base64-encoded PDF)
     - multipart/form-data with 'pdf' field
-    - application/json with 'file_content_base64' field
 
-    Returns compressed PDF as base64.
+    Returns job_id for polling status. Poll /status/<job_id> for results.
     """
-    request_id = str(uuid.uuid4())[:8]
-    logger.info(f"[{request_id}] Compress request")
+    task_data: Dict[str, Any] = {}
 
-    # Parse input (multipart or JSON)
+    # Parse input
     if request.is_json:
         data = request.get_json()
-        if not data or 'file_content_base64' not in data:
-            return jsonify({"success": False, "error": "Missing file_content_base64"}), 400
-        try:
-            pdf_bytes = base64.b64decode(data['file_content_base64'])
-        except Exception:
-            return jsonify({"success": False, "error": "Invalid base64"}), 400
+        if not data:
+            return jsonify({"success": False, "error": "Empty request body"}), 400
+
+        # Option 1: URL to download PDF
+        if 'file_download_link' in data:
+            download_url = data['file_download_link']
+            if not download_url or not isinstance(download_url, str):
+                return jsonify({"success": False, "error": "Invalid file_download_link"}), 400
+            task_data['download_url'] = download_url
+            logger.info(f"Compress request with URL: {download_url[:100]}...")
+
+        # Option 2: Base64-encoded PDF
+        elif 'file_content_base64' in data:
+            try:
+                pdf_bytes = base64.b64decode(data['file_content_base64'])
+            except Exception:
+                return jsonify({"success": False, "error": "Invalid base64"}), 400
+
+            if not pdf_bytes[:5] == b'%PDF-':
+                return jsonify({"success": False, "error": "Invalid PDF file"}), 400
+
+            task_data['pdf_bytes'] = pdf_bytes
+            logger.info(f"Compress request with base64: {len(pdf_bytes) / (1024*1024):.1f}MB")
+
+        else:
+            return jsonify({
+                "success": False,
+                "error": "Missing file_download_link or file_content_base64"
+            }), 400
+
+    # Option 3: Multipart form upload
     else:
         if 'pdf' not in request.files:
             return jsonify({"success": False, "error": "Missing 'pdf' field"}), 400
         f = request.files['pdf']
         if not f.filename:
             return jsonify({"success": False, "error": "No file selected"}), 400
+
         pdf_bytes = f.read()
+        if not pdf_bytes[:5] == b'%PDF-':
+            return jsonify({"success": False, "error": "Invalid PDF file"}), 400
 
-    # Validate PDF
-    if not pdf_bytes[:5] == b'%PDF-':
-        return jsonify({"success": False, "error": "Invalid PDF file"}), 400
+        task_data['pdf_bytes'] = pdf_bytes
+        logger.info(f"Compress request with upload: {len(pdf_bytes) / (1024*1024):.1f}MB")
 
-    # Save input file
-    input_path = UPLOAD_FOLDER / f"{uuid.uuid4()}.pdf"
-    input_path.write_bytes(pdf_bytes)
-    track_file(input_path)
-
-    file_mb = len(pdf_bytes) / (1024 * 1024)
-    logger.info(f"[{request_id}] Input: {file_mb:.1f}MB")
-
-    # Compress
-    try:
-        result = compress_pdf(str(input_path), working_dir=UPLOAD_FOLDER)
-    except Exception as e:
-        logger.error(f"[{request_id}] Compression failed: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-    output_path = Path(result['output_path'])
-    track_file(output_path)
-
-    # Read and encode result
-    compressed_b64 = base64.b64encode(output_path.read_bytes()).decode()
-
-    logger.info(
-        f"[{request_id}] Done: {result['original_size_mb']}MB -> "
-        f"{result['compressed_size_mb']}MB ({result['reduction_percent']}%)"
-    )
+    # Create job and enqueue for processing
+    job_id = job_queue.create_job()
+    job_queue.enqueue(job_id, task_data)
 
     return jsonify({
         "success": True,
-        "original_mb": result['original_size_mb'],
-        "compressed_mb": result['compressed_size_mb'],
-        "reduction_percent": result['reduction_percent'],
-        "compressed_pdf_b64": compressed_b64,
-        "compression_method": result['compression_method'],
-        "request_id": request_id
+        "job_id": job_id,
+        "status_url": f"/status/{job_id}"
+    }), 202
+
+
+@app.route('/status/<job_id>', methods=['GET'])
+@require_auth
+def get_status(job_id: str):
+    """
+    Get the status of a compression job.
+
+    Args:
+        job_id: The job identifier from /compress response.
+
+    Returns:
+        Job status and results when completed.
+    """
+    job = job_queue.get_job(job_id)
+
+    if not job:
+        return jsonify({"success": False, "error": "Job not found"}), 404
+
+    if job.status == "processing":
+        return jsonify({
+            "success": True,
+            "status": "processing"
+        })
+
+    if job.status == "failed":
+        return jsonify({
+            "success": False,
+            "status": "failed",
+            "error": job.error
+        })
+
+    # Completed
+    return jsonify({
+        "success": True,
+        "status": "completed",
+        **job.result
     })
 
 
@@ -193,10 +296,23 @@ def download(filename):
     Allows downloading compressed PDFs directly without base64 encoding.
     Files are automatically cleaned up after FILE_RETENTION_SECONDS.
     """
-    file_path = UPLOAD_FOLDER / filename
+    # Security: Prevent path traversal attacks
+    from werkzeug.utils import secure_filename
+    safe_filename = secure_filename(filename)
+    if not safe_filename or safe_filename != filename:
+        return jsonify({"success": False, "error": "Invalid filename"}), 400
+
+    file_path = UPLOAD_FOLDER / safe_filename
+
+    # Extra security: Verify file is within upload folder
+    try:
+        file_path.resolve().relative_to(UPLOAD_FOLDER.resolve())
+    except ValueError:
+        return jsonify({"success": False, "error": "Invalid filename"}), 400
+
     if not file_path.exists():
         return jsonify({"success": False, "error": "File not found"}), 404
-    return send_file(file_path, as_attachment=True, download_name=filename)
+    return send_file(file_path, as_attachment=True, download_name=safe_filename)
 
 
 if __name__ == '__main__':
