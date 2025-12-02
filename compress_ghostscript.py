@@ -9,6 +9,77 @@ from typing import Tuple, Optional
 logger = logging.getLogger(__name__)
 
 
+def optimize_split_part(input_path: Path, output_path: Path) -> Tuple[bool, str]:
+    """
+    Lightweight optimization for split PDF parts - removes duplicate resources
+    without re-encoding images.
+
+    Use this for split parts where images are already compressed. The /default
+    setting preserves image quality while removing PyPDF2's duplicated resources.
+
+    Args:
+        input_path: Source PDF (split part with duplicated resources)
+        output_path: Destination for optimized PDF
+
+    Returns:
+        (success, message) tuple
+    """
+    gs_cmd = get_ghostscript_command()
+    if not gs_cmd:
+        return False, "Ghostscript not installed"
+
+    if not input_path.exists():
+        return False, f"File not found: {input_path}"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use /default - preserves quality, just de-duplicates resources
+    cmd = [
+        gs_cmd,
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        "-dPDFSETTINGS=/default",  # Preserve quality, don't re-encode
+        "-dNOPAUSE",
+        "-dBATCH",
+        "-dQUIET",
+        # Critical: Don't re-encode images, just pass them through
+        "-dPassThroughJPEGImages=true",
+        "-dPassThroughJPXImages=true",
+        # Remove duplicates
+        "-dDetectDuplicateImages=true",
+        "-dCompressFonts=true",
+        "-dSubsetFonts=true",
+        f"-sOutputFile={output_path}",
+        str(input_path)
+    ]
+
+    try:
+        file_mb = input_path.stat().st_size / (1024 * 1024)
+        timeout = max(300, int(file_mb * 5))
+
+        logger.info(f"Optimizing split part {input_path.name} ({file_mb:.1f}MB)")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+        if result.returncode != 0:
+            return False, f"Ghostscript error: {result.stderr[:200]}"
+
+        if not output_path.exists():
+            return False, "Output file not created"
+
+        out_mb = output_path.stat().st_size / (1024 * 1024)
+        reduction = ((file_mb - out_mb) / file_mb) * 100
+
+        logger.info(f"Optimized: {file_mb:.1f}MB -> {out_mb:.1f}MB ({reduction:.1f}% reduction)")
+
+        return True, f"{reduction:.1f}% reduction"
+
+    except subprocess.TimeoutExpired:
+        return False, "Timeout exceeded"
+    except Exception as e:
+        return False, str(e)
+
+
 def get_ghostscript_command() -> Optional[str]:
     """Get Ghostscript binary name for current platform."""
     for name in ["gs", "gswin64c", "gswin32c"]:
