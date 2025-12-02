@@ -19,17 +19,17 @@ def get_ghostscript_command() -> Optional[str]:
 
 def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[bool, str]:
     """
-    Compress scanned PDF using Ghostscript at 150 DPI with quality optimization.
+    Compress scanned PDF using Ghostscript at 150 DPI with JPEG encoding.
 
     Balances file size reduction with readable quality for legal documents.
-    Uses JPEG encoding with quality settings and 150 DPI resolution.
+    Uses /ebook preset (150 DPI, JPEG quality ~80) with optimized settings.
 
     Args:
         input_path: Source PDF
         output_path: Destination for compressed PDF
 
     Returns:
-        (success, message) tuple
+        (success, message) tuple where message contains reduction % or error
     """
     gs_cmd = get_ghostscript_command()
     if not gs_cmd:
@@ -40,22 +40,20 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 150 DPI + JPEG quality 85 for good balance of size vs readability
-    # /ebook preset provides better quality than /screen while still compressing
+    # /ebook preset: 150 DPI with JPEG compression, good balance for legal docs
     cmd = [
         gs_cmd,
         "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.4",
-        "-dPDFSETTINGS=/ebook",  # 150 DPI preset, better quality than /screen
+        "-dPDFSETTINGS=/ebook",  # 150 DPI preset with JPEG quality ~80
         "-dNOPAUSE",
         "-dBATCH",
-        # Force JPEG encoding (converts JPEG2000 to JPEG) with quality control
+        "-dQUIET",
+        # Force JPEG encoding (converts JPEG2000 to JPEG)
         "-dAutoFilterColorImages=false",
         "-dColorImageFilter=/DCTEncode",
-        "-dColorImageDict={/QFactor 0.15 /Blend 1 /HSamples [1 1 1 1] /VSamples [1 1 1 1]}",
         "-dAutoFilterGrayImages=false",
         "-dGrayImageFilter=/DCTEncode",
-        "-dGrayImageDict={/QFactor 0.15 /Blend 1 /HSamples [1 1 1 1] /VSamples [1 1 1 1]}",
         # Downsample images to 150 DPI for readable text
         "-dDownsampleColorImages=true",
         "-dColorImageDownsampleType=/Bicubic",

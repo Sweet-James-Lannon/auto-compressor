@@ -258,6 +258,235 @@
             font-size: 0.6em;
             text-transform: uppercase;
         }
+
+        .compression-status {
+            padding: 15px 20px;
+            margin-bottom: 20px;
+            border: 4px solid #000000;
+            font-size: 0.8em;
+            text-align: center;
+            font-weight: normal;
+            text-transform: uppercase;
+        }
+
+        .compression-status.success {
+            background: #10B981;
+            color: white;
+            box-shadow: 4px 4px 0px 0px rgba(16,185,129,0.5);
+        }
+
+        .compression-status.failed {
+            background: #EF4444;
+            color: white;
+            box-shadow: 4px 4px 0px 0px rgba(239,68,68,0.5);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-card {
+            background: #f0f0f0;
+            padding: 15px;
+            border: 4px solid #000000;
+            box-shadow: 2px 2px 0px 0px rgba(0,0,0,0.3);
+        }
+
+        .stat-card label {
+            display: block;
+            color: #666;
+            font-size: 0.55em;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+        }
+
+        .stat-card value {
+            display: block;
+            color: #4169E1;
+            font-size: 0.75em;
+            font-weight: normal;
+        }
+
+        .parts-verification {
+            background: #f0f0f0;
+            padding: 15px;
+            border: 4px solid #000000;
+            margin-bottom: 20px;
+            box-shadow: 2px 2px 0px 0px rgba(0,0,0,0.3);
+        }
+
+        .parts-verification h4 {
+            color: #4169E1;
+            margin-bottom: 15px;
+            font-size: 0.7em;
+            text-transform: uppercase;
+        }
+
+        .part-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            background: white;
+            border: 3px solid #000000;
+            margin-bottom: 8px;
+            font-size: 0.6em;
+        }
+
+        .part-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .part-status {
+            font-weight: normal;
+            padding: 5px 10px;
+            border: 3px solid #000000;
+        }
+
+        .part-status.ok {
+            background: #10B981;
+            color: white;
+        }
+
+        .part-status.warning {
+            background: #ffc107;
+            color: #000000;
+        }
+
+        .debug-section {
+            margin-top: 20px;
+            border: 4px solid #666;
+            background: #f5f5f5;
+        }
+
+        .debug-header {
+            background: #666;
+            color: white;
+            padding: 12px 15px;
+            cursor: pointer;
+            font-size: 0.7em;
+            text-transform: uppercase;
+            user-select: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .debug-header:hover {
+            background: #555;
+        }
+
+        .debug-content {
+            padding: 15px;
+            display: none;
+            font-size: 0.55em;
+            line-height: 1.6;
+            overflow-x: auto;
+        }
+
+        .debug-content.expanded {
+            display: block;
+        }
+
+        .debug-content pre {
+            background: white;
+            padding: 10px;
+            border: 3px solid #000000;
+            overflow-x: auto;
+            margin: 10px 0;
+        }
+
+        .debug-item {
+            margin-bottom: 12px;
+        }
+
+        .debug-item label {
+            color: #666;
+            display: block;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+        }
+
+        .debug-item value {
+            color: #333;
+            font-family: monospace;
+            background: white;
+            padding: 8px;
+            border: 3px solid #000000;
+            display: block;
+            word-break: break-all;
+        }
+
+        .verify-section {
+            margin-top: 20px;
+            text-align: center;
+            padding-top: 20px;
+            border-top: 4px solid #e0e0e0;
+        }
+
+        .btn-secondary {
+            background: #666;
+            color: white;
+            border: 4px solid #000000;
+            padding: 12px 30px;
+            font-size: 0.7em;
+            cursor: pointer;
+            font-weight: normal;
+            font-family: 'Press Start 2P', cursive;
+            text-transform: uppercase;
+            box-shadow: 4px 4px 0px 0px rgba(0,0,0,1);
+            transition: all 0.1s;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            transform: translate(2px, 2px);
+            box-shadow: 2px 2px 0px 0px rgba(0,0,0,1);
+        }
+
+        .btn-secondary:active:not(:disabled) {
+            transform: translate(4px, 4px);
+            box-shadow: 0px 0px 0px 0px rgba(0,0,0,1);
+        }
+
+        .btn-secondary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .verification-results {
+            margin-top: 15px;
+            font-size: 0.6em;
+            text-align: left;
+        }
+
+        .verification-item {
+            padding: 10px;
+            background: white;
+            border: 3px solid #000000;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .verification-status {
+            padding: 5px 10px;
+            border: 3px solid #000000;
+            font-weight: normal;
+        }
+
+        .verification-status.pass {
+            background: #10B981;
+            color: white;
+        }
+
+        .verification-status.fail {
+            background: #EF4444;
+            color: white;
+        }
     </style>
 </head>
 <body>
@@ -290,27 +519,80 @@
 
         <div class="results" id="results">
             <h3>Compression Results</h3>
-            <div class="stat">
-                <label>Original Size:</label>
-                <value id="original-size">-</value>
+
+            <!-- Compression Status Indicator -->
+            <div class="compression-status success" id="compression-status">
+                Compression: SUCCESS
             </div>
-            <div class="stat">
-                <label>Compressed Size:</label>
-                <value id="compressed-size">-</value>
+
+            <!-- Detailed Stats Panel -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <label>Compression Method</label>
+                    <value id="compression-method">-</value>
+                </div>
+                <div class="stat-card">
+                    <label>Reduction</label>
+                    <value id="reduction">-</value>
+                </div>
+                <div class="stat-card">
+                    <label>Original Size</label>
+                    <value id="original-size">-</value>
+                </div>
+                <div class="stat-card">
+                    <label>Compressed Size</label>
+                    <value id="compressed-size">-</value>
+                </div>
+                <div class="stat-card" id="page-count-card" style="display: none;">
+                    <label>Page Count</label>
+                    <value id="page-count">-</value>
+                </div>
+                <div class="stat-card" id="processing-time-card" style="display: none;">
+                    <label>Processing Time</label>
+                    <value id="processing-time">-</value>
+                </div>
             </div>
-            <div class="stat">
-                <label>Reduction:</label>
-                <value id="reduction">-</value>
+
+            <!-- Part Size Verification (shown when split) -->
+            <div class="parts-verification" id="parts-verification" style="display: none;">
+                <h4>Part Size Verification</h4>
+                <div id="parts-list"></div>
+                <div class="stat" style="margin-top: 15px; padding-top: 15px; border-top: 3px solid #000;">
+                    <label>Total Parts Size:</label>
+                    <value id="total-parts-size">-</value>
+                </div>
             </div>
-            <div class="stat">
-                <label>Method:</label>
-                <value id="compression-method">-</value>
-            </div>
-            <div class="stat" id="split-info" style="display: none;">
-                <label>Split into:</label>
-                <value id="split-parts">-</value>
-            </div>
+
+            <!-- Download Links -->
             <div id="download-links" style="margin-top: 20px; text-align: center;"></div>
+
+            <!-- Verification Section -->
+            <div class="verify-section">
+                <button class="btn-secondary" id="verify-btn">Run Verification Test</button>
+                <div class="verification-results" id="verification-results"></div>
+            </div>
+
+            <!-- Debug Console -->
+            <div class="debug-section">
+                <div class="debug-header" id="debug-header">
+                    <span>Debug Info</span>
+                    <span id="debug-toggle">▼</span>
+                </div>
+                <div class="debug-content" id="debug-content">
+                    <div class="debug-item">
+                        <label>Job ID:</label>
+                        <value id="debug-job-id">-</value>
+                    </div>
+                    <div class="debug-item">
+                        <label>Timestamp:</label>
+                        <value id="debug-timestamp">-</value>
+                    </div>
+                    <div class="debug-item">
+                        <label>Raw JSON Response:</label>
+                        <pre id="debug-json">-</pre>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -318,6 +600,7 @@
         let selectedFile = null;
         let downloadLinks = [];
         let pollInterval = null;
+        let currentResult = null; // Store full result for verification
 
         const uploadZone = document.getElementById('upload-zone');
         const fileInput = document.getElementById('file-input');
@@ -328,6 +611,14 @@
         const progressBar = document.getElementById('progress-bar');
         const resultsDiv = document.getElementById('results');
         const healthIndicator = document.getElementById('health-indicator');
+
+        // Debug toggle functionality
+        document.getElementById('debug-header').addEventListener('click', () => {
+            const content = document.getElementById('debug-content');
+            const toggle = document.getElementById('debug-toggle');
+            content.classList.toggle('expanded');
+            toggle.textContent = content.classList.contains('expanded') ? '▲' : '▼';
+        });
 
         /**
          * Safely parse JSON response, handling HTML error pages from server.
@@ -560,18 +851,94 @@
         }
 
         function displayResults(result) {
-            document.getElementById('original-size').textContent = result.original_mb.toFixed(2) + ' MB';
-            document.getElementById('compressed-size').textContent = result.compressed_mb.toFixed(2) + ' MB';
-            document.getElementById('reduction').textContent = result.reduction_percent.toFixed(1) + '%';
-            document.getElementById('compression-method').textContent = result.compression_method || 'ghostscript';
+            // Store result for verification
+            currentResult = result;
 
-            // Show split info if PDF was split
-            const splitInfo = document.getElementById('split-info');
-            if (result.was_split && result.total_parts > 1) {
-                splitInfo.style.display = 'flex';
-                document.getElementById('split-parts').textContent = result.total_parts + ' parts';
+            // 1. COMPRESSION STATUS INDICATOR
+            const statusEl = document.getElementById('compression-status');
+            const method = result.compression_method || 'ghostscript';
+            const reduction = result.reduction_percent || 0;
+
+            if (method === 'ghostscript' && reduction > 0) {
+                statusEl.className = 'compression-status success';
+                statusEl.textContent = 'Compression: SUCCESS';
+            } else if (method === 'none' || reduction === 0) {
+                statusEl.className = 'compression-status failed';
+                statusEl.textContent = 'Compression: FAILED (no reduction)';
             } else {
-                splitInfo.style.display = 'none';
+                statusEl.className = 'compression-status success';
+                statusEl.textContent = 'Compression: SUCCESS';
+            }
+
+            // 2. DETAILED STATS PANEL
+            const originalBytes = result.original_size || (result.original_mb * 1024 * 1024);
+            const compressedBytes = result.compressed_size || (result.compressed_mb * 1024 * 1024);
+
+            document.getElementById('compression-method').textContent = method.toUpperCase();
+            document.getElementById('reduction').textContent = reduction.toFixed(1) + '%';
+            document.getElementById('original-size').innerHTML =
+                `${result.original_mb.toFixed(2)} MB<br><small style="font-size: 0.8em; color: #666;">(${originalBytes.toLocaleString()} bytes)</small>`;
+            document.getElementById('compressed-size').innerHTML =
+                `${result.compressed_mb.toFixed(2)} MB<br><small style="font-size: 0.8em; color: #666;">(${compressedBytes.toLocaleString()} bytes)</small>`;
+
+            // Show page count if available
+            const pageCountCard = document.getElementById('page-count-card');
+            if (result.page_count || result.pages) {
+                pageCountCard.style.display = 'block';
+                document.getElementById('page-count').textContent = result.page_count || result.pages;
+            } else {
+                pageCountCard.style.display = 'none';
+            }
+
+            // Show processing time if available
+            const processingTimeCard = document.getElementById('processing-time-card');
+            if (result.processing_time) {
+                processingTimeCard.style.display = 'block';
+                document.getElementById('processing-time').textContent = result.processing_time + 's';
+            } else {
+                processingTimeCard.style.display = 'none';
+            }
+
+            // 3. PART SIZE VERIFICATION
+            const partsVerification = document.getElementById('parts-verification');
+            if (result.was_split && result.total_parts > 1) {
+                partsVerification.style.display = 'block';
+
+                const partsList = document.getElementById('parts-list');
+                partsList.innerHTML = '';
+
+                const partSizes = result.part_sizes || [];
+                let totalPartsSize = 0;
+
+                (result.download_links || []).forEach((link, index) => {
+                    const partSize = partSizes[index] || 0;
+                    const partSizeMB = partSize / (1024 * 1024);
+                    totalPartsSize += partSize;
+
+                    const partItem = document.createElement('div');
+                    partItem.className = 'part-item';
+
+                    const sizeLimit = 25 * 1024 * 1024; // 25MB
+                    const isUnderLimit = partSize <= sizeLimit;
+
+                    partItem.innerHTML = `
+                        <span>Part ${index + 1}: ${partSizeMB.toFixed(2)} MB (${partSize.toLocaleString()} bytes)</span>
+                        <span class="part-status ${isUnderLimit ? 'ok' : 'warning'}">
+                            ${isUnderLimit ? '✓ Under 25MB' : '⚠ Over 25MB'}
+                        </span>
+                    `;
+                    partsList.appendChild(partItem);
+                });
+
+                const totalPartsSizeMB = totalPartsSize / (1024 * 1024);
+                const comparisonMatch = Math.abs(totalPartsSize - compressedBytes) < 1024; // Within 1KB tolerance
+
+                document.getElementById('total-parts-size').innerHTML =
+                    `${totalPartsSizeMB.toFixed(2)} MB (${totalPartsSize.toLocaleString()} bytes)<br>` +
+                    `<small style="font-size: 0.8em; color: ${comparisonMatch ? '#10B981' : '#EF4444'};">` +
+                    `${comparisonMatch ? '✓' : '✗'} Matches compressed size</small>`;
+            } else {
+                partsVerification.style.display = 'none';
             }
 
             // Store download links and create buttons
@@ -590,6 +957,11 @@
                 linksContainer.appendChild(btn);
             });
 
+            // 4. DEBUG CONSOLE
+            document.getElementById('debug-job-id').textContent = result.job_id || 'N/A';
+            document.getElementById('debug-timestamp').textContent = new Date().toISOString();
+            document.getElementById('debug-json').textContent = JSON.stringify(result, null, 2);
+
             resultsDiv.style.display = 'block';
         }
 
@@ -602,6 +974,128 @@
         function hideStatus() {
             statusDiv.style.display = 'none';
         }
+
+        // 5. QUICK VERIFICATION TEST
+        document.getElementById('verify-btn').addEventListener('click', async () => {
+            if (!currentResult || !downloadLinks.length) {
+                showStatus('No compression results to verify', 'error');
+                return;
+            }
+
+            const verifyBtn = document.getElementById('verify-btn');
+            const resultsContainer = document.getElementById('verification-results');
+
+            verifyBtn.disabled = true;
+            verifyBtn.textContent = 'Verifying...';
+            resultsContainer.innerHTML = '<p style="text-align: center; color: #666;">Running verification tests...</p>';
+
+            try {
+                const verifications = [];
+
+                // Test each download link
+                for (let i = 0; i < downloadLinks.length; i++) {
+                    const link = downloadLinks[i];
+                    const partNumber = i + 1;
+
+                    try {
+                        // Use HEAD request to get file size without downloading
+                        const response = await fetch(link, { method: 'HEAD' });
+
+                        if (!response.ok) {
+                            verifications.push({
+                                part: partNumber,
+                                status: 'fail',
+                                message: `HTTP ${response.status}: Failed to fetch`,
+                                expected: null,
+                                actual: null
+                            });
+                            continue;
+                        }
+
+                        const contentLength = response.headers.get('content-length');
+                        const actualSize = contentLength ? parseInt(contentLength) : null;
+
+                        // Get expected size from result
+                        let expectedSize = null;
+                        if (currentResult.part_sizes && currentResult.part_sizes[i]) {
+                            expectedSize = currentResult.part_sizes[i];
+                        } else if (downloadLinks.length === 1) {
+                            expectedSize = currentResult.compressed_size || (currentResult.compressed_mb * 1024 * 1024);
+                        }
+
+                        if (!actualSize) {
+                            verifications.push({
+                                part: partNumber,
+                                status: 'fail',
+                                message: 'Could not determine file size',
+                                expected: expectedSize,
+                                actual: null
+                            });
+                            continue;
+                        }
+
+                        // Check if sizes match (within 1KB tolerance)
+                        const matches = expectedSize ? Math.abs(actualSize - expectedSize) < 1024 : true;
+
+                        verifications.push({
+                            part: partNumber,
+                            status: matches ? 'pass' : 'fail',
+                            message: matches ? 'Size matches' : 'Size mismatch',
+                            expected: expectedSize,
+                            actual: actualSize
+                        });
+
+                    } catch (error) {
+                        verifications.push({
+                            part: partNumber,
+                            status: 'fail',
+                            message: `Error: ${error.message}`,
+                            expected: null,
+                            actual: null
+                        });
+                    }
+                }
+
+                // Display results
+                resultsContainer.innerHTML = '';
+                verifications.forEach(v => {
+                    const item = document.createElement('div');
+                    item.className = 'verification-item';
+
+                    const partLabel = downloadLinks.length > 1 ? `Part ${v.part}` : 'Compressed PDF';
+
+                    let details = v.message;
+                    if (v.expected && v.actual) {
+                        const expectedMB = (v.expected / (1024 * 1024)).toFixed(2);
+                        const actualMB = (v.actual / (1024 * 1024)).toFixed(2);
+                        details += ` (Expected: ${expectedMB}MB, Actual: ${actualMB}MB)`;
+                    }
+
+                    item.innerHTML = `
+                        <span>${partLabel}: ${details}</span>
+                        <span class="verification-status ${v.status}">${v.status.toUpperCase()}</span>
+                    `;
+                    resultsContainer.appendChild(item);
+                });
+
+                // Show summary
+                const passCount = verifications.filter(v => v.status === 'pass').length;
+                const totalCount = verifications.length;
+                const allPassed = passCount === totalCount;
+
+                showStatus(
+                    `Verification complete: ${passCount}/${totalCount} tests passed`,
+                    allPassed ? 'success' : 'error'
+                );
+
+            } catch (error) {
+                showStatus(`Verification error: ${error.message}`, 'error');
+                resultsContainer.innerHTML = '<p style="text-align: center; color: #EF4444;">Verification failed</p>';
+            } finally {
+                verifyBtn.disabled = false;
+                verifyBtn.textContent = 'Run Verification Test';
+            }
+        });
     </script>
 </body>
 </html>
