@@ -16,6 +16,14 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from compress import compress_pdf
 from compress_ghostscript import get_ghostscript_command
+from exceptions import (
+    PDFCompressionError,
+    EncryptionError,
+    StructureError,
+    MetadataCorruptionError,
+    CompressionFailureError,
+    SplitError,
+)
 import job_queue
 
 # Config
@@ -51,6 +59,38 @@ def require_auth(f):
             return jsonify({"success": False, "error": "Invalid token"}), 403
         return f(*args, **kwargs)
     return decorated
+
+
+def create_error_response(error: Exception, status_code: int = 500):
+    """Create standardized error response with backward compatibility.
+
+    Returns both 'error' (for old clients) and 'error_type'/'error_message' (for new clients).
+    """
+    if isinstance(error, PDFCompressionError):
+        return jsonify({
+            "success": False,
+            "error": error.message,  # Backward compatibility
+            "error_type": error.error_type,
+            "error_message": error.message,
+        }), status_code
+
+    return jsonify({
+        "success": False,
+        "error": str(error),
+        "error_type": "UnknownError",
+        "error_message": str(error),
+    }), status_code
+
+
+def get_error_status_code(error: Exception) -> int:
+    """Map exception type to appropriate HTTP status code."""
+    if isinstance(error, (EncryptionError, StructureError, MetadataCorruptionError, SplitError)):
+        return 422  # Unprocessable Entity - valid request but can't process the PDF
+    if isinstance(error, FileNotFoundError):
+        return 404
+    if isinstance(error, ValueError):
+        return 400
+    return 500
 
 
 # File tracking for cleanup
@@ -136,9 +176,20 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
 
         logger.info(f"[{job_id}] Job completed: {len(download_links)} file(s)")
 
+    except PDFCompressionError as e:
+        # Our custom exceptions - log and return structured error
+        logger.error(f"[{job_id}] Job failed ({e.error_type}): {e.message}")
+        job_queue.update_job(job_id, "failed", error=str(e), result={
+            "error_type": e.error_type,
+            "error_message": e.message,
+        })
     except Exception as e:
-        logger.exception(f"[{job_id}] Job failed: {e}")
-        job_queue.update_job(job_id, "failed", error=str(e))
+        # Unexpected errors - log full stack trace
+        logger.exception(f"[{job_id}] Job failed with unexpected error: {e}")
+        job_queue.update_job(job_id, "failed", error=str(e), result={
+            "error_type": "UnknownError",
+            "error_message": str(e),
+        })
 
 
 # Configure and start job queue worker
@@ -155,7 +206,7 @@ def handle_large_file(e):
 @app.errorhandler(Exception)
 def handle_error(e):
     logger.exception("Unhandled error")
-    return jsonify({"success": False, "error": str(e)}), 500
+    return create_error_response(e, get_error_status_code(e))
 
 
 # Routes
@@ -274,11 +325,18 @@ def get_status(job_id: str):
         })
 
     if job.status == "failed":
-        return jsonify({
+        response = {
             "success": False,
             "status": "failed",
-            "error": job.error
-        })
+            "error": job.error,  # Backward compatibility
+        }
+        # Add structured error info if available
+        if job.result and isinstance(job.result, dict):
+            if "error_type" in job.result:
+                response["error_type"] = job.result["error_type"]
+            if "error_message" in job.result:
+                response["error_message"] = job.result["error_message"]
+        return jsonify(response)
 
     # Completed
     return jsonify({

@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from typing import Tuple, Optional
 
+from exceptions import EncryptionError, MetadataCorruptionError, StructureError
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,7 +64,7 @@ def optimize_split_part(input_path: Path, output_path: Path) -> Tuple[bool, str]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
         if result.returncode != 0:
-            return False, f"Ghostscript error: {result.stderr[:200]}"
+            return False, translate_ghostscript_error(result.stderr, result.returncode)
 
         if not output_path.exists():
             return False, "Output file not created"
@@ -88,12 +90,46 @@ def get_ghostscript_command() -> Optional[str]:
     return None
 
 
+def translate_ghostscript_error(stderr: str, return_code: int) -> str:
+    """Translate Ghostscript stderr to a clear, user-friendly error message.
+
+    Also logs the full stderr for debugging purposes.
+
+    Args:
+        stderr: Full stderr output from Ghostscript.
+        return_code: Process exit code.
+
+    Returns:
+        User-friendly error message explaining what went wrong.
+    """
+    # Log full stderr for debugging (don't truncate!)
+    logger.error(f"Ghostscript failed (exit code {return_code}). Full error:\n{stderr}")
+
+    stderr_lower = stderr.lower()
+
+    # Check for encryption/permission errors
+    if 'invalidfileaccess' in stderr_lower or 'password' in stderr_lower:
+        return "PDF is password-protected or locked. Please remove the password and try again."
+
+    # Check for metadata/type errors
+    if 'typecheck' in stderr_lower or 'rangecheck' in stderr_lower:
+        return "PDF has corrupted internal data. Try re-saving it from Adobe Acrobat."
+
+    # Check for structure errors
+    if any(x in stderr_lower for x in ['undefined', 'ioerror', 'syntaxerror', 'eofread']):
+        return "PDF is damaged or corrupted. Please use a different copy of the file."
+
+    # Generic fallback with exit code
+    return f"PDF processing failed (Ghostscript exit code {return_code}). The file may be corrupted."
+
+
 def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[bool, str]:
     """
-    Compress scanned PDF using Ghostscript at 150 DPI with JPEG encoding.
+    Compress scanned PDF using Ghostscript at 72 DPI with JPEG encoding.
 
-    Balances file size reduction with readable quality for legal documents.
-    Uses /ebook preset (150 DPI, JPEG quality ~80) with optimized settings.
+    Uses aggressive compression (72 DPI) which provides significant file size
+    reduction while maintaining readable quality for legal documents.
+    Converts JPEG2000 to JPEG for maximum compatibility.
 
     Args:
         input_path: Source PDF
@@ -111,12 +147,13 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # /ebook preset: 150 DPI with JPEG compression, good balance for legal docs
+    # 72 DPI + DCTEncode: Best compression for scanned legal documents
+    # Higher DPI (150, 200) often makes JPEG2000 files BIGGER
     cmd = [
         gs_cmd,
         "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.4",
-        "-dPDFSETTINGS=/ebook",  # 150 DPI preset with JPEG quality ~80
+        "-dPDFSETTINGS=/screen",  # 72 DPI preset - best compression
         "-dNOPAUSE",
         "-dBATCH",
         "-dQUIET",
@@ -125,18 +162,18 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
         "-dColorImageFilter=/DCTEncode",
         "-dAutoFilterGrayImages=false",
         "-dGrayImageFilter=/DCTEncode",
-        # Downsample images to 150 DPI for readable text
+        # Downsample all images to 72 DPI for maximum compression
         "-dDownsampleColorImages=true",
         "-dColorImageDownsampleType=/Bicubic",
-        "-dColorImageResolution=150",
+        "-dColorImageResolution=72",
         "-dColorImageDownsampleThreshold=1.0",
         "-dDownsampleGrayImages=true",
         "-dGrayImageDownsampleType=/Bicubic",
-        "-dGrayImageResolution=150",
+        "-dGrayImageResolution=72",
         "-dGrayImageDownsampleThreshold=1.0",
         "-dDownsampleMonoImages=true",
         "-dMonoImageDownsampleType=/Bicubic",
-        "-dMonoImageResolution=300",  # Higher DPI for text/line art
+        "-dMonoImageResolution=72",
         "-dMonoImageDownsampleThreshold=1.0",
         # Optimization
         "-dDetectDuplicateImages=true",
@@ -158,7 +195,7 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
         if result.returncode != 0:
-            return False, f"Ghostscript error: {result.stderr[:200]}"
+            return False, translate_ghostscript_error(result.stderr, result.returncode)
 
         if not output_path.exists():
             return False, "Output file not created"

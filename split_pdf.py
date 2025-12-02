@@ -10,12 +10,15 @@ from pathlib import Path
 from typing import List
 
 from PyPDF2 import PdfReader, PdfWriter
+from PyPDF2.errors import PdfReadError
 
 from compress_ghostscript import optimize_split_part, compress_pdf_with_ghostscript
+from exceptions import EncryptionError, StructureError, SplitError
 
 # Constants
 SPLIT_THRESHOLD_MB: float = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
-MAX_SPLIT_PARTS: int = 10  # Maximum number of parts to create
+SAFETY_BUFFER_MB: float = 0.5  # Target 24.5MB to ensure we're under 25MB limit
+MAX_SPLIT_PARTS: int = int(os.environ.get('MAX_SPLIT_PARTS', '50'))  # Allow more splits for large files
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +75,13 @@ def split_pdf(
         threshold_mb: Maximum size per part in MB. Defaults to SPLIT_THRESHOLD_MB.
 
     Returns:
-        List of paths to the created PDF parts.
+        List of paths to the created PDF parts, all guaranteed under threshold_mb.
 
     Raises:
         FileNotFoundError: If source PDF doesn't exist.
-        RuntimeError: If splitting fails.
+        EncryptionError: If PDF is password-protected.
+        StructureError: If PDF is corrupted or malformed.
+        SplitError: If PDF cannot be split into parts under threshold.
     """
     import math
 
@@ -98,16 +103,22 @@ def split_pdf(
     try:
         with open(pdf_path, 'rb') as f:
             reader = PdfReader(f)
+
+            # Check for encrypted PDFs FIRST - don't waste time on password-protected files
+            if reader.is_encrypted:
+                raise EncryptionError.for_file(pdf_path.name)
+
             total_pages = len(reader.pages)
 
             if total_pages == 0:
-                raise RuntimeError("PDF has no pages")
+                raise StructureError.for_file(pdf_path.name, "PDF has no pages")
 
             # Start with minimum parts needed mathematically
             num_parts = math.ceil(file_size_mb / threshold_mb)
 
-            # Try splitting with increasing number of parts until all are under threshold
-            max_attempts = min(num_parts + 5, MAX_SPLIT_PARTS)  # Cap at MAX_SPLIT_PARTS
+            # Allow up to 2x the minimum parts to handle compression variability
+            # Cap at MAX_SPLIT_PARTS or total_pages (can't have more parts than pages)
+            max_attempts = min(num_parts * 2, MAX_SPLIT_PARTS, total_pages)
 
             for attempt in range(num_parts, max_attempts + 1):
                 pages_per_part = math.ceil(total_pages / attempt)
@@ -176,7 +187,9 @@ def split_pdf(
                         compressed_size_mb = uncompressed_size_mb
                         logger.info(f"Part {part_num} already under threshold: {compressed_size_mb:.1f}MB")
 
-                    if compressed_size_mb > threshold_mb:
+                    # Use safety buffer to ensure we're WELL under the hard limit
+                    target_size = threshold_mb - SAFETY_BUFFER_MB  # 24.5MB target
+                    if compressed_size_mb > target_size:
                         all_under_threshold = False
 
                     output_paths.append(part_path)
@@ -192,14 +205,33 @@ def split_pdf(
                             p.unlink()
                     output_paths = []
                 else:
-                    # This was our last attempt, return what we have
-                    logger.warning(f"Could not split into parts under {threshold_mb}MB after {max_attempts - num_parts + 1} attempts")
-                    logger.warning(f"Returning {len(output_paths)} parts - some may exceed threshold")
-                    return output_paths
+                    # CRITICAL: NEVER return files over threshold - clean up and raise error
+                    logger.error(f"Could not split into parts under {threshold_mb}MB after {max_attempts - num_parts + 1} attempts")
+
+                    # Clean up all created files
+                    for p in output_paths:
+                        if p.exists():
+                            p.unlink()
+
+                    # Raise clear error explaining what happened
+                    raise SplitError.for_file(
+                        pdf_path.name,
+                        threshold_mb,
+                        max_attempts - num_parts + 1
+                    )
 
             # Should not reach here, but just in case
             return output_paths
 
+    except (EncryptionError, StructureError, SplitError):
+        # Re-raise our custom exceptions as-is (already have good messages)
+        raise
+    except PdfReadError as e:
+        # Translate PyPDF2 errors to our custom exceptions
+        error_str = str(e).lower()
+        if 'encrypt' in error_str or 'password' in error_str:
+            raise EncryptionError.for_file(pdf_path.name) from e
+        raise StructureError.for_file(pdf_path.name, str(e)) from e
     except Exception as e:
         logger.error(f"Failed to split PDF: {e}")
-        raise RuntimeError(f"PDF split failed: {e}") from e
+        raise StructureError.for_file(pdf_path.name, str(e)) from e

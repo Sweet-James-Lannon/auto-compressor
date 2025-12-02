@@ -5,8 +5,17 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from PyPDF2 import PdfReader
+
 import compress_ghostscript
 import split_pdf
+from exceptions import (
+    PDFCompressionError,
+    EncryptionError,
+    StructureError,
+    MetadataCorruptionError,
+    SplitError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +45,31 @@ def compress_pdf(
 
     Raises:
         FileNotFoundError: If input file doesn't exist.
-        RuntimeError: If compression fails.
+        EncryptionError: If PDF is password-protected.
+        StructureError: If PDF is corrupted or malformed.
+        MetadataCorruptionError: If PDF metadata is corrupted.
+        SplitError: If PDF cannot be split into small enough parts.
     """
     input_path = Path(input_path)
 
     if not input_path.exists():
         raise FileNotFoundError(f"File not found: {input_path}")
+
+    # Validate PDF before processing - catch encrypted files early
+    try:
+        with open(input_path, 'rb') as f:
+            reader = PdfReader(f)
+            if reader.is_encrypted:
+                raise EncryptionError.for_file(input_path.name)
+    except EncryptionError:
+        raise
+    except Exception as e:
+        # If we can't read it at all, it might be encrypted or corrupted
+        error_str = str(e).lower()
+        if 'encrypt' in error_str or 'password' in error_str:
+            raise EncryptionError.for_file(input_path.name) from e
+        # Let Ghostscript try - it might handle some edge cases
+        logger.warning(f"PDF pre-validation warning: {e}")
 
     working_dir = working_dir or input_path.parent
     output_path = working_dir / f"{input_path.stem}_compressed.pdf"
@@ -53,7 +81,16 @@ def compress_pdf(
     success, message = compress_ghostscript.compress_pdf_with_ghostscript(input_path, output_path)
 
     if not success:
-        raise RuntimeError(f"Compression failed: {message}")
+        # Map error message to specific exception type
+        msg_lower = message.lower()
+        if 'password' in msg_lower or 'encrypt' in msg_lower or 'locked' in msg_lower:
+            raise EncryptionError.for_file(input_path.name)
+        elif 'corrupted' in msg_lower or 'damaged' in msg_lower or 'structure' in msg_lower:
+            raise StructureError.for_file(input_path.name, message)
+        elif 'metadata' in msg_lower or 'internal data' in msg_lower:
+            raise MetadataCorruptionError.for_file(input_path.name)
+        else:
+            raise StructureError.for_file(input_path.name, message)
 
     compressed_size = get_file_size_mb(output_path)
 
