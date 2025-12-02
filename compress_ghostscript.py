@@ -19,10 +19,10 @@ def get_ghostscript_command() -> Optional[str]:
 
 def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[bool, str]:
     """
-    Compress scanned PDF using Ghostscript at 72 DPI.
+    Compress scanned PDF using Ghostscript at 150 DPI with quality optimization.
 
-    This is the only setting that actually reduces file size for JPEG2000
-    scanned documents. Higher DPI settings make files BIGGER.
+    Balances file size reduction with readable quality for legal documents.
+    Uses JPEG encoding with quality settings and 150 DPI resolution.
 
     Args:
         input_path: Source PDF
@@ -40,32 +40,34 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 72 DPI + DCTEncode: tested to give 29% reduction on 115MB scanned PDF
-    # Higher DPI (150, 200) makes JPEG2000 files BIGGER
+    # 150 DPI + JPEG quality 85 for good balance of size vs readability
+    # /ebook preset provides better quality than /screen while still compressing
     cmd = [
         gs_cmd,
         "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.4",
-        "-dPDFSETTINGS=/screen",  # 72 DPI preset
+        "-dPDFSETTINGS=/ebook",  # 150 DPI preset, better quality than /screen
         "-dNOPAUSE",
         "-dBATCH",
-        # Force JPEG encoding (converts JPEG2000 to JPEG)
+        # Force JPEG encoding (converts JPEG2000 to JPEG) with quality control
         "-dAutoFilterColorImages=false",
         "-dColorImageFilter=/DCTEncode",
+        "-dColorImageDict={/QFactor 0.15 /Blend 1 /HSamples [1 1 1 1] /VSamples [1 1 1 1]}",
         "-dAutoFilterGrayImages=false",
         "-dGrayImageFilter=/DCTEncode",
-        # Downsample all images to 72 DPI
+        "-dGrayImageDict={/QFactor 0.15 /Blend 1 /HSamples [1 1 1 1] /VSamples [1 1 1 1]}",
+        # Downsample images to 150 DPI for readable text
         "-dDownsampleColorImages=true",
         "-dColorImageDownsampleType=/Bicubic",
-        "-dColorImageResolution=72",
+        "-dColorImageResolution=150",
         "-dColorImageDownsampleThreshold=1.0",
         "-dDownsampleGrayImages=true",
         "-dGrayImageDownsampleType=/Bicubic",
-        "-dGrayImageResolution=72",
+        "-dGrayImageResolution=150",
         "-dGrayImageDownsampleThreshold=1.0",
         "-dDownsampleMonoImages=true",
         "-dMonoImageDownsampleType=/Bicubic",
-        "-dMonoImageResolution=72",
+        "-dMonoImageResolution=300",  # Higher DPI for text/line art
         "-dMonoImageDownsampleThreshold=1.0",
         # Optimization
         "-dDetectDuplicateImages=true",

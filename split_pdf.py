@@ -107,6 +107,9 @@ def split_pdf(
                 writer = PdfWriter()
                 part_path = output_dir / f"{base_name}_part{part_num}.pdf"
 
+                # Track the starting page for this part
+                start_page = current_page
+
                 # Add pages until we approach the target size
                 pages_added = 0
                 while current_page < total_pages:
@@ -127,7 +130,8 @@ def split_pdf(
                         pages_added -= 1
 
                         writer = PdfWriter()
-                        for i in range(current_page - pages_added, current_page):
+                        # Use start_page to ensure correct page range
+                        for i in range(start_page, start_page + pages_added):
                             writer.add_page(reader.pages[i])
 
                         with open(part_path, 'wb') as out_f:
