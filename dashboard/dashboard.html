@@ -265,16 +265,10 @@
         <h1>SJ PDF Compressor <span id="health-indicator"></span></h1>
         <p class="subtitle">Lossless PDF compression with cryptographic verification</p>
 
-        <!-- API Token section temporarily disabled for testing
         <div class="auth-section">
             <label for="api-token">API Token</label>
             <input type="password" id="api-token" placeholder="Enter your API token">
-            <small>Required for compression. Token is stored in browser session only.</small>
-        </div>
-        -->
-        <div class="auth-section" style="background: #fff3cd;">
-            <label style="color: #856404;">Testing Mode Enabled</label>
-            <small style="color: #856404;">Authentication temporarily disabled. Re-enable in app.py and dashboard.html when done testing.</small>
+            <small>Required for compression. Leave empty if API_TOKEN env var is not set on server.</small>
         </div>
 
         <div class="upload-zone" id="upload-zone">
@@ -309,22 +303,21 @@
                 <value id="reduction">-</value>
             </div>
             <div class="stat">
-                <label>Original SHA-256:</label>
-                <value id="original-hash" style="font-size: 0.8em; word-break: break-all;">-</value>
+                <label>Method:</label>
+                <value id="compression-method">-</value>
             </div>
-            <div class="stat">
-                <label>Compressed SHA-256:</label>
-                <value id="compressed-hash" style="font-size: 0.8em; word-break: break-all;">-</value>
+            <div class="stat" id="split-info" style="display: none;">
+                <label>Split into:</label>
+                <value id="split-parts">-</value>
             </div>
-            <div style="margin-top: 20px; text-align: center;">
-                <button class="btn" id="download-btn">Download Compressed PDF</button>
-            </div>
+            <div id="download-links" style="margin-top: 20px; text-align: center;"></div>
         </div>
     </div>
 
     <script>
         let selectedFile = null;
-        let compressedPdfData = null;
+        let downloadLinks = [];
+        let pollInterval = null;
 
         const uploadZone = document.getElementById('upload-zone');
         const fileInput = document.getElementById('file-input');
@@ -334,7 +327,6 @@
         const progressDiv = document.getElementById('progress');
         const progressBar = document.getElementById('progress-bar');
         const resultsDiv = document.getElementById('results');
-        const downloadBtn = document.getElementById('download-btn');
         const healthIndicator = document.getElementById('health-indicator');
 
         /**
@@ -424,8 +416,8 @@
             }
         });
 
-        // API token input - TEMPORARILY DISABLED FOR TESTING
-        // apiTokenInput.addEventListener('input', updateCompressButton);
+        // API token input - re-enable button when token entered
+        apiTokenInput.addEventListener('input', updateCompressButton);
 
         function handleFileSelect(file) {
             if (!file.name.toLowerCase().endsWith('.pdf')) {
@@ -453,9 +445,8 @@
         }
 
         function updateCompressButton() {
-            // TEMPORARILY DISABLED FOR TESTING - Only require file selection, not token
+            // Only require file - token is optional (server may not have API_TOKEN set)
             compressBtn.disabled = !selectedFile;
-            // compressBtn.disabled = !(selectedFile && apiTokenInput.value.trim());
         }
 
         // Compress button
@@ -463,8 +454,6 @@
 
         async function compressPDF() {
             if (!selectedFile) return;
-            // TEMPORARILY DISABLED FOR TESTING - No token required
-            // if (!selectedFile || !apiTokenInput.value.trim()) return;
 
             const formData = new FormData();
             formData.append('pdf', selectedFile);
@@ -472,61 +461,64 @@
             // Reset UI
             resultsDiv.style.display = 'none';
             progressDiv.style.display = 'block';
-            progressBar.style.width = '0%';
-            progressBar.textContent = '0%';
+            progressBar.style.width = '10%';
+            progressBar.textContent = 'Uploading...';
             compressBtn.disabled = true;
+            downloadLinks = [];
 
-            showStatus('Uploading and compressing...', 'info');
+            showStatus('Uploading PDF...', 'info');
 
-            // Simulate progress
-            let progress = 0;
-            const progressInterval = setInterval(() => {
-                progress += Math.random() * 15;
-                if (progress > 90) progress = 90;
-                progressBar.style.width = progress + '%';
-                progressBar.textContent = Math.round(progress) + '%';
-            }, 500);
+            // Build headers - include auth token if provided
+            const headers = {};
+            const token = apiTokenInput.value.trim();
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
 
             try {
+                // Step 1: Submit compression job
                 const response = await fetch('/compress', {
                     method: 'POST',
-                    // TEMPORARILY DISABLED FOR TESTING - No Authorization header
-                    // headers: {
-                    //     'Authorization': `Bearer ${apiTokenInput.value.trim()}`
-                    // },
+                    headers: headers,
                     body: formData
                 });
 
-                clearInterval(progressInterval);
-                progressBar.style.width = '100%';
-                progressBar.textContent = '100%';
-
-                // Use safe JSON parsing to handle HTML error pages
                 const { data: result, error: parseError } = await safeParseJson(response);
 
                 if (parseError) {
                     throw new Error(parseError);
                 }
 
-                if (response.ok && result && result.success) {
-                    compressedPdfData = result.compressed_pdf_b64;
-                    displayResults(result);
-                    showStatus('Compression successful!', 'success');
-                } else {
-                    throw new Error(result?.error || `Compression failed (HTTP ${response.status})`);
+                if (!response.ok || !result.success) {
+                    throw new Error(result?.error || `Upload failed (HTTP ${response.status})`);
                 }
-            } catch (error) {
-                clearInterval(progressInterval);
 
-                // Provide user-friendly error messages
+                // Step 2: Poll for completion
+                const jobId = result.job_id;
+                progressBar.style.width = '30%';
+                progressBar.textContent = 'Processing...';
+                showStatus('Compressing PDF...', 'info');
+
+                const finalResult = await pollForCompletion(jobId, headers);
+
+                progressBar.style.width = '100%';
+                progressBar.textContent = 'Done!';
+
+                displayResults(finalResult);
+                showStatus('Compression successful!', 'success');
+
+            } catch (error) {
                 let displayMessage = error.message;
                 if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
                     displayMessage = 'Network error. Please check your connection and try again.';
                 }
-
                 showStatus(`Error: ${displayMessage}`, 'error');
                 console.error('Compression error:', error);
             } finally {
+                if (pollInterval) {
+                    clearInterval(pollInterval);
+                    pollInterval = null;
+                }
                 setTimeout(() => {
                     progressDiv.style.display = 'none';
                     compressBtn.disabled = false;
@@ -534,45 +526,72 @@
             }
         }
 
+        async function pollForCompletion(jobId, headers) {
+            return new Promise((resolve, reject) => {
+                let dots = 0;
+                pollInterval = setInterval(async () => {
+                    try {
+                        dots = (dots + 1) % 4;
+                        progressBar.textContent = 'Processing' + '.'.repeat(dots);
+
+                        const response = await fetch(`/status/${jobId}`, { headers });
+                        const { data, error } = await safeParseJson(response);
+
+                        if (error) {
+                            clearInterval(pollInterval);
+                            reject(new Error(error));
+                            return;
+                        }
+
+                        if (data.status === 'completed') {
+                            clearInterval(pollInterval);
+                            resolve(data);
+                        } else if (data.status === 'failed') {
+                            clearInterval(pollInterval);
+                            reject(new Error(data.error || 'Compression failed'));
+                        }
+                        // else still processing, continue polling
+                    } catch (err) {
+                        clearInterval(pollInterval);
+                        reject(err);
+                    }
+                }, 2000);
+            });
+        }
+
         function displayResults(result) {
             document.getElementById('original-size').textContent = result.original_mb.toFixed(2) + ' MB';
             document.getElementById('compressed-size').textContent = result.compressed_mb.toFixed(2) + ' MB';
+            document.getElementById('reduction').textContent = result.reduction_percent.toFixed(1) + '%';
+            document.getElementById('compression-method').textContent = result.compression_method || 'ghostscript';
 
-            const reduction = ((result.original_mb - result.compressed_mb) / result.original_mb * 100).toFixed(1);
-            document.getElementById('reduction').textContent = reduction + '%';
+            // Show split info if PDF was split
+            const splitInfo = document.getElementById('split-info');
+            if (result.was_split && result.total_parts > 1) {
+                splitInfo.style.display = 'flex';
+                document.getElementById('split-parts').textContent = result.total_parts + ' parts';
+            } else {
+                splitInfo.style.display = 'none';
+            }
 
-            document.getElementById('original-hash').textContent = result.original_sha256;
-            document.getElementById('compressed-hash').textContent = result.compressed_sha256;
+            // Store download links and create buttons
+            downloadLinks = result.download_links || [];
+            const linksContainer = document.getElementById('download-links');
+            linksContainer.innerHTML = '';
+
+            downloadLinks.forEach((link, index) => {
+                const btn = document.createElement('button');
+                btn.className = 'btn';
+                btn.style.margin = '5px';
+                btn.textContent = downloadLinks.length > 1
+                    ? `Download Part ${index + 1}`
+                    : 'Download Compressed PDF';
+                btn.onclick = () => window.location.href = link;
+                linksContainer.appendChild(btn);
+            });
 
             resultsDiv.style.display = 'block';
         }
-
-        // Download button
-        downloadBtn.addEventListener('click', () => {
-            if (!compressedPdfData) return;
-
-            const byteCharacters = atob(compressedPdfData);
-            const byteNumbers = new Array(byteCharacters.length);
-            for (let i = 0; i < byteCharacters.length; i++) {
-                byteNumbers[i] = byteCharacters.charCodeAt(i);
-            }
-            const byteArray = new Uint8Array(byteNumbers);
-            const blob = new Blob([byteArray], { type: 'application/pdf' });
-
-            // DEBUG: Log actual blob size
-            const blobSizeMB = (blob.size / (1024 * 1024)).toFixed(2);
-            console.log(`[DEBUG] Downloading PDF blob: ${blobSizeMB} MB (${blob.size} bytes)`);
-            alert(`Downloading: ${blobSizeMB} MB\nIf this doesn't match the compressed size shown above, there's a bug!`);
-
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'compressed_' + (selectedFile ? selectedFile.name : 'document.pdf');
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            window.URL.revokeObjectURL(url);
-        });
 
         function showStatus(message, type) {
             statusDiv.textContent = message;
