@@ -224,16 +224,34 @@ def split_pdf(
             target_size = threshold_mb - SAFETY_BUFFER_MB  # 24.5MB max per part
             logger.info(f"Split: {file_size_mb:.2f}MB ÷ {threshold_mb}MB = {num_parts} parts needed")
 
-            def measure_pages(start_page: int, end_page: int) -> float:
-                """Actually create a temp PDF and measure its size."""
+            def measure_pages(start_page: int, end_page: int, optimize: bool = True) -> float:
+                """Create a temp PDF, optionally optimize it, and measure its size.
+
+                Args:
+                    start_page: Starting page index (0-based, inclusive)
+                    end_page: Ending page index (0-based, exclusive)
+                    optimize: If True, apply Ghostscript optimization to get accurate size
+                """
                 writer = PdfWriter()
                 for idx in range(start_page, end_page):
                     writer.add_page(reader.pages[idx])
                 temp_path = output_dir / f"{base_name}_measure_temp.pdf"
                 with open(temp_path, 'wb') as f:
                     writer.write(f)
-                size = get_file_size_mb(temp_path)
-                temp_path.unlink()
+
+                if optimize:
+                    # Apply Ghostscript optimization to get accurate final size
+                    optimized_path = output_dir / f"{base_name}_measure_opt.pdf"
+                    success, _ = optimize_split_part(temp_path, optimized_path)
+                    if success and optimized_path.exists():
+                        size = get_file_size_mb(optimized_path)
+                        optimized_path.unlink()
+                    else:
+                        size = get_file_size_mb(temp_path)
+                else:
+                    size = get_file_size_mb(temp_path)
+
+                temp_path.unlink(missing_ok=True)
                 return size
 
             # Try to find split points, increasing num_parts if needed
@@ -304,7 +322,7 @@ def split_pdf(
                     f"The PDF may have individual pages that are too large."
                 )
 
-            # Now create the actual split parts (all verified to be under threshold)
+            # Now create the actual split parts - ALWAYS optimize to match measured sizes
             output_paths: List[Path] = []
 
             for part_num, page_indices in enumerate(groups, 1):
@@ -312,63 +330,43 @@ def split_pdf(
                 for page_idx in page_indices:
                     writer.add_page(reader.pages[page_idx])
 
-                # Write uncompressed part to temporary path
+                # Write raw PyPDF2 part to temporary path
                 temp_part_path = output_dir / f"{base_name}_part{part_num}_temp.pdf"
                 with open(temp_part_path, 'wb') as out_f:
                     writer.write(out_f)
 
-                uncompressed_size_mb = get_file_size_mb(temp_part_path)
+                raw_size_mb = get_file_size_mb(temp_part_path)
                 pages_in_part = len(page_indices)
-                logger.info(f"Created {temp_part_path.name}: {pages_in_part} pages, {uncompressed_size_mb:.1f}MB")
+                logger.info(f"Created {temp_part_path.name}: {pages_in_part} pages, {raw_size_mb:.1f}MB (raw)")
 
-                # Only optimize if part exceeds threshold (Ghostscript can sometimes make files bigger)
                 part_path = output_dir / f"{base_name}_part{part_num}.pdf"
 
-                if uncompressed_size_mb > threshold_mb:
-                    # Part exceeds threshold - try OPTIMIZATION first (de-duplicates resources)
-                    # This is critical for already-compressed files where re-compression won't help
-                    logger.info(f"Part {part_num} exceeds threshold ({uncompressed_size_mb:.1f}MB), optimizing...")
-                    success, message = optimize_split_part(temp_part_path, part_path)
-                    if success:
-                        compressed_size_mb = get_file_size_mb(part_path)
-                        logger.info(f"Optimized {part_path.name}: {uncompressed_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB")
+                # ALWAYS optimize - this matches what we measured during binary search
+                success, message = optimize_split_part(temp_part_path, part_path)
+                if success:
+                    optimized_size_mb = get_file_size_mb(part_path)
+                    logger.info(f"Optimized {part_path.name}: {raw_size_mb:.1f}MB -> {optimized_size_mb:.1f}MB")
+                    temp_part_path.unlink()
 
-                        # If optimization didn't help much and still over threshold, try full compression
-                        if compressed_size_mb > target_size:
-                            logger.info(f"Still over threshold, trying full compression...")
-                            compressed_path = part_path.with_suffix('.compressed.pdf')
-                            success2, msg2 = compress_pdf_with_ghostscript(temp_part_path, compressed_path)
-                            if success2:
-                                new_size = get_file_size_mb(compressed_path)
-                                if new_size < compressed_size_mb:
-                                    # Full compression helped - use it
-                                    part_path.unlink()
-                                    compressed_path.rename(part_path)
-                                    compressed_size_mb = new_size
-                                    logger.info(f"Full compression better: {compressed_size_mb:.1f}MB")
-                                else:
-                                    # Optimization was better - keep it
-                                    compressed_path.unlink()
-                            else:
-                                logger.warning(f"Full compression failed: {msg2}")
-
-                        temp_part_path.unlink()
-                    else:
-                        # Optimization failed - try full compression
-                        logger.warning(f"Optimization failed: {message}, trying full compression...")
-                        success2, msg2 = compress_pdf_with_ghostscript(temp_part_path, part_path)
+                    # If still over threshold after optimization, try full compression
+                    if optimized_size_mb > target_size:
+                        logger.info(f"Part {part_num} still {optimized_size_mb:.1f}MB, trying full compression...")
+                        compressed_path = part_path.with_suffix('.compressed.pdf')
+                        success2, msg2 = compress_pdf_with_ghostscript(temp_part_path if temp_part_path.exists() else part_path, compressed_path)
                         if success2:
-                            compressed_size_mb = get_file_size_mb(part_path)
-                            temp_part_path.unlink()
+                            new_size = get_file_size_mb(compressed_path)
+                            if new_size < optimized_size_mb:
+                                part_path.unlink()
+                                compressed_path.rename(part_path)
+                                logger.info(f"Full compression: {optimized_size_mb:.1f}MB -> {new_size:.1f}MB")
+                            else:
+                                compressed_path.unlink()
                         else:
-                            logger.warning(f"Compression also failed: {msg2}")
-                            temp_part_path.rename(part_path)
-                            compressed_size_mb = uncompressed_size_mb
+                            logger.warning(f"Full compression failed: {msg2}")
                 else:
-                    # Part already under threshold, just rename
+                    # Optimization failed - just rename
+                    logger.warning(f"Optimization failed: {message}")
                     temp_part_path.rename(part_path)
-                    compressed_size_mb = uncompressed_size_mb
-                    logger.info(f"Part {part_num} already under threshold: {compressed_size_mb:.1f}MB")
 
                 output_paths.append(part_path)
 
