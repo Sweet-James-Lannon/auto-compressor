@@ -6,8 +6,6 @@ import subprocess
 from pathlib import Path
 from typing import Tuple, Optional
 
-from exceptions import EncryptionError, MetadataCorruptionError, StructureError
-
 logger = logging.getLogger(__name__)
 
 

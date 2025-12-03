@@ -5,7 +5,6 @@ Handles background processing to avoid blocking the main request threads.
 """
 
 import logging
-import os
 import queue
 import threading
 import time

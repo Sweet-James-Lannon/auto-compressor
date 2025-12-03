@@ -5,6 +5,7 @@ the size threshold into smaller parts for email attachment limits.
 """
 
 import logging
+import math
 import os
 from pathlib import Path
 from typing import List
@@ -18,7 +19,6 @@ from exceptions import EncryptionError, StructureError, SplitError
 # Constants
 SPLIT_THRESHOLD_MB: float = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 SAFETY_BUFFER_MB: float = 0.5  # Target 24.5MB to ensure we're under 25MB limit
-MAX_SPLIT_PARTS: int = int(os.environ.get('MAX_SPLIT_PARTS', '50'))  # Allow more splits for large files
 
 logger = logging.getLogger(__name__)
 
@@ -33,113 +33,6 @@ def get_file_size_mb(path: Path) -> float:
         File size in MB.
     """
     return path.stat().st_size / (1024 * 1024)
-
-
-def estimate_page_sizes(reader: PdfReader, total_file_size_mb: float) -> List[float]:
-    """Estimate each page's contribution to file size.
-
-    For scanned PDFs, the bulk of data is in XObjects (images), not content streams.
-    This function estimates by looking at image resources on each page.
-
-    Args:
-        reader: PyPDF2 PdfReader object
-        total_file_size_mb: Total file size in MB
-
-    Returns:
-        List of estimated sizes in MB for each page
-    """
-    total_pages = len(reader.pages)
-    page_weights = []
-
-    for page in reader.pages:
-        weight = 1.0  # Base weight
-        try:
-            # Look for XObjects (images) which contain the actual data
-            resources = page.get("/Resources")
-            if resources:
-                xobjects = resources.get("/XObject")
-                if xobjects:
-                    # Sum up the sizes of all XObjects on this page
-                    for name in xobjects:
-                        try:
-                            xobj = xobjects[name]
-                            if hasattr(xobj, 'get_data'):
-                                data = xobj.get_data()
-                                weight += len(data) / 1000  # KB as weight
-                            elif hasattr(xobj, '_data'):
-                                weight += len(xobj._data) / 1000
-                        except Exception:
-                            weight += 100  # Default weight for unreadable XObjects
-        except Exception:
-            pass  # Keep default weight
-
-        page_weights.append(max(1.0, weight))
-
-    # Normalize weights to sum to total file size
-    total_weight = sum(page_weights)
-    if total_weight > 0:
-        return [w / total_weight * total_file_size_mb for w in page_weights]
-
-    # Fallback: even distribution
-    return [total_file_size_mb / total_pages] * total_pages
-
-
-def split_into_n_parts(
-    page_sizes: List[float],
-    num_parts: int,
-    max_size_mb: float
-) -> List[List[int]]:
-    """Split pages into exactly N parts, balanced by estimated size.
-
-    Distributes pages to achieve roughly equal MB per part.
-    Each part will be approximately (total_size / num_parts) MB.
-
-    Args:
-        page_sizes: Estimated size in MB for each page
-        num_parts: Exact number of parts to create
-        max_size_mb: Hard maximum per part (safety limit)
-
-    Returns:
-        List of page index lists, one per part
-    """
-    total_size = sum(page_sizes)
-    target_per_part = total_size / num_parts
-
-    parts = []
-    current_part = []
-    current_size = 0.0
-    remaining_parts = num_parts
-
-    for page_idx, page_size in enumerate(page_sizes):
-        pages_remaining = len(page_sizes) - page_idx
-
-        # Must start new part if:
-        # 1. Current part hit target AND we have enough pages for remaining parts
-        # 2. Current part would exceed hard max
-        should_split = (
-            current_part and
-            remaining_parts > 1 and
-            pages_remaining >= remaining_parts and
-            (current_size >= target_per_part or current_size + page_size > max_size_mb)
-        )
-
-        if should_split:
-            parts.append(current_part)
-            current_part = []
-            current_size = 0.0
-            remaining_parts -= 1
-            # Recalculate target for remaining pages
-            remaining_size = sum(page_sizes[page_idx:])
-            target_per_part = remaining_size / remaining_parts
-
-        current_part.append(page_idx)
-        current_size += page_size
-
-    # Don't forget the last part
-    if current_part:
-        parts.append(current_part)
-
-    return parts
 
 
 def needs_splitting(pdf_path: Path, threshold_mb: float = SPLIT_THRESHOLD_MB) -> bool:
@@ -189,8 +82,6 @@ def split_pdf(
         StructureError: If PDF is corrupted or malformed.
         SplitError: If PDF cannot be split into parts under threshold.
     """
-    import math
-
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
 
@@ -352,7 +243,7 @@ def split_pdf(
                     if optimized_size_mb > target_size:
                         logger.info(f"Part {part_num} still {optimized_size_mb:.1f}MB, trying full compression...")
                         compressed_path = part_path.with_suffix('.compressed.pdf')
-                        success2, msg2 = compress_pdf_with_ghostscript(temp_part_path if temp_part_path.exists() else part_path, compressed_path)
+                        success2, msg2 = compress_pdf_with_ghostscript(part_path, compressed_path)
                         if success2:
                             new_size = get_file_size_mb(compressed_path)
                             if new_size < optimized_size_mb:

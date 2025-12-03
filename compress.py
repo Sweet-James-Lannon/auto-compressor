@@ -3,7 +3,7 @@
 import logging
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from PyPDF2 import PdfReader
 
