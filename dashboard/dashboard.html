@@ -582,10 +582,16 @@
                     <div class="debug-item">
                         <label>Job ID:</label>
                         <value id="debug-job-id">-</value>
+                        <button class="btn-secondary" id="copy-job-id-btn" style="margin-top: 8px; padding: 8px 15px; font-size: 0.6em;">Copy Job ID</button>
                     </div>
                     <div class="debug-item">
                         <label>Timestamp:</label>
                         <value id="debug-timestamp">-</value>
+                    </div>
+                    <div class="debug-item">
+                        <label>Diagnostics:</label>
+                        <button class="btn-secondary" id="run-diagnostics-btn" style="margin-top: 8px; padding: 8px 15px; font-size: 0.6em;">Run Diagnostics</button>
+                        <pre id="debug-diagnostics" style="margin-top: 10px; display: none;">-</pre>
                     </div>
                     <div class="debug-item">
                         <label>Raw JSON Response:</label>
@@ -819,12 +825,8 @@
 
         async function pollForCompletion(jobId, headers) {
             return new Promise((resolve, reject) => {
-                let dots = 0;
                 pollInterval = setInterval(async () => {
                     try {
-                        dots = (dots + 1) % 4;
-                        progressBar.textContent = 'Processing' + '.'.repeat(dots);
-
                         const response = await fetch(`/status/${jobId}`, { headers });
                         const { data, error } = await safeParseJson(response);
 
@@ -832,6 +834,17 @@
                             clearInterval(pollInterval);
                             reject(new Error(error));
                             return;
+                        }
+
+                        // Update progress bar with real-time data from backend
+                        if (data.status === 'processing' && data.progress) {
+                            const { percent, stage, message } = data.progress;
+                            progressBar.style.width = percent + '%';
+                            progressBar.textContent = `${percent}% - ${message}`;
+                            showStatus(`${stage.toUpperCase()}: ${message}`, 'info');
+                        } else if (data.status === 'processing') {
+                            // Fallback if no progress data
+                            progressBar.textContent = 'Processing...';
                         }
 
                         if (data.status === 'completed') {
@@ -846,7 +859,7 @@
                         clearInterval(pollInterval);
                         reject(err);
                     }
-                }, 2000);
+                }, 1000); // Poll every 1 second for smoother progress updates
             });
         }
 
@@ -958,9 +971,11 @@
             });
 
             // 4. DEBUG CONSOLE
-            document.getElementById('debug-job-id').textContent = result.job_id || 'N/A';
+            document.getElementById('debug-job-id').textContent = result.request_id || result.job_id || 'N/A';
             document.getElementById('debug-timestamp').textContent = new Date().toISOString();
             document.getElementById('debug-json').textContent = JSON.stringify(result, null, 2);
+            // Reset diagnostics display
+            document.getElementById('debug-diagnostics').style.display = 'none';
 
             resultsDiv.style.display = 'block';
         }
@@ -1094,6 +1109,68 @@
             } finally {
                 verifyBtn.disabled = false;
                 verifyBtn.textContent = 'Run Verification Test';
+            }
+        });
+
+        // Copy Job ID button
+        document.getElementById('copy-job-id-btn').addEventListener('click', () => {
+            const jobId = document.getElementById('debug-job-id').textContent;
+            if (jobId && jobId !== '-' && jobId !== 'N/A') {
+                navigator.clipboard.writeText(jobId).then(() => {
+                    showStatus('Job ID copied to clipboard!', 'success');
+                }).catch(() => {
+                    showStatus('Failed to copy Job ID', 'error');
+                });
+            }
+        });
+
+        // Run Diagnostics button
+        document.getElementById('run-diagnostics-btn').addEventListener('click', async () => {
+            const jobId = document.getElementById('debug-job-id').textContent;
+            if (!jobId || jobId === '-' || jobId === 'N/A') {
+                showStatus('No job ID available for diagnostics', 'error');
+                return;
+            }
+
+            const diagBtn = document.getElementById('run-diagnostics-btn');
+            const diagPre = document.getElementById('debug-diagnostics');
+
+            diagBtn.disabled = true;
+            diagBtn.textContent = 'Running...';
+            diagPre.style.display = 'block';
+            diagPre.textContent = 'Fetching diagnostics...';
+
+            try {
+                const headers = {};
+                const token = apiTokenInput.value.trim();
+                if (token) {
+                    headers['Authorization'] = `Bearer ${token}`;
+                }
+
+                const response = await fetch(`/diagnose/${jobId}`, { headers });
+                const { data, error } = await safeParseJson(response);
+
+                if (error) {
+                    diagPre.textContent = `Error: ${error}`;
+                    showStatus('Diagnostics failed', 'error');
+                } else {
+                    diagPre.textContent = JSON.stringify(data, null, 2);
+                    showStatus('Diagnostics loaded!', 'success');
+
+                    // Highlight any size discrepancies
+                    if (data.diagnostics && data.diagnostics.size_verification) {
+                        const sv = data.diagnostics.size_verification;
+                        if (Math.abs(sv.discrepancy_percent) > 1) {
+                            showStatus(`WARNING: Size discrepancy of ${sv.discrepancy_percent}%!`, 'error');
+                        }
+                    }
+                }
+            } catch (err) {
+                diagPre.textContent = `Error: ${err.message}`;
+                showStatus('Diagnostics failed', 'error');
+            } finally {
+                diagBtn.disabled = false;
+                diagBtn.textContent = 'Run Diagnostics';
             }
         });
     </script>

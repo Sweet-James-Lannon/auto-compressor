@@ -15,6 +15,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from compress import compress_pdf
 from compress_ghostscript import get_ghostscript_command
+from pdf_diagnostics import diagnose_for_job, analyze_pdf, get_quality_warnings
 from exceptions import (
     PDFCompressionError,
     EncryptionError,
@@ -131,8 +132,18 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         job_id: The job identifier.
         task_data: Dict containing either 'pdf_bytes' or 'download_url'.
     """
+    # Progress callback to update job status in real-time
+    def progress_callback(percent: int, stage: str, message: str):
+        job_queue.update_job(job_id, "processing", progress={
+            "percent": percent,
+            "stage": stage,
+            "message": message
+        })
+
     try:
         input_path = UPLOAD_FOLDER / f"{job_id}_input.pdf"
+
+        progress_callback(5, "uploading", "Receiving file...")
 
         # Get PDF bytes - either from task_data or download from URL
         if 'pdf_bytes' in task_data:
@@ -145,16 +156,21 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
 
         track_file(input_path)
 
+        progress_callback(10, "compressing", "Starting compression...")
+
         # Compress with splitting enabled
         result = compress_pdf(
             str(input_path),
             working_dir=UPLOAD_FOLDER,
-            split_threshold_mb=SPLIT_THRESHOLD_MB
+            split_threshold_mb=SPLIT_THRESHOLD_MB,
+            progress_callback=progress_callback
         )
 
         # Track all output files
         for path_str in result.get('output_paths', [result['output_path']]):
             track_file(Path(path_str))
+
+        progress_callback(98, "finalizing", "Preparing download links...")
 
         # Build download links
         download_links = [
@@ -318,10 +334,14 @@ def get_status(job_id: str):
         return jsonify({"success": False, "error": "Job not found"}), 404
 
     if job.status == "processing":
-        return jsonify({
+        response = {
             "success": True,
             "status": "processing"
-        })
+        }
+        # Include progress data if available
+        if job.progress:
+            response["progress"] = job.progress
+        return jsonify(response)
 
     if job.status == "failed":
         response = {
@@ -370,6 +390,75 @@ def download(filename):
     if not file_path.exists():
         return jsonify({"success": False, "error": "File not found"}), 404
     return send_file(file_path, as_attachment=True, download_name=safe_filename)
+
+
+@app.route('/diagnose/<job_id>', methods=['GET'])
+@require_auth
+def diagnose(job_id: str):
+    """
+    Get diagnostic information for a compression job.
+
+    Provides detailed analysis of input/output files, size verification,
+    and quality warnings. Useful for debugging size discrepancies.
+
+    Args:
+        job_id: The job identifier from /compress response.
+
+    Returns:
+        Diagnostic report with file analyses and size verification.
+    """
+    job = job_queue.get_job(job_id)
+
+    if not job:
+        return jsonify({"success": False, "error": "Job not found"}), 404
+
+    if job.status == "processing":
+        return jsonify({
+            "success": True,
+            "job_id": job_id,
+            "status": "processing",
+            "message": "Job still processing, diagnostics available after completion"
+        })
+
+    if job.status == "failed":
+        return jsonify({
+            "success": False,
+            "job_id": job_id,
+            "status": "failed",
+            "error": job.error
+        })
+
+    # Job completed - run diagnostics
+    result = job.result or {}
+    download_links = result.get("download_links", [])
+    reported_compressed_mb = result.get("compressed_mb", 0)
+
+    # Convert download links back to file paths
+    output_paths = []
+    for link in download_links:
+        filename = link.split("/")[-1]
+        output_paths.append(str(UPLOAD_FOLDER / filename))
+
+    # Check if input file still exists
+    input_path = UPLOAD_FOLDER / f"{job_id}_input.pdf"
+    input_exists = input_path.exists()
+
+    # Generate diagnostic report
+    report = diagnose_for_job(
+        input_path if input_exists else None,
+        output_paths,
+        reported_compressed_mb
+    )
+
+    return jsonify({
+        "success": True,
+        "job_id": job_id,
+        "status": "completed",
+        "job_result": result,
+        "diagnostics": report,
+        "input_file_available": input_exists,
+        "timestamp": datetime.utcnow().isoformat()
+    })
 
 
 if __name__ == '__main__':

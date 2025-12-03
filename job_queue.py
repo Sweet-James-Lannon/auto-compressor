@@ -32,6 +32,7 @@ class Job:
     created_at: float = field(default_factory=time.time)
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    progress: Optional[Dict[str, Any]] = None  # Real-time progress info
 
 
 # Module-level state
@@ -74,7 +75,8 @@ def update_job(
     job_id: str,
     status: str,
     result: Optional[Dict[str, Any]] = None,
-    error: Optional[str] = None
+    error: Optional[str] = None,
+    progress: Optional[Dict[str, Any]] = None
 ) -> None:
     """Update a job's status and result.
 
@@ -83,14 +85,20 @@ def update_job(
         status: New status ("processing", "completed", "failed").
         result: Optional result data for completed jobs.
         error: Optional error message for failed jobs.
+        progress: Optional progress data (percent, stage, message).
     """
     with _job_lock:
         if job_id in _jobs:
             _jobs[job_id].status = status
             _jobs[job_id].result = result
             _jobs[job_id].error = error
+            if progress is not None:
+                _jobs[job_id].progress = progress
 
-    logger.info(f"[{job_id}] Status updated: {status}")
+    if progress:
+        logger.debug(f"[{job_id}] Progress: {progress.get('percent', 0)}% - {progress.get('stage', 'unknown')}")
+    else:
+        logger.info(f"[{job_id}] Status updated: {status}")
 
 
 def enqueue(job_id: str, task_data: Dict[str, Any]) -> None:

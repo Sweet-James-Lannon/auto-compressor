@@ -180,6 +180,10 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
         # Strip metadata that might confuse email clients
         "-dFastWebView=true",
         "-dPrinted=false",
+        # Speed optimizations (NO effect on compression ratio)
+        "-dNumRenderingThreads=4",
+        "-dBandHeight=100",
+        "-dBandBufferSpace=500000000",
         f"-sOutputFile={output_path}",
         str(input_path)
     ]
