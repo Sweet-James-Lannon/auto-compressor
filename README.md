@@ -21,7 +21,6 @@ Requires Ghostscript: `brew install ghostscript` (Mac) or `apt-get install ghost
 | `PORT` | Server port | 5005 |
 | `FILE_RETENTION_SECONDS` | Auto-cleanup interval | 86400 (24h) |
 | `SPLIT_THRESHOLD_MB` | Max file size before auto-split | 25 |
-| `MAX_SPLIT_PARTS` | Maximum parts when splitting | 50 |
 
 ## Features
 
@@ -41,7 +40,6 @@ Structured errors with user-friendly messages:
 |------------|------|-------|
 | EncryptionError | 422 | Password-protected PDF |
 | StructureError | 422 | Corrupted/damaged PDF |
-| CompressionFailureError | 422 | Already optimized |
 | SplitError | 422 | Cannot split small enough |
 
 ## API
@@ -123,7 +121,8 @@ Poll for job completion. Requires auth if `API_TOKEN` is set.
     "download_seconds": 1.2,
     "compression_seconds": 8.5,
     "total_seconds": 9.7
-  }
+  },
+  "performance_notes": []
 }
 ```
 
@@ -150,7 +149,14 @@ Poll for job completion. Requires auth if `API_TOKEN` is set.
     "download_seconds": 3.1,
     "compression_seconds": 45.2,
     "total_seconds": 48.3
-  }
+  },
+  "performance_notes": [
+    {
+      "stage": "compression",
+      "seconds": 45.2,
+      "reason": "PDF has 156 pages - large documents require more processing"
+    }
+  ]
 }
 ```
 

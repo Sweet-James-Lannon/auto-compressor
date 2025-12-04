@@ -6,7 +6,6 @@ the size threshold into smaller parts for email attachment limits.
 
 import logging
 import math
-import os
 from pathlib import Path
 from typing import List
 
@@ -15,49 +14,20 @@ from PyPDF2.errors import PdfReadError
 
 from compress_ghostscript import optimize_split_part, compress_pdf_with_ghostscript
 from exceptions import EncryptionError, StructureError, SplitError
+from utils import get_file_size_mb
 
 # Constants
-SPLIT_THRESHOLD_MB: float = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
+DEFAULT_THRESHOLD_MB: float = 25.0
 SAFETY_BUFFER_MB: float = 0.5  # Target 24.5MB to ensure we're under 25MB limit
 
 logger = logging.getLogger(__name__)
-
-
-def get_file_size_mb(path: Path) -> float:
-    """Get file size in megabytes.
-
-    Args:
-        path: Path to the file.
-
-    Returns:
-        File size in MB.
-    """
-    return path.stat().st_size / (1024 * 1024)
-
-
-def needs_splitting(pdf_path: Path, threshold_mb: float = SPLIT_THRESHOLD_MB) -> bool:
-    """Check if PDF exceeds size threshold and needs splitting.
-
-    Args:
-        pdf_path: Path to the PDF file.
-        threshold_mb: Size threshold in MB. Defaults to SPLIT_THRESHOLD_MB.
-
-    Returns:
-        True if file exceeds threshold, False otherwise.
-    """
-    pdf_path = Path(pdf_path)
-    if not pdf_path.exists():
-        return False
-
-    size_mb = get_file_size_mb(pdf_path)
-    return size_mb > threshold_mb
 
 
 def split_pdf(
     pdf_path: Path,
     output_dir: Path,
     base_name: str,
-    threshold_mb: float = SPLIT_THRESHOLD_MB
+    threshold_mb: float = DEFAULT_THRESHOLD_MB
 ) -> List[Path]:
     """Split PDF into optimal number of parts using smart byte-based distribution.
 

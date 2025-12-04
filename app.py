@@ -12,6 +12,7 @@ from typing import Any, Dict
 
 from flask import Flask, jsonify, request, render_template, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.utils import secure_filename
 
 from compress import compress_pdf
 from compress_ghostscript import get_ghostscript_command
@@ -21,7 +22,6 @@ from exceptions import (
     EncryptionError,
     StructureError,
     MetadataCorruptionError,
-    CompressionFailureError,
     SplitError,
 )
 import job_queue
@@ -91,6 +91,58 @@ def get_error_status_code(error: Exception) -> int:
     if isinstance(error, ValueError):
         return 400
     return 500
+
+
+def get_performance_notes(timings: dict, pdf_info: dict, warnings: list) -> list:
+    """Generate explanations for slow processing.
+
+    Called after compression to explain to users WHY processing took time.
+    Only returns notes when processing exceeds expected thresholds.
+
+    Args:
+        timings: Dict with download_seconds, compression_seconds
+        pdf_info: Dict with page_count, original_mb
+        warnings: Quality warnings from get_quality_warnings()
+
+    Returns:
+        List of performance note dicts with stage, seconds, and reason.
+    """
+    notes = []
+
+    # Slow compression (>30 seconds)
+    compress_seconds = timings.get("compression_seconds", 0)
+    if compress_seconds > 30:
+        pages = pdf_info.get("page_count") or 0
+        size_mb = pdf_info.get("original_mb") or 0
+
+        # Check if warnings indicate scanned document
+        is_scanned = any(w.get("type") == "scanned_document" for w in warnings)
+
+        if pages > 100:
+            reason = f"PDF has {pages} pages - large documents require more processing"
+        elif size_mb > 50:
+            reason = f"PDF is {size_mb:.0f}MB - large files take longer to compress"
+        elif is_scanned:
+            reason = "Scanned document with images - these compress slower than text PDFs"
+        else:
+            reason = "Complex PDF structure required extended processing"
+
+        notes.append({
+            "stage": "compression",
+            "seconds": compress_seconds,
+            "reason": reason
+        })
+
+    # Slow download (>10 seconds)
+    download_seconds = timings.get("download_seconds", 0)
+    if download_seconds > 10:
+        notes.append({
+            "stage": "download",
+            "seconds": download_seconds,
+            "reason": "Source server responded slowly - not within our control"
+        })
+
+    return notes
 
 
 # File tracking for cleanup
@@ -187,6 +239,20 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             for p in result.get('output_paths', [result['output_path']])
         ]
 
+        # Build timing info
+        timings = {
+            "download_seconds": download_time,
+            "compression_seconds": compress_time,
+            "total_seconds": round(time.time() - start_time, 2)
+        }
+
+        # Generate performance notes explaining why processing took time
+        perf_notes = get_performance_notes(
+            timings,
+            {"page_count": result.get('page_count'), "original_mb": result['original_size_mb']},
+            warnings
+        )
+
         job_queue.update_job(job_id, "completed", result={
             "was_split": result.get('was_split', False),
             "total_parts": result.get('total_parts', 1),
@@ -199,11 +265,8 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             "page_count": result.get('page_count'),
             "part_sizes": result.get('part_sizes'),
             "quality_warnings": warnings,
-            "processing_time": {
-                "download_seconds": download_time,
-                "compression_seconds": compress_time,
-                "total_seconds": round(time.time() - start_time, 2)
-            }
+            "processing_time": timings,
+            "performance_notes": perf_notes
         })
 
         logger.info(f"[{job_id}] Job completed: {len(download_links)} file(s)")
@@ -391,7 +454,6 @@ def download(filename):
     Files are automatically cleaned up after FILE_RETENTION_SECONDS.
     """
     # Security: Prevent path traversal attacks
-    from werkzeug.utils import secure_filename
     safe_filename = secure_filename(filename)
     if not safe_filename or safe_filename != filename:
         return jsonify({"success": False, "error": "Invalid filename"}), 400

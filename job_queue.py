@@ -4,6 +4,7 @@ Provides job queue and status tracking for long-running compression tasks.
 Handles background processing to avoid blocking the main request threads.
 """
 
+import ipaddress
 import logging
 import queue
 import threading
@@ -12,6 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -121,9 +123,6 @@ def _is_safe_url(url: str) -> bool:
     Returns:
         True if URL appears safe, False otherwise.
     """
-    from urllib.parse import urlparse
-    import ipaddress
-
     try:
         parsed = urlparse(url)
 

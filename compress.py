@@ -16,13 +16,9 @@ from exceptions import (
     MetadataCorruptionError,
     SplitError,
 )
+from utils import get_file_size_mb
 
 logger = logging.getLogger(__name__)
-
-
-def get_file_size_mb(path: Path) -> float:
-    """Get file size in MB."""
-    return path.stat().st_size / (1024 * 1024)
 
 
 def compress_pdf(

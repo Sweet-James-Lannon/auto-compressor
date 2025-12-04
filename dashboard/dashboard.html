@@ -348,6 +348,37 @@
             color: #1E40AF;
         }
 
+        .performance-notes {
+            margin-bottom: 20px;
+            padding: 12px 15px;
+            background: #E0F2FE;
+            border: 2px solid #0284C7;
+            border-radius: 4px;
+        }
+
+        .performance-notes h4 {
+            color: #0369A1;
+            margin-bottom: 10px;
+            font-size: 0.7em;
+            text-transform: uppercase;
+        }
+
+        .performance-notes .note-item {
+            padding: 6px 0;
+            font-size: 0.65em;
+            color: #0C4A6E;
+            line-height: 1.6;
+        }
+
+        .performance-notes .note-item .stage {
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .performance-notes .note-item .time {
+            color: #0369A1;
+        }
+
         .stats-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -626,6 +657,12 @@
 
             <!-- Quality Warnings (hidden by default) -->
             <div class="quality-warnings" id="quality-warnings" style="display: none;"></div>
+
+            <!-- Performance Notes (hidden by default) - explains why processing took time -->
+            <div class="performance-notes" id="performance-notes" style="display: none;">
+                <h4>Why did this take time?</h4>
+                <div id="performance-notes-list"></div>
+            </div>
 
             <!-- Detailed Stats Panel -->
             <div class="stats-grid">
@@ -1011,6 +1048,18 @@
                     .join('');
             } else {
                 warningsEl.style.display = 'none';
+            }
+
+            // Show performance notes if any (explains why processing took time)
+            const perfNotesEl = document.getElementById('performance-notes');
+            const perfNotesListEl = document.getElementById('performance-notes-list');
+            if (result.performance_notes && result.performance_notes.length > 0) {
+                perfNotesEl.style.display = 'block';
+                perfNotesListEl.innerHTML = result.performance_notes
+                    .map(n => `<div class="note-item"><span class="stage">${n.stage}</span> (<span class="time">${n.seconds}s</span>): ${n.reason}</div>`)
+                    .join('');
+            } else {
+                perfNotesEl.style.display = 'none';
             }
 
             // 2. DETAILED STATS PANEL
