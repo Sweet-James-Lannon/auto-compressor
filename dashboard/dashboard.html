@@ -330,6 +330,24 @@
             box-shadow: 4px 4px 0px 0px rgba(239,68,68,0.5);
         }
 
+        .quality-warnings {
+            margin-bottom: 20px;
+            padding: 12px 15px;
+            background: #FEF3C7;
+            border: 2px solid #F59E0B;
+            border-radius: 4px;
+        }
+
+        .quality-warnings .warning-item {
+            padding: 6px 0;
+            font-size: 0.85em;
+            color: #92400E;
+        }
+
+        .quality-warnings .warning-item.info {
+            color: #1E40AF;
+        }
+
         .stats-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -605,6 +623,9 @@
             <div class="compression-status success" id="compression-status">
                 Compression: SUCCESS
             </div>
+
+            <!-- Quality Warnings (hidden by default) -->
+            <div class="quality-warnings" id="quality-warnings" style="display: none;"></div>
 
             <!-- Detailed Stats Panel -->
             <div class="stats-grid">
@@ -981,6 +1002,17 @@
                 statusEl.textContent = 'Compression: SUCCESS';
             }
 
+            // Show quality warnings if any
+            const warningsEl = document.getElementById('quality-warnings');
+            if (result.quality_warnings && result.quality_warnings.length > 0) {
+                warningsEl.style.display = 'block';
+                warningsEl.innerHTML = result.quality_warnings
+                    .map(w => `<div class="warning-item ${w.severity || ''}">${w.message}</div>`)
+                    .join('');
+            } else {
+                warningsEl.style.display = 'none';
+            }
+
             // 2. DETAILED STATS PANEL
             const originalBytes = result.original_size || (result.original_mb * 1024 * 1024);
             const compressedBytes = result.compressed_size || (result.compressed_mb * 1024 * 1024);
@@ -1005,7 +1037,10 @@
             const processingTimeCard = document.getElementById('processing-time-card');
             if (result.processing_time) {
                 processingTimeCard.style.display = 'block';
-                document.getElementById('processing-time').textContent = result.processing_time + 's';
+                const time = typeof result.processing_time === 'object'
+                    ? result.processing_time.total_seconds
+                    : result.processing_time;
+                document.getElementById('processing-time').textContent = time + 's';
             } else {
                 processingTimeCard.style.display = 'none';
             }

@@ -250,38 +250,6 @@ def get_quality_warnings(pdf_path: Path) -> list:
     return warnings
 
 
-def compare_files(original_path: Path, compressed_path: Path) -> Dict[str, Any]:
-    """Compare original and compressed PDF files.
-
-    Args:
-        original_path: Path to original PDF.
-        compressed_path: Path to compressed PDF.
-
-    Returns:
-        Dictionary with comparison data.
-    """
-    original = analyze_pdf(original_path)
-    compressed = analyze_pdf(compressed_path)
-
-    original_bytes = original.get("file_size_bytes", 0)
-    compressed_bytes = compressed.get("file_size_bytes", 0)
-
-    reduction_bytes = original_bytes - compressed_bytes
-    reduction_percent = (reduction_bytes / original_bytes * 100) if original_bytes > 0 else 0
-
-    return {
-        "original_size_bytes": original_bytes,
-        "original_size_mb": original.get("file_size_mb", 0),
-        "compressed_size_bytes": compressed_bytes,
-        "compressed_size_mb": compressed.get("file_size_mb", 0),
-        "reduction_bytes": reduction_bytes,
-        "reduction_percent": round(reduction_percent, 1),
-        "original_page_count": original.get("page_count", 0),
-        "compressed_page_count": compressed.get("page_count", 0),
-        "metadata_stripped": original.get("metadata", {}) != compressed.get("metadata", {}),
-    }
-
-
 def diagnose_for_job(
     input_path: Optional[Path],
     output_paths: list,

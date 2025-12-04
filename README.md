@@ -114,7 +114,16 @@ Poll for job completion. Requires auth if `API_TOKEN` is set.
   "compressed_mb": 5.2,
   "reduction_percent": 89.6,
   "was_split": false,
-  "total_parts": 1
+  "total_parts": 1,
+  "compression_method": "ghostscript",
+  "page_count": 42,
+  "part_sizes": null,
+  "quality_warnings": [],
+  "processing_time": {
+    "download_seconds": 1.2,
+    "compression_seconds": 8.5,
+    "total_seconds": 9.7
+  }
 }
 ```
 
@@ -132,7 +141,16 @@ Poll for job completion. Requires auth if `API_TOKEN` is set.
   ],
   "original_mb": 80.0,
   "compressed_mb": 45.0,
-  "reduction_percent": 43.8
+  "reduction_percent": 43.8,
+  "compression_method": "ghostscript",
+  "page_count": 156,
+  "part_sizes": [15728640, 14680064, 16777216],
+  "quality_warnings": [],
+  "processing_time": {
+    "download_seconds": 3.1,
+    "compression_seconds": 45.2,
+    "total_seconds": 48.3
+  }
 }
 ```
 

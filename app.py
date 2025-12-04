@@ -132,6 +132,8 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         job_id: The job identifier.
         task_data: Dict containing either 'pdf_bytes' or 'download_url'.
     """
+    start_time = time.time()
+
     # Progress callback to update job status in real-time
     def progress_callback(percent: int, stage: str, message: str):
         job_queue.update_job(job_id, "processing", progress={
@@ -155,7 +157,12 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             raise ValueError("No PDF data provided")
 
         track_file(input_path)
+        download_time = round(time.time() - start_time, 2)
 
+        # Get quality warnings before compression
+        warnings = get_quality_warnings(str(input_path))
+
+        compress_start = time.time()
         progress_callback(10, "compressing", "Starting compression...")
 
         # Compress with splitting enabled
@@ -165,6 +172,8 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             split_threshold_mb=SPLIT_THRESHOLD_MB,
             progress_callback=progress_callback
         )
+
+        compress_time = round(time.time() - compress_start, 2)
 
         # Track all output files
         for path_str in result.get('output_paths', [result['output_path']]):
@@ -186,7 +195,15 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             "compressed_mb": result['compressed_size_mb'],
             "reduction_percent": result['reduction_percent'],
             "compression_method": result['compression_method'],
-            "request_id": job_id
+            "request_id": job_id,
+            "page_count": result.get('page_count'),
+            "part_sizes": result.get('part_sizes'),
+            "quality_warnings": warnings,
+            "processing_time": {
+                "download_seconds": download_time,
+                "compression_seconds": compress_time,
+                "total_seconds": round(time.time() - start_time, 2)
+            }
         })
 
         logger.info(f"[{job_id}] Job completed: {len(download_links)} file(s)")

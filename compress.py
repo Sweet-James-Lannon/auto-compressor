@@ -65,11 +65,13 @@ def compress_pdf(
     report_progress(5, "validating", "Validating PDF...")
 
     # Validate PDF before processing - catch encrypted files early
+    page_count = None
     try:
         with open(input_path, 'rb') as f:
             reader = PdfReader(f)
             if reader.is_encrypted:
                 raise EncryptionError.for_file(input_path.name)
+            page_count = len(reader.pages)
     except EncryptionError:
         raise
     except Exception as e:
@@ -134,7 +136,9 @@ def compress_pdf(
                 "was_split": len(output_paths) > 1,
                 "total_parts": len(output_paths),
                 "success": True,
-                "note": "Already optimized, split for size"
+                "note": "Already optimized, split for size",
+                "page_count": page_count,
+                "part_sizes": [p.stat().st_size for p in output_paths]
             }
 
         return {
@@ -147,7 +151,9 @@ def compress_pdf(
             "was_split": False,
             "total_parts": 1,
             "success": True,
-            "note": "Already optimized"
+            "note": "Already optimized",
+            "page_count": page_count,
+            "part_sizes": None
         }
 
     reduction = ((original_size - compressed_size) / original_size) * 100
@@ -179,7 +185,9 @@ def compress_pdf(
             "compression_method": "ghostscript",
             "was_split": len(output_paths) > 1,
             "total_parts": len(output_paths),
-            "success": True
+            "success": True,
+            "page_count": page_count,
+            "part_sizes": [p.stat().st_size for p in output_paths]
         }
 
     # No splitting needed
@@ -195,5 +203,7 @@ def compress_pdf(
         "compression_method": "ghostscript",
         "was_split": False,
         "total_parts": 1,
-        "success": True
+        "success": True,
+        "page_count": page_count,
+        "part_sizes": None
     }
