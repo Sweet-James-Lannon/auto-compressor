@@ -164,22 +164,63 @@
             height: 40px;
             background: #f0f0f0;
             border: 4px solid #000000;
-            overflow: hidden;
+            overflow: visible;
             margin: 20px 0;
             display: none;
             box-shadow: inset 2px 2px 0px 0px rgba(0,0,0,0.3);
+            position: relative;
         }
 
         .progress-bar {
             height: 100%;
             background: #4169E1;
-            transition: width 0.3s;
+            transition: width 0.5s ease-in-out;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
             font-weight: normal;
             border-right: 4px solid #000000;
+            position: relative;
+            animation: progressPulse 2s ease-in-out infinite;
+            font-size: 0.65em;
+            white-space: nowrap;
+            padding: 0 8px;
+            min-width: fit-content;
+        }
+
+        @keyframes progressPulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.85;
+            }
+        }
+
+        .progress-bar::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(
+                90deg,
+                transparent,
+                rgba(255, 255, 255, 0.3) 50%,
+                transparent
+            );
+            animation: shimmer 2s infinite;
+        }
+
+        @keyframes shimmer {
+            0% {
+                transform: translateX(-100%);
+            }
+            100% {
+                transform: translateX(100%);
+            }
         }
 
         .results {
@@ -487,6 +528,37 @@
             background: #EF4444;
             color: white;
         }
+
+        .outlook-disclaimer {
+            background: #fff3cd;
+            padding: 20px;
+            border: 4px solid #ffc107;
+            margin: 20px 0;
+            box-shadow: 4px 4px 0px 0px rgba(255,193,7,0.5);
+        }
+
+        .outlook-disclaimer h4 {
+            color: #856404;
+            margin-bottom: 15px;
+            font-size: 0.75em;
+            text-transform: uppercase;
+        }
+
+        .outlook-disclaimer p {
+            color: #856404;
+            font-size: 0.6em;
+            line-height: 1.8;
+            margin-bottom: 12px;
+        }
+
+        .outlook-disclaimer p:last-child {
+            margin-bottom: 0;
+        }
+
+        .outlook-disclaimer strong {
+            color: #000000;
+            font-weight: normal;
+        }
     </style>
 </head>
 <body>
@@ -565,6 +637,22 @@
 
             <!-- Download Links -->
             <div id="download-links" style="margin-top: 20px; text-align: center;"></div>
+
+            <!-- Outlook Disclaimer -->
+            <div class="outlook-disclaimer">
+                <h4>Important: Email Client Settings</h4>
+                <p>
+                    <strong>If Outlook shows "Upload and share as OneDrive link?" when attaching files,
+                    this is an Outlook setting, not a file size issue.</strong>
+                </p>
+                <p>
+                    To disable: Outlook → File → Options → General → Attachment options →
+                    "Always attach them as copies"
+                </p>
+                <p>
+                    Your IT administrator can also configure this via Group Policy.
+                </p>
+            </div>
 
             <!-- Verification Section -->
             <div class="verify-section">
