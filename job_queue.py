@@ -252,12 +252,13 @@ def _cleanup_expired_jobs() -> None:
             logger.info(f"Cleaned up {len(expired)} expired jobs")
 
 
-def start_worker() -> None:
-    """Start the background worker thread."""
-    worker_thread = threading.Thread(target=_worker, daemon=True)
-    worker_thread.start()
-
+def start_workers(num_workers: int = 8) -> None:
+    """Start multiple background worker threads."""
+    for i in range(num_workers):
+        worker_thread = threading.Thread(target=_worker, daemon=True, name=f"compression-worker-{i}")
+        worker_thread.start()
+    
     cleanup_thread = threading.Thread(target=_cleanup_expired_jobs, daemon=True)
     cleanup_thread.start()
-
-    logger.info("Job queue worker and cleanup threads started")
+    
+    logger.info(f"Started {num_workers} compression workers and cleanup thread")
