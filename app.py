@@ -289,7 +289,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
 
 # Configure and start job queue worker
 job_queue.set_processor(process_compression_job)
-job_queue.start_worker()
+job_queue.start_workers(8)
 
 
 # Error handlers
