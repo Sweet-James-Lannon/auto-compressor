@@ -18,4 +18,4 @@ gs --version && echo "Ghostscript installed successfully" || echo "WARNING: Ghos
 # Start gunicorn with production settings
 # Using single worker with threads to maintain shared memory for job queue
 echo "Starting gunicorn..."
-gunicorn --bind=0.0.0.0:8000 --timeout 300 --workers 1 --threads 4 app:app
+gunicorn --bind=0.0.0.0:8000 --timeout=1800 --workers=1 --threads=8 app:app

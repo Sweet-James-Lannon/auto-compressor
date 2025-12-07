@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -443,6 +444,61 @@ def get_status(job_id: str):
         "status": "completed",
         **job.result
     })
+
+
+@app.route('/compress-sync', methods=['POST'])
+@require_auth
+def compress_sync():
+    """
+    Synchronous compression for Salesforce integration.
+    Blocks until complete, returns download URLs directly.
+
+    Request:  { "file_download_link": "https://..." }
+    Response: { "success": true, "files": ["/download/part1.pdf", ...] }
+    """
+    if not request.is_json:
+        return jsonify({"success": False, "error": "JSON required"}), 400
+
+    data = request.get_json()
+    file_url = data.get('file_download_link') or data.get('file_url')
+    if not file_url:
+        return jsonify({"success": False, "error": "Missing file_download_link"}), 400
+
+    file_id = str(uuid.uuid4()).replace('-', '')[:16]
+    input_path = UPLOAD_FOLDER / f"{file_id}_input.pdf"
+
+    try:
+        logger.info(f"[sync] Starting compression for URL: {file_url[:100]}...")
+        job_queue.download_pdf(file_url, input_path)
+        track_file(input_path)
+
+        result = compress_pdf(
+            str(input_path),
+            working_dir=UPLOAD_FOLDER,
+            split_threshold_mb=SPLIT_THRESHOLD_MB
+        )
+
+        for path_str in result.get('output_paths', [result['output_path']]):
+            track_file(Path(path_str))
+
+        files = [
+            f"/download/{Path(p).name}"
+            for p in result.get('output_paths', [result['output_path']])
+        ]
+
+        logger.info(f"[sync] Compression complete: {len(files)} file(s)")
+        return jsonify({
+            "success": True,
+            "files": files,
+            "original_mb": result['original_size_mb'],
+            "compressed_mb": result['compressed_size_mb'],
+            "was_split": result.get('was_split', False),
+            "total_parts": result.get('total_parts', 1)
+        })
+
+    except Exception as e:
+        logger.exception(f"[sync] Compression failed: {e}")
+        return create_error_response(e, get_error_status_code(e))
 
 
 @app.route('/download/<filename>')

@@ -7,7 +7,7 @@ the size threshold into smaller parts for email attachment limits.
 import logging
 import math
 from pathlib import Path
-from typing import List
+from typing import Callable, List, Optional
 
 from PyPDF2 import PdfReader, PdfWriter
 from PyPDF2.errors import PdfReadError
@@ -27,7 +27,8 @@ def split_pdf(
     pdf_path: Path,
     output_dir: Path,
     base_name: str,
-    threshold_mb: float = DEFAULT_THRESHOLD_MB
+    threshold_mb: float = DEFAULT_THRESHOLD_MB,
+    progress_callback: Optional[Callable[[int, str, str], None]] = None
 ) -> List[Path]:
     """Split PDF into optimal number of parts using smart byte-based distribution.
 
@@ -59,6 +60,10 @@ def split_pdf(
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    def report_progress(percent: int, message: str):
+        if progress_callback:
+            progress_callback(percent, "splitting", message)
 
     file_size_mb = get_file_size_mb(pdf_path)
 
@@ -137,6 +142,7 @@ def split_pdf(
                     high = start + remaining_pages - (remaining_parts - 1)  # Leave pages for other parts
                     best_split = low
 
+                    report_progress(72 + part_idx * 2, f"Finding split point {part_idx + 1}...")
                     logger.info(f"Finding split point {part_idx + 1}: searching pages {low}-{high}")
 
                     while low <= high:
@@ -187,6 +193,7 @@ def split_pdf(
             output_paths: List[Path] = []
 
             for part_num, page_indices in enumerate(groups, 1):
+                report_progress(80 + part_num * 3, f"Creating part {part_num} of {len(groups)}...")
                 writer = PdfWriter()
                 for page_idx in page_indices:
                     writer.add_page(reader.pages[page_idx])
@@ -228,6 +235,9 @@ def split_pdf(
                     # Optimization failed - just rename
                     logger.warning(f"Optimization failed: {message}")
                     temp_part_path.rename(part_path)
+
+                if not part_path.exists():
+                    raise SplitError(f"Failed to create part {part_num}: file not written")
 
                 output_paths.append(part_path)
 

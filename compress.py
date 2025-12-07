@@ -120,7 +120,8 @@ def compress_pdf(
         # Check if we still need to split the original
         if split_threshold_mb and compressed_size > split_threshold_mb:
             output_paths = split_pdf.split_pdf(
-                output_path, working_dir, input_path.stem
+                output_path, working_dir, input_path.stem,
+                progress_callback=progress_callback
             )
             return {
                 "output_path": str(output_paths[0]),
@@ -162,7 +163,8 @@ def compress_pdf(
         report_progress(70, "splitting", "Splitting into parts...")
 
         output_paths = split_pdf.split_pdf(
-            output_path, working_dir, input_path.stem
+            output_path, working_dir, input_path.stem,
+            progress_callback=progress_callback
         )
 
         # Log size of each split part

@@ -1,81 +1,130 @@
 # SJ PDF Compressor
 
-PDF compression service for Salesforce integration. Compresses scanned documents using Ghostscript with automatic splitting for large files.
+PDF compression API for Salesforce. Compresses scanned medical demand documents using Ghostscript, with automatic splitting for files over 25MB (Outlook's attachment limit).
 
-## Setup
+---
 
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python app.py
+## How It Works (The Big Picture)
+
+```
+Case Manager uploads 115MB demand PDF in Salesforce
+                    ↓
+Salesforce sends URL to our API → POST /compress-sync
+                    ↓
+API downloads the PDF from Docreo/AWS
+                    ↓
+Ghostscript compresses it (115MB → 45MB)
+                    ↓
+Still over 25MB? Auto-split into parts (45MB → 2 parts × ~22MB each)
+                    ↓
+Return download URLs → { "files": ["/download/part1.pdf", "/download/part2.pdf"] }
+                    ↓
+Salesforce displays files, user attaches to Outlook email
 ```
 
-Requires Ghostscript: `brew install ghostscript` (Mac) or `apt-get install ghostscript` (Linux)
+### Why These Choices?
 
-## Environment Variables
+| Decision | Why |
+|----------|-----|
+| **25MB split threshold** | Outlook's attachment limit is 25MB. Parts must be under this to email. |
+| **Ghostscript at 72 DPI** | Scanned medical docs are images. Lower DPI = smaller files. 72 DPI is readable but compact. |
+| **Synchronous endpoint** | Salesforce can't easily poll async jobs. One request, one response is simpler for Jai's integration. |
+| **Async endpoint kept** | Dashboard and large files (300MB) still use async for progress tracking. |
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `API_TOKEN` | Bearer token for auth | None (open) |
-| `PORT` | Server port | 5005 |
-| `FILE_RETENTION_SECONDS` | Auto-cleanup interval | 86400 (24h) |
-| `SPLIT_THRESHOLD_MB` | Max file size before auto-split | 25 |
+---
 
-## Features
+## Two Ways to Compress
 
-### Automatic PDF Splitting
-Files exceeding 25MB are automatically split into email-safe parts:
-- Smart page distribution based on content size
-- Each part optimized with Ghostscript
-- Configure threshold via `SPLIT_THRESHOLD_MB`
+### 1. Synchronous (for Salesforce) - `/compress-sync`
 
-### Web Dashboard
-Access `/` for a web UI with drag-and-drop upload and real-time status.
+**Best for:** Salesforce integration, simple scripts, files under ~100MB
 
-### Error Handling
-Structured errors with user-friendly messages:
+```
+POST /compress-sync
+  ↓ (blocks until done)
+Response: { files: ["/download/part1.pdf", ...] }
+```
 
-| Error Type | HTTP | Cause |
-|------------|------|-------|
-| EncryptionError | 422 | Password-protected PDF |
-| StructureError | 422 | Corrupted/damaged PDF |
-| SplitError | 422 | Cannot split small enough |
+One request. One response. No polling. Jai's Salesforce component shows a spinner while waiting.
 
-## API
+**Limitation:** Salesforce has a 120-second HTTP timeout. Files over ~100MB may take longer to compress.
+
+### 2. Asynchronous (for Dashboard/Large Files) - `/compress`
+
+**Best for:** Web dashboard, very large files, when you need progress updates
+
+```
+POST /compress → { job_id: "abc123" }
+GET /status/abc123 → { status: "processing", progress: { percent: 45 } }
+GET /status/abc123 → { status: "completed", download_links: [...] }
+```
+
+Three steps, but you get progress updates and it handles huge files without timeout.
+
+---
+
+## API Reference
+
+### POST /compress-sync
+
+Synchronous compression for Salesforce. Blocks until complete.
+
+**Request:**
+```bash
+curl -X POST https://your-domain/compress-sync \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"file_download_link": "https://docreo-aws-url/document.pdf"}'
+```
+
+**Success Response:**
+```json
+{
+  "success": true,
+  "files": ["/download/doc_part1.pdf", "/download/doc_part2.pdf"],
+  "original_mb": 115.2,
+  "compressed_mb": 45.8,
+  "was_split": true,
+  "total_parts": 2
+}
+```
+
+**Error Response:**
+```json
+{
+  "success": false,
+  "error": "PDF is password-protected",
+  "error_type": "EncryptionError"
+}
+```
+
+**How Jai Uses This:**
+1. User clicks "Send to AI" in Salesforce
+2. Jai's component extracts the Docreo download URL
+3. Sends POST to `/compress-sync` with that URL
+4. Shows spinner while waiting
+5. Receives array of file URLs
+6. Displays download links to user
+
+---
 
 ### POST /compress
 
-Compresses a PDF asynchronously. Returns a job ID for polling.
+Async compression. Returns job ID, poll `/status/<job_id>` for results.
 
-**Headers:**
-```
-Authorization: Bearer <your-token>
-```
-
-**Request Options:**
-
-1. **Form data upload:**
-```
-Content-Type: multipart/form-data
-pdf: <file>
-```
-
-2. **Base64 JSON:**
+**Request (URL method):**
 ```json
-{
-  "file_content_base64": "<base64-encoded-pdf>"
-}
+{ "file_download_link": "https://example.com/document.pdf" }
 ```
 
-3. **URL download:**
-```json
-{
-  "file_download_link": "https://example.com/document.pdf"
-}
+**Request (upload method):**
+```bash
+curl -X POST https://your-domain/compress \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -F "pdf=@document.pdf"
 ```
 
-**Response (202 Accepted):**
+**Response:**
 ```json
 {
   "success": true,
@@ -84,210 +133,181 @@ pdf: <file>
 }
 ```
 
-**Error Codes:**
-- `400` - Invalid PDF or missing file
-- `401` - Missing Authorization header
-- `403` - Invalid token
-- `413` - File too large (max 300MB)
+---
 
 ### GET /status/<job_id>
 
-Poll for job completion. Requires auth if `API_TOKEN` is set.
+Poll for job completion.
 
 **Processing:**
 ```json
 {
   "success": true,
-  "status": "processing"
+  "status": "processing",
+  "progress": { "percent": 72, "stage": "splitting", "message": "Finding split point 2..." }
 }
 ```
 
-**Completed (single file):**
+**Completed:**
 ```json
 {
   "success": true,
   "status": "completed",
-  "download_links": ["/download/doc_compressed.pdf"],
-  "original_mb": 50.0,
-  "compressed_mb": 5.2,
-  "reduction_percent": 89.6,
-  "was_split": false,
-  "total_parts": 1,
-  "compression_method": "ghostscript",
-  "page_count": 42,
-  "part_sizes": null,
-  "quality_warnings": [],
-  "processing_time": {
-    "download_seconds": 1.2,
-    "compression_seconds": 8.5,
-    "total_seconds": 9.7
-  },
-  "performance_notes": []
-}
-```
-
-**Completed (split into parts):**
-```json
-{
-  "success": true,
-  "status": "completed",
-  "was_split": true,
-  "total_parts": 3,
-  "download_links": [
-    "/download/doc_part1.pdf",
-    "/download/doc_part2.pdf",
-    "/download/doc_part3.pdf"
-  ],
+  "download_links": ["/download/doc_part1.pdf", "/download/doc_part2.pdf"],
   "original_mb": 80.0,
   "compressed_mb": 45.0,
-  "reduction_percent": 43.8,
-  "compression_method": "ghostscript",
-  "page_count": 156,
-  "part_sizes": [15728640, 14680064, 16777216],
-  "quality_warnings": [],
-  "processing_time": {
-    "download_seconds": 3.1,
-    "compression_seconds": 45.2,
-    "total_seconds": 48.3
-  },
-  "performance_notes": [
-    {
-      "stage": "compression",
-      "seconds": 45.2,
-      "reason": "PDF has 156 pages - large documents require more processing"
-    }
-  ]
+  "was_split": true,
+  "total_parts": 2
 }
 ```
 
-**Failed:**
-```json
-{
-  "success": false,
-  "status": "failed",
-  "error": "PDF is password-protected",
-  "error_type": "EncryptionError"
-}
-```
-
-### GET /health
-
-Returns service status and Ghostscript availability.
+---
 
 ### GET /download/<filename>
 
-Direct file download. Files auto-delete after retention period.
-
-## Integration Guide
-
-For n8n, Salesforce, or any custom application:
-
-| Item | Value |
-|------|-------|
-| **Endpoint URL** | `https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net/compress` |
-| **Payload** | Form data, base64 JSON, or URL JSON |
-| **Auth** | Header: `Authorization: Bearer <your-token>` |
-
-### cURL
+Download a compressed file. Files auto-delete after 24 hours.
 
 ```bash
-# Submit for compression
-JOB=$(curl -s -X POST https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net/compress \
-  -H "Authorization: Bearer your-token" \
-  -F "pdf=@document.pdf" | jq -r '.job_id')
-
-# Poll for completion
-curl -s "https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net/status/$JOB" \
-  -H "Authorization: Bearer your-token"
-
-# Download result (filename from download_links)
-curl -O "https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net/download/document_compressed.pdf"
+curl -O https://your-domain/download/doc_part1.pdf
 ```
 
-### Python
+---
 
-```python
-import requests
-import time
+### GET /health
 
-BASE_URL = "https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net"
-HEADERS = {"Authorization": "Bearer your-token"}
+Check if the service is running.
 
-# Submit
-with open("document.pdf", "rb") as f:
-    resp = requests.post(f"{BASE_URL}/compress", headers=HEADERS, files={"pdf": f})
-job_id = resp.json()["job_id"]
-
-# Poll until complete
-while True:
-    status = requests.get(f"{BASE_URL}/status/{job_id}", headers=HEADERS).json()
-    if status["status"] != "processing":
-        break
-    time.sleep(2)
-
-# Download all parts
-if status["status"] == "completed":
-    for link in status["download_links"]:
-        r = requests.get(f"{BASE_URL}{link}")
-        filename = link.split("/")[-1]
-        with open(filename, "wb") as f:
-            f.write(r.content)
+```json
+{
+  "status": "healthy",
+  "ghostscript": true
+}
 ```
 
-### Salesforce Apex
+---
 
-```apex
-// Submit compression job
-HttpRequest req = new HttpRequest();
-req.setEndpoint('https://sj-doc-compressor-g4esbvbgd5fdesee.westus3-01.azurewebsites.net/compress');
-req.setMethod('POST');
-req.setHeader('Authorization', 'Bearer ' + API_TOKEN);
-req.setHeader('Content-Type', 'application/json');
-req.setBody('{"file_content_base64": "' + EncodingUtil.base64Encode(pdfBlob) + '"}');
+## Error Types
 
-Http http = new Http();
-HttpResponse res = http.send(req);
-Map<String, Object> result = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
-String jobId = (String)result.get('job_id');
+| Error | HTTP | What It Means | User Message |
+|-------|------|---------------|--------------|
+| `EncryptionError` | 422 | PDF is password-protected | "This PDF is locked. Please unlock it first." |
+| `StructureError` | 422 | PDF is corrupted/damaged | "This PDF appears to be damaged." |
+| `SplitError` | 422 | Can't split small enough (single page too big) | "Individual pages are too large to split." |
 
-// Poll /status/{jobId} for completion, then download from download_links
+---
+
+## Setup
+
+### Local Development
+
+```bash
+# Install Ghostscript
+brew install ghostscript  # Mac
+apt-get install ghostscript  # Linux
+
+# Setup Python
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Run
+python app.py
 ```
 
-## Project Structure
+### Environment Variables
+
+| Variable | What It Does | Default |
+|----------|--------------|---------|
+| `API_TOKEN` | Required for auth. If not set, API is open. | None |
+| `PORT` | Server port | 5005 |
+| `FILE_RETENTION_SECONDS` | How long to keep files before auto-delete | 86400 (24h) |
+| `SPLIT_THRESHOLD_MB` | Split files larger than this | 25 |
+
+---
+
+## Architecture
 
 ```
-app.py                  # Flask routes, auth, async job handling
-compress.py             # Compression orchestration with splitting
-compress_ghostscript.py # Ghostscript wrapper (72 DPI compression)
-split_pdf.py            # PDF splitting for large files
-job_queue.py            # Async job queue and URL download
-exceptions.py           # Custom error types
-startup.sh              # Azure startup (installs Ghostscript)
-dashboard/              # Web UI
+app.py                  # Flask routes, handles HTTP requests
+   ↓
+compress.py             # Orchestrates compression + splitting
+   ↓
+├── compress_ghostscript.py  # Runs Ghostscript (the actual compression)
+└── split_pdf.py             # Splits large PDFs into parts
+   ↓
+job_queue.py            # Background workers for async jobs
 ```
+
+### Why Each File Exists
+
+| File | Purpose |
+|------|---------|
+| `app.py` | HTTP layer. Handles requests, auth, routes. |
+| `compress.py` | Business logic. "Compress this PDF, split if needed." |
+| `compress_ghostscript.py` | Ghostscript wrapper. Translates to `gs` commands. |
+| `split_pdf.py` | Binary search algorithm to find optimal split points. |
+| `job_queue.py` | Thread pool for async jobs. Downloads URLs. |
+| `exceptions.py` | Custom error types (Encryption, Structure, Split). |
+| `startup.sh` | Azure runs this on deploy to install Ghostscript. |
+
+---
+
+## Deployment (Azure)
+
+Push to `main` → GitHub Actions → Azure App Service
+
+**Important Azure Settings:**
+
+1. **Application settings** → Set `API_TOKEN`
+2. **General settings** → Startup Command should point to `startup.sh`
+3. **Scale out** → Instance count = 1 (for shared memory in job queue)
 
 ### Why startup.sh?
 
-Azure App Service runs on a Linux container that doesn't include Ghostscript by default. The `startup.sh` script runs on each deployment to:
-1. Install Ghostscript via `apt-get`
-2. Verify the installation
-3. Start the Flask app with gunicorn
+Azure's Linux container doesn't have Ghostscript. The startup script:
+1. Installs Ghostscript via `apt-get`
+2. Starts the Flask app with Gunicorn
 
-Without this, the `/health` endpoint would return `"ghostscript": false` and compression would fail.
+Without this, compression fails.
 
-## Technical Notes
+---
 
-- Uses 72 DPI for scanned docs (higher DPI increases size for JPEG2000)
-- Returns original file if compression makes it larger
-- 300MB max file size
-- Files auto-split if >25MB after compression
-- HTTPS handled by Azure App Service
+## Technical Details
 
-## Deployment
+### Gunicorn Configuration
 
-Deployed via GitHub Actions to Azure App Service. Push to `main` triggers auto-deploy.
+```bash
+gunicorn --bind=0.0.0.0:8000 --timeout=1800 --workers=1 --threads=8 app:app
+```
 
-Set `API_TOKEN` in Azure Portal > Configuration > Application settings.
+| Setting | Value | Why |
+|---------|-------|-----|
+| `timeout` | 1800 (30 min) | Large files (300MB) take up to 35 min to compress |
+| `workers` | 1 | Single process = shared memory for job queue. Multiple workers would cause 404 errors. |
+| `threads` | 8 | Handle 8 concurrent HTTP requests |
+
+### Split Algorithm
+
+When a compressed file is still over 25MB, we split it:
+
+1. Calculate parts needed: `ceil(file_size / 25MB)`
+2. Binary search for split points (measuring actual compressed size)
+3. Create each part, verify it's under 25MB
+4. If a part is still too big, add more parts and retry
+
+This ensures **every part is under 25MB**, not just estimated.
+
+### Why 72 DPI?
+
+Medical demands are scanned images. Higher DPI = more pixels = larger files.
+
+- 300 DPI: Archival quality, huge files
+- 150 DPI: Good balance, but still large
+- **72 DPI: Screen-readable, much smaller files**
+
+For email attachments, 72 DPI is sufficient.
+
+---
 
 ## License
 
