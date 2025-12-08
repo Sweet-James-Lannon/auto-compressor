@@ -54,11 +54,24 @@ def require_auth(f):
     def decorated(*args, **kwargs):
         if not API_TOKEN:
             return f(*args, **kwargs)  # No token configured = open access
+
         auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({"success": False, "error": "Missing authorization"}), 401
+
+        # Debug logging to diagnose auth issues
+        logger.debug(f"Auth check on {request.path}: header={'present' if auth_header else 'missing'}, content_type={request.content_type}")
+
+        if not auth_header:
+            logger.warning(f"Missing Authorization header on {request.path} (content_type: {request.content_type})")
+            return jsonify({"success": False, "error": "Missing Authorization header"}), 401
+
+        if not auth_header.startswith('Bearer '):
+            logger.warning(f"Invalid Authorization format on {request.path}: {auth_header[:30]}...")
+            return jsonify({"success": False, "error": "Authorization must use Bearer token format"}), 401
+
         if auth_header[7:] != API_TOKEN:
+            logger.warning(f"Invalid token on {request.path}")
             return jsonify({"success": False, "error": "Invalid token"}), 403
+
         return f(*args, **kwargs)
     return decorated
 
@@ -505,12 +518,30 @@ def compress_sync():
             split_threshold_mb=SPLIT_THRESHOLD_MB
         )
 
-        for path_str in result.get('output_paths', [result['output_path']]):
-            track_file(Path(path_str))
+        # =====================================================================
+        # CRITICAL: Verify all output files exist before returning download URLs
+        # This prevents 404 errors when files weren't created properly
+        # =====================================================================
+        output_paths = result.get('output_paths', [result['output_path']])
+        for path_str in output_paths:
+            p = Path(path_str)
+            if not p.exists():
+                logger.error(f"[sync:{file_id}] Output file missing: {p}")
+                return jsonify({
+                    "success": False,
+                    "error": "Compression failed - output file not created"
+                }), 500
+            if p.stat().st_size == 0:
+                logger.error(f"[sync:{file_id}] Output file is empty: {p}")
+                return jsonify({
+                    "success": False,
+                    "error": "Compression failed - output file is empty"
+                }), 500
+            track_file(p)
 
         files = [
             f"/download/{Path(p).name}"
-            for p in result.get('output_paths', [result['output_path']])
+            for p in output_paths
         ]
 
         logger.info(f"[sync:{file_id}] Complete: {len(files)} file(s), {result['original_size_mb']:.1f}MB → {result['compressed_size_mb']:.1f}MB")

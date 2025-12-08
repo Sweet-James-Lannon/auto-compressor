@@ -4,23 +4,19 @@ Provides job queue and status tracking for long-running compression tasks.
 Handles background processing to avoid blocking the main request threads.
 """
 
-import ipaddress
 import logging
 import queue
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Dict, Optional
-from urllib.parse import urlparse
 
-import requests
+# Import download_pdf from utils to avoid duplication
+from utils import download_pdf  # noqa: F401 - re-exported for backwards compatibility
 
 # Constants
 JOB_TTL_SECONDS: int = 3600  # Jobs expire after 1 hour
-DOWNLOAD_TIMEOUT: int = 300  # 5 minute timeout for downloading PDFs
-MAX_DOWNLOAD_SIZE: int = 314572800  # 300 MB max download
 
 logger = logging.getLogger(__name__)
 
@@ -112,94 +108,6 @@ def enqueue(job_id: str, task_data: Dict[str, Any]) -> None:
     """
     _work_queue.put((job_id, task_data))
     logger.info(f"[{job_id}] Job enqueued")
-
-
-def _is_safe_url(url: str) -> bool:
-    """Check if URL is safe to fetch (not internal/metadata endpoints).
-
-    Args:
-        url: The URL to validate.
-
-    Returns:
-        True if URL appears safe, False otherwise.
-    """
-    try:
-        parsed = urlparse(url)
-
-        # Only allow http/https schemes
-        if parsed.scheme not in ('http', 'https'):
-            return False
-
-        # Block common metadata and internal endpoints
-        blocked_hosts = [
-            '169.254.169.254',  # Azure/AWS metadata
-            'metadata.google.internal',
-            'localhost',
-            '127.0.0.1',
-            '0.0.0.0',
-        ]
-
-        hostname = parsed.hostname or ''
-        if hostname.lower() in blocked_hosts:
-            return False
-
-        # Block private IP ranges
-        try:
-            ip = ipaddress.ip_address(hostname)
-            if ip.is_private or ip.is_loopback or ip.is_link_local:
-                return False
-        except ValueError:
-            pass  # Not an IP address, hostname is OK
-
-        return True
-    except Exception:
-        return False
-
-
-def download_pdf(url: str, output_path: Path) -> None:
-    """Download a PDF from a URL.
-
-    Args:
-        url: The URL to download from.
-        output_path: Path to save the downloaded file.
-
-    Raises:
-        RuntimeError: If download fails or file is too large.
-    """
-    # Security: Validate URL to prevent SSRF
-    if not _is_safe_url(url):
-        raise RuntimeError("Invalid or blocked URL")
-
-    logger.info(f"Downloading PDF from {url[:100]}...")
-
-    try:
-        response = requests.get(
-            url,
-            timeout=DOWNLOAD_TIMEOUT,
-            stream=True,
-            headers={'User-Agent': 'SJ-PDF-Compressor/1.0'},
-            allow_redirects=False  # Don't follow redirects to internal URLs
-        )
-        response.raise_for_status()
-
-        # Check content length if available
-        content_length = response.headers.get('content-length')
-        if content_length and int(content_length) > MAX_DOWNLOAD_SIZE:
-            raise RuntimeError(f"File too large: {int(content_length) / (1024*1024):.1f}MB")
-
-        # Stream download with size check
-        downloaded = 0
-        with open(output_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                downloaded += len(chunk)
-                if downloaded > MAX_DOWNLOAD_SIZE:
-                    raise RuntimeError("File too large (exceeded 300MB during download)")
-                f.write(chunk)
-
-        logger.info(f"Downloaded {downloaded / (1024*1024):.1f}MB to {output_path.name}")
-
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Download failed: {e}") from e
 
 
 def set_processor(processor_func: Callable[[str, Dict[str, Any]], None]) -> None:

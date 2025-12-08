@@ -101,12 +101,3 @@ class SplitError(PDFCompressionError):
             f"The PDF likely contains high-resolution images that can't be compressed further. "
             f"Try reducing image quality in the original document before uploading."
         )
-
-    @staticmethod
-    def single_page_too_large(filename: str, page_mb: float, threshold_mb: float) -> "SplitError":
-        """Create error when a single page is too large."""
-        return SplitError(
-            f"'{filename}' has a single page that is {page_mb:.1f}MB - "
-            f"larger than the {threshold_mb:.0f}MB email limit. "
-            f"Please reduce the image quality on that page and try again."
-        )

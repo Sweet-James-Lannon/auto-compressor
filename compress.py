@@ -21,6 +21,10 @@ from utils import get_file_size_mb
 logger = logging.getLogger(__name__)
 
 
+# Threshold for switching to parallel compression (MB)
+PARALLEL_THRESHOLD_MB = 40.0
+
+
 def compress_pdf(
     input_path: str,
     working_dir: Optional[Path] = None,
@@ -29,6 +33,8 @@ def compress_pdf(
 ) -> Dict:
     """
     Compress a PDF file using Ghostscript, optionally splitting if too large.
+
+    For large files (>40MB), uses parallel compression for 3-4x faster processing.
 
     Args:
         input_path: Path to input PDF.
@@ -79,12 +85,30 @@ def compress_pdf(
         logger.warning(f"PDF pre-validation warning: {e}")
 
     working_dir = working_dir or input_path.parent
-    output_path = working_dir / f"{input_path.stem}_compressed.pdf"
     original_size = get_file_size_mb(input_path)
     original_bytes = input_path.stat().st_size
 
     logger.info(f"[SIZE_CHECK] Input: {input_path.name} = {original_bytes} bytes ({original_size:.2f}MB)")
+
+    # =========================================================================
+    # ROUTE: Large files use parallel compression for 3-4x speedup
+    # =========================================================================
+    if original_size > PARALLEL_THRESHOLD_MB:
+        logger.info(f"[PARALLEL] File {original_size:.1f}MB > {PARALLEL_THRESHOLD_MB}MB threshold, using parallel compression")
+        return compress_ghostscript.compress_parallel(
+            input_path=input_path,
+            working_dir=working_dir,
+            base_name=input_path.stem,
+            split_threshold_mb=split_threshold_mb or 25.0,
+            progress_callback=progress_callback,
+            max_workers=6
+        )
+
+    # =========================================================================
+    # ROUTE: Small files use serial compression (existing logic)
+    # =========================================================================
     logger.info(f"Compressing: {input_path.name} ({original_size:.1f}MB)")
+    output_path = working_dir / f"{input_path.stem}_compressed.pdf"
 
     report_progress(15, "compressing", "Compressing PDF...")
 

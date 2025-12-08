@@ -6,10 +6,11 @@ the size threshold into smaller parts for email attachment limits.
 
 import logging
 import math
+import uuid
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from PyPDF2 import PdfReader, PdfWriter
+from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 from PyPDF2.errors import PdfReadError
 
 from compress_ghostscript import optimize_split_part, compress_pdf_with_ghostscript
@@ -24,6 +25,151 @@ SAFETY_BUFFER_MB: float = 1.5  # Buffer for email headers/body overhead (target 
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# NEW HELPER FUNCTIONS FOR PARALLEL COMPRESSION
+# =============================================================================
+
+def split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: str) -> List[Path]:
+    """Split PDF into N parts by page count. Fast - no Ghostscript.
+
+    Used for parallel compression: split first, compress each chunk in parallel.
+
+    Args:
+        pdf_path: Path to source PDF.
+        output_dir: Directory for output chunks.
+        num_parts: Number of parts to create.
+        base_name: Base filename for chunks.
+
+    Returns:
+        List of paths to created chunk files.
+
+    Example: 300 pages / 6 parts = 50 pages each
+    """
+    pdf_path = Path(pdf_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    reader = PdfReader(pdf_path)
+    total_pages = len(reader.pages)
+
+    if total_pages == 0:
+        raise StructureError.for_file(pdf_path.name, "PDF has no pages")
+
+    # Calculate pages per part (last part gets remainder)
+    pages_per_part = total_pages // num_parts
+
+    chunk_paths = []
+    for i in range(num_parts):
+        start = i * pages_per_part
+        # Last part gets all remaining pages
+        end = total_pages if i == num_parts - 1 else (i + 1) * pages_per_part
+
+        writer = PdfWriter()
+        for page_idx in range(start, end):
+            writer.add_page(reader.pages[page_idx])
+
+        # Use unique ID to prevent collisions in parallel operations
+        unique_id = str(uuid.uuid4())[:8]
+        chunk_path = output_dir / f"{base_name}_chunk{i+1}_{unique_id}.pdf"
+
+        with open(chunk_path, 'wb') as f:
+            writer.write(f)
+
+        chunk_paths.append(chunk_path)
+        logger.info(f"Created chunk {i+1}/{num_parts}: pages {start+1}-{end} -> {chunk_path.name}")
+
+    return chunk_paths
+
+
+def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
+    """Merge multiple PDFs into one. Fast - no Ghostscript.
+
+    Used after parallel compression to recombine compressed chunks.
+
+    Args:
+        pdf_paths: List of PDF paths to merge (in order).
+        output_path: Path for merged output.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    merger = PdfMerger()
+    for path in pdf_paths:
+        merger.append(str(path))
+
+    merger.write(str(output_path))
+    merger.close()
+
+    logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name}")
+
+
+def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb: float = DEFAULT_THRESHOLD_MB) -> List[Path]:
+    """Split PDF into parts under threshold_mb each.
+
+    Uses page-proportional estimation (fast, no binary search).
+    This is the final split for email attachments after compression.
+
+    Args:
+        pdf_path: Path to source PDF.
+        output_dir: Directory for output parts.
+        base_name: Base filename for parts.
+        threshold_mb: Maximum size per part.
+
+    Returns:
+        List of paths to created part files.
+    """
+    pdf_path = Path(pdf_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    file_size_mb = get_file_size_mb(pdf_path)
+
+    # If already under threshold, just return the original
+    if file_size_mb <= threshold_mb:
+        logger.info(f"PDF {file_size_mb:.1f}MB already under {threshold_mb}MB, no split needed")
+        return [pdf_path]
+
+    reader = PdfReader(pdf_path)
+    total_pages = len(reader.pages)
+
+    if total_pages == 0:
+        raise StructureError.for_file(pdf_path.name, "PDF has no pages")
+
+    # Calculate number of parts needed (with buffer for safety)
+    buffer_mb = 2.0  # Safety buffer
+    effective_threshold = threshold_mb - buffer_mb
+    num_parts = math.ceil(file_size_mb / effective_threshold)
+
+    # Ensure at least 1 page per part
+    num_parts = min(num_parts, total_pages)
+
+    pages_per_part = total_pages // num_parts
+
+    output_paths = []
+    for i in range(num_parts):
+        start = i * pages_per_part
+        end = total_pages if i == num_parts - 1 else (i + 1) * pages_per_part
+
+        writer = PdfWriter()
+        for page_idx in range(start, end):
+            writer.add_page(reader.pages[page_idx])
+
+        part_path = output_dir / f"{base_name}_part{i+1}.pdf"
+
+        with open(part_path, 'wb') as f:
+            writer.write(f)
+
+        part_size = get_file_size_mb(part_path)
+        output_paths.append(part_path)
+        logger.info(f"Created part {i+1}/{num_parts}: pages {start+1}-{end}, {part_size:.1f}MB -> {part_path.name}")
+
+    return output_paths
+
+
+# =============================================================================
+# ORIGINAL SPLIT FUNCTION (for binary search splitting - kept for compatibility)
+# =============================================================================
 
 def split_pdf(
     pdf_path: Path,
@@ -103,16 +249,19 @@ def split_pdf(
                     end_page: Ending page index (0-based, exclusive)
                     optimize: If True, apply Ghostscript optimization to get accurate size
                 """
+                # Unique ID prevents file collisions when multiple jobs run in parallel
+                unique_id = str(uuid.uuid4())[:8]
+
                 writer = PdfWriter()
                 for idx in range(start_page, end_page):
                     writer.add_page(reader.pages[idx])
-                temp_path = output_dir / f"{base_name}_measure_temp.pdf"
+                temp_path = output_dir / f"{base_name}_{unique_id}_measure_temp.pdf"
                 with open(temp_path, 'wb') as f:
                     writer.write(f)
 
                 if optimize:
                     # Apply Ghostscript optimization to get accurate final size
-                    optimized_path = output_dir / f"{base_name}_measure_opt.pdf"
+                    optimized_path = output_dir / f"{base_name}_{unique_id}_measure_opt.pdf"
                     success, _ = optimize_split_part(temp_path, optimized_path)
                     if success and optimized_path.exists():
                         size = get_file_size_mb(optimized_path)
@@ -204,12 +353,15 @@ def split_pdf(
 
             for part_num, page_indices in enumerate(groups, 1):
                 report_progress(80 + part_num * 3, f"Creating part {part_num} of {len(groups)}...")
+                # Unique ID prevents file collisions when multiple jobs run in parallel
+                part_unique_id = str(uuid.uuid4())[:8]
+
                 writer = PdfWriter()
                 for page_idx in page_indices:
                     writer.add_page(reader.pages[page_idx])
 
                 # Write raw PyPDF2 part to temporary path
-                temp_part_path = output_dir / f"{base_name}_part{part_num}_temp.pdf"
+                temp_part_path = output_dir / f"{base_name}_part{part_num}_{part_unique_id}_temp.pdf"
                 with open(temp_part_path, 'wb') as out_f:
                     writer.write(out_f)
 
