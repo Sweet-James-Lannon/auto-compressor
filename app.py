@@ -522,6 +522,20 @@ def compress_sync():
 
         track_file(input_path)
 
+        # Check file size - reject files over 200MB for sync endpoint
+        # Larger files can cause Azure load balancer timeouts (230s hard limit)
+        MAX_SYNC_SIZE_MB = 200.0
+        file_size_mb = input_path.stat().st_size / (1024 * 1024)
+
+        if file_size_mb > MAX_SYNC_SIZE_MB:
+            logger.warning(f"[sync:{file_id}] File too large: {file_size_mb:.1f}MB > {MAX_SYNC_SIZE_MB}MB limit")
+            input_path.unlink(missing_ok=True)
+            return jsonify({
+                "success": False,
+                "error": f"File too large ({file_size_mb:.1f}MB). Maximum for sync endpoint is {MAX_SYNC_SIZE_MB:.0f}MB.",
+                "recommendation": "Use the async /compress endpoint for very large files"
+            }), 413
+
         result = compress_pdf(
             str(input_path),
             working_dir=UPLOAD_FOLDER,

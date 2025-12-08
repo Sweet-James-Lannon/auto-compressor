@@ -6,6 +6,8 @@ the size threshold into smaller parts for email attachment limits.
 
 import logging
 import math
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -13,7 +15,7 @@ from typing import Callable, List, Optional
 from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 from PyPDF2.errors import PdfReadError
 
-from compress_ghostscript import optimize_split_part, compress_pdf_with_ghostscript
+from compress_ghostscript import optimize_split_part, compress_pdf_with_ghostscript, get_ghostscript_command
 from exceptions import EncryptionError, StructureError, SplitError
 from utils import get_file_size_mb
 
@@ -83,9 +85,10 @@ def split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: 
 
 
 def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
-    """Merge multiple PDFs into one. Fast - no Ghostscript.
+    """Merge multiple PDFs into one using Ghostscript (deduplicates resources).
 
-    Used after parallel compression to recombine compressed chunks.
+    Uses Ghostscript to merge PDFs which properly deduplicates shared resources
+    like fonts and images. Falls back to PyPDF2 if Ghostscript is not available.
 
     Args:
         pdf_paths: List of PDF paths to merge (in order).
@@ -94,21 +97,60 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    merger = PdfMerger()
-    for path in pdf_paths:
-        merger.append(str(path))
+    gs_cmd = get_ghostscript_command()
+    if not gs_cmd:
+        # Fallback to PyPDF2 if Ghostscript not available
+        logger.warning("Ghostscript not found, falling back to PyPDF2 merge (may inflate file size)")
+        merger = PdfMerger()
+        for path in pdf_paths:
+            merger.append(str(path))
+        merger.write(str(output_path))
+        merger.close()
+        logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2)")
+        return
 
-    merger.write(str(output_path))
-    merger.close()
+    # Use Ghostscript - properly deduplicates resources
+    cmd = [
+        gs_cmd,
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        "-dPDFSETTINGS=/default",  # Preserve quality, just merge
+        "-dNOPAUSE", "-dBATCH", "-dQUIET",
+        "-dDetectDuplicateImages=true",  # Key: deduplicate shared images
+        "-dPassThroughJPEGImages=true",  # Don't re-encode JPEGs
+        "-dPassThroughJPXImages=true",   # Don't re-encode JPEG2000
+        f"-sOutputFile={output_path}",
+        *[str(p) for p in pdf_paths]
+    ]
 
-    logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        if result.returncode != 0:
+            logger.warning(f"Ghostscript merge failed (code {result.returncode}), falling back to PyPDF2")
+            # Fallback to PyPDF2
+            merger = PdfMerger()
+            for path in pdf_paths:
+                merger.append(str(path))
+            merger.write(str(output_path))
+            merger.close()
+            logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2 fallback)")
+        else:
+            logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (Ghostscript)")
+    except subprocess.TimeoutExpired:
+        logger.warning("Ghostscript merge timed out, falling back to PyPDF2")
+        merger = PdfMerger()
+        for path in pdf_paths:
+            merger.append(str(path))
+        merger.write(str(output_path))
+        merger.close()
+        logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2 fallback)")
 
 
 def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb: float = DEFAULT_THRESHOLD_MB) -> List[Path]:
     """Split PDF into parts under threshold_mb each.
 
-    Creates parts and verifies each is under threshold. If any part exceeds
-    threshold, increases the number of parts and retries.
+    Simple approach: calculate number of parts needed, split evenly by pages.
+    Does NOT retry - just creates the calculated number of parts.
 
     Args:
         pdf_path: Path to source PDF.
@@ -117,7 +159,7 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
         threshold_mb: Maximum size per part.
 
     Returns:
-        List of paths to created part files, all guaranteed under threshold_mb.
+        List of paths to created part files.
     """
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
@@ -136,65 +178,43 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
     if total_pages == 0:
         raise StructureError.for_file(pdf_path.name, "PDF has no pages")
 
-    # Start with estimated number of parts, increase if needed
-    buffer_mb = 2.0
-    effective_threshold = threshold_mb - buffer_mb
-    num_parts = max(2, math.ceil(file_size_mb / effective_threshold))
+    # Calculate parts needed with safety margin
+    # Use 15MB target per part to leave room for uneven page sizes and email overhead
+    target_size_per_part = 15.0
+    num_parts = max(2, math.ceil(file_size_mb / target_size_per_part))
 
-    max_attempts = 20  # Prevent infinite loops
+    # Cap at reasonable number - no more than 10 parts
+    num_parts = min(num_parts, 10)
 
-    for attempt in range(max_attempts):
-        # Ensure at least 1 page per part
-        num_parts = min(num_parts, total_pages)
-        pages_per_part = total_pages // num_parts
+    # Ensure at least 1 page per part
+    num_parts = min(num_parts, total_pages)
 
-        logger.info(f"[split_by_size] Attempt {attempt + 1}: splitting into {num_parts} parts ({pages_per_part} pages each)")
+    pages_per_part = total_pages // num_parts
 
-        # Clean up any previous attempt files
-        for old_file in output_dir.glob(f"{base_name}_part*.pdf"):
-            old_file.unlink(missing_ok=True)
+    logger.info(f"[split_by_size] Splitting {file_size_mb:.1f}MB into {num_parts} parts ({pages_per_part} pages each)")
 
-        output_paths = []
-        all_under_threshold = True
-        max_part_size = 0
+    output_paths = []
 
-        for i in range(num_parts):
-            start = i * pages_per_part
-            # Last part gets all remaining pages
-            end = total_pages if i == num_parts - 1 else (i + 1) * pages_per_part
+    for i in range(num_parts):
+        start = i * pages_per_part
+        # Last part gets all remaining pages
+        end = total_pages if i == num_parts - 1 else (i + 1) * pages_per_part
 
-            writer = PdfWriter()
-            for page_idx in range(start, end):
-                writer.add_page(reader.pages[page_idx])
+        writer = PdfWriter()
+        for page_idx in range(start, end):
+            writer.add_page(reader.pages[page_idx])
 
-            part_path = output_dir / f"{base_name}_part{i+1}.pdf"
+        part_path = output_dir / f"{base_name}_part{i+1}.pdf"
 
-            with open(part_path, 'wb') as f:
-                writer.write(f)
+        with open(part_path, 'wb') as f:
+            writer.write(f)
 
-            part_size = get_file_size_mb(part_path)
-            max_part_size = max(max_part_size, part_size)
-            output_paths.append(part_path)
+        part_size = get_file_size_mb(part_path)
+        output_paths.append(part_path)
 
-            if part_size > threshold_mb:
-                all_under_threshold = False
-                logger.warning(f"[split_by_size] Part {i+1} is {part_size:.1f}MB (over {threshold_mb}MB threshold)")
+        status = "OK" if part_size <= threshold_mb else "OVER"
+        logger.info(f"[split_by_size] Part {i+1}/{num_parts}: pages {start+1}-{end}, {part_size:.1f}MB [{status}]")
 
-            logger.info(f"[split_by_size] Part {i+1}/{num_parts}: pages {start+1}-{end}, {part_size:.1f}MB")
-
-        if all_under_threshold:
-            logger.info(f"[split_by_size] Success: {num_parts} parts, all under {threshold_mb}MB (max: {max_part_size:.1f}MB)")
-            return output_paths
-
-        # Parts too big - increase number of parts and retry
-        # Estimate how many more parts we need based on largest part
-        scale_factor = max_part_size / effective_threshold
-        num_parts = max(num_parts + 1, int(num_parts * scale_factor) + 1)
-        logger.info(f"[split_by_size] Retrying with {num_parts} parts...")
-
-    # If we get here, we couldn't split small enough
-    logger.error(f"[split_by_size] Could not split into parts under {threshold_mb}MB after {max_attempts} attempts")
-    # Return what we have - better than nothing
     return output_paths
 
 
