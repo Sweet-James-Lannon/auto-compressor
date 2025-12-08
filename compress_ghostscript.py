@@ -342,13 +342,111 @@ def compress_parallel(
     for _, compressed in compressed_chunks:
         compressed.unlink(missing_ok=True)
 
+    # =========================================================================
+    # CRITICAL: If parallel compression made file BIGGER, fall back to serial
+    # This can happen because PyPDF2 merge duplicates resources across chunks
+    # =========================================================================
+    if compressed_size_mb >= original_size_mb:
+        logger.warning(f"[PARALLEL] Compression INCREASED size ({original_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB)!")
+        logger.warning(f"[PARALLEL] Falling back to serial compression...")
+
+        # Delete the inflated merged file
+        merged_path.unlink(missing_ok=True)
+
+        # Fall back to serial compression (single Ghostscript pass on entire file)
+        report_progress(40, "compressing", "Parallel failed, trying serial compression...")
+
+        serial_output = working_dir / f"{base_name}_serial_compressed.pdf"
+        success, message = compress_pdf_with_ghostscript(input_path, serial_output)
+
+        if success and serial_output.exists():
+            serial_size_mb = get_file_size_mb(serial_output)
+
+            # If serial also made it bigger, just split the original
+            if serial_size_mb >= original_size_mb:
+                logger.warning(f"[PARALLEL] Serial also increased size. Using original file.")
+                serial_output.unlink(missing_ok=True)
+
+                # Just split the original file without compression
+                from split_pdf import split_by_size
+                final_parts = split_by_size(input_path, working_dir, base_name, split_threshold_mb)
+
+                return {
+                    "output_path": str(final_parts[0]),
+                    "output_paths": [str(p) for p in final_parts],
+                    "original_size_mb": round(original_size_mb, 2),
+                    "compressed_size_mb": round(original_size_mb, 2),
+                    "reduction_percent": 0.0,
+                    "compression_method": "none",
+                    "was_split": len(final_parts) > 1,
+                    "total_parts": len(final_parts),
+                    "success": True,
+                    "note": "File already optimized, split only",
+                    "page_count": None,
+                    "part_sizes": [p.stat().st_size for p in final_parts],
+                    "parallel_chunks": num_chunks
+                }
+
+            # Serial worked - use that result
+            logger.info(f"[PARALLEL] Serial compression succeeded: {serial_size_mb:.1f}MB")
+
+            # Rename serial output to expected name
+            final_compressed = working_dir / f"{base_name}_compressed.pdf"
+            serial_output.rename(final_compressed)
+            merged_path = final_compressed
+
+            compressed_size_mb = serial_size_mb
+            compressed_bytes = merged_path.stat().st_size
+            reduction_percent = ((original_size_mb - compressed_size_mb) / original_size_mb) * 100
+        else:
+            # Serial failed too - just split original
+            logger.error(f"[PARALLEL] Serial compression also failed: {message}")
+
+            from split_pdf import split_by_size
+            final_parts = split_by_size(input_path, working_dir, base_name, split_threshold_mb)
+
+            return {
+                "output_path": str(final_parts[0]),
+                "output_paths": [str(p) for p in final_parts],
+                "original_size_mb": round(original_size_mb, 2),
+                "compressed_size_mb": round(original_size_mb, 2),
+                "reduction_percent": 0.0,
+                "compression_method": "none",
+                "was_split": len(final_parts) > 1,
+                "total_parts": len(final_parts),
+                "success": True,
+                "note": "Compression failed, split original",
+                "page_count": None,
+                "part_sizes": [p.stat().st_size for p in final_parts],
+                "parallel_chunks": num_chunks
+            }
+
     # Step 5: Final split by 25MB threshold if needed
     if compressed_size_mb > split_threshold_mb:
         report_progress(85, "splitting", f"Splitting into parts under {split_threshold_mb}MB...")
         final_parts = split_by_size(merged_path, working_dir, base_name, split_threshold_mb)
 
-        # Delete merged file, keep parts
-        merged_path.unlink(missing_ok=True)
+        # Only delete merged file if split actually created NEW files
+        # (split_by_size returns [merged_path] if already under threshold)
+        # Use resolve() for robust path comparison
+        merged_resolved = merged_path.resolve()
+        parts_are_new_files = (
+            len(final_parts) > 1 or
+            (len(final_parts) == 1 and final_parts[0].resolve() != merged_resolved)
+        )
+
+        if parts_are_new_files:
+            merged_path.unlink(missing_ok=True)
+            logger.info(f"[PARALLEL] Deleted merged file, keeping {len(final_parts)} split parts")
+        else:
+            logger.info(f"[PARALLEL] Keeping merged file as final output")
+
+        # Verify all output files exist before returning
+        for i, part in enumerate(final_parts):
+            if not part.exists():
+                logger.error(f"[PARALLEL] Part {i+1} missing after split: {part}")
+            else:
+                logger.info(f"[PARALLEL] Part {i+1} verified: {part.name} ({part.stat().st_size / (1024*1024):.1f}MB)")
 
         # Get page count from original
         from PyPDF2 import PdfReader
@@ -367,7 +465,7 @@ def compress_parallel(
             "compressed_size_mb": round(compressed_size_mb, 2),
             "reduction_percent": round(reduction_percent, 1),
             "compression_method": "ghostscript_parallel",
-            "was_split": True,
+            "was_split": len(final_parts) > 1,  # Only true if actually split into multiple parts
             "total_parts": len(final_parts),
             "success": True,
             "page_count": page_count,

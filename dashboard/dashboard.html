@@ -1089,6 +1089,9 @@
 
             // 3. PART SIZE VERIFICATION
             const partsVerification = document.getElementById('parts-verification');
+            // Get the download links - sync endpoint uses 'files', async uses 'download_links'
+            const currentDownloadLinks = result.download_links || result.files || [];
+
             if (result.was_split && result.total_parts > 1) {
                 partsVerification.style.display = 'block';
 
@@ -1098,7 +1101,7 @@
                 const partSizes = result.part_sizes || [];
                 let totalPartsSize = 0;
 
-                (result.download_links || []).forEach((link, index) => {
+                currentDownloadLinks.forEach((link, index) => {
                     const partSize = partSizes[index] || 0;
                     const partSizeMB = partSize / (1024 * 1024);
                     totalPartsSize += partSize;

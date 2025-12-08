@@ -328,12 +328,22 @@ def dashboard():
 
 @app.route('/health')
 def health():
-    """Health check endpoint."""
+    """Health check endpoint with instance info for debugging."""
     gs = get_ghostscript_command()
+
+    # Count files in upload folder for debugging
+    try:
+        pdf_count = len(list(UPLOAD_FOLDER.glob("*.pdf")))
+    except Exception:
+        pdf_count = -1
+
     return jsonify({
         "status": "healthy" if gs else "degraded",
         "ghostscript": gs is not None,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
+        "upload_folder": str(UPLOAD_FOLDER.resolve()),
+        "pdf_count": pdf_count,
+        "instance_id": os.environ.get("WEBSITE_INSTANCE_ID", "local"),  # Azure instance ID
     })
 
 
@@ -523,10 +533,16 @@ def compress_sync():
         # This prevents 404 errors when files weren't created properly
         # =====================================================================
         output_paths = result.get('output_paths', [result['output_path']])
+
+        logger.info(f"[sync:{file_id}] Verifying {len(output_paths)} output files...")
+
         for path_str in output_paths:
             p = Path(path_str)
+            logger.info(f"[sync:{file_id}] Checking: {p} (absolute: {p.resolve()})")
+
             if not p.exists():
                 logger.error(f"[sync:{file_id}] Output file missing: {p}")
+                logger.error(f"[sync:{file_id}] UPLOAD_FOLDER is: {UPLOAD_FOLDER.resolve()}")
                 return jsonify({
                     "success": False,
                     "error": "Compression failed - output file not created"
@@ -537,6 +553,8 @@ def compress_sync():
                     "success": False,
                     "error": "Compression failed - output file is empty"
                 }), 500
+
+            logger.info(f"[sync:{file_id}] Verified: {p.name} ({p.stat().st_size / (1024*1024):.1f}MB)")
             track_file(p)
 
         files = [
@@ -545,6 +563,7 @@ def compress_sync():
         ]
 
         logger.info(f"[sync:{file_id}] Complete: {len(files)} file(s), {result['original_size_mb']:.1f}MB → {result['compressed_size_mb']:.1f}MB")
+        logger.info(f"[sync:{file_id}] Download URLs: {files}")
         return jsonify({
             "success": True,
             "files": files,
@@ -571,6 +590,7 @@ def download(filename):
     # Security: Prevent path traversal attacks
     safe_filename = secure_filename(filename)
     if not safe_filename or safe_filename != filename:
+        logger.warning(f"[download] Invalid filename rejected: {filename}")
         return jsonify({"success": False, "error": "Invalid filename"}), 400
 
     file_path = UPLOAD_FOLDER / safe_filename
@@ -579,10 +599,24 @@ def download(filename):
     try:
         file_path.resolve().relative_to(UPLOAD_FOLDER.resolve())
     except ValueError:
+        logger.warning(f"[download] Path traversal attempt blocked: {filename}")
         return jsonify({"success": False, "error": "Invalid filename"}), 400
 
     if not file_path.exists():
+        # Debug logging to help diagnose 404 issues
+        logger.error(f"[download] File not found: {file_path}")
+        logger.error(f"[download] UPLOAD_FOLDER resolved to: {UPLOAD_FOLDER.resolve()}")
+
+        # List files in upload folder for debugging
+        try:
+            existing_files = list(UPLOAD_FOLDER.glob("*.pdf"))[:10]  # First 10 PDFs
+            logger.error(f"[download] Sample files in uploads: {[f.name for f in existing_files]}")
+        except Exception as e:
+            logger.error(f"[download] Could not list upload folder: {e}")
+
         return jsonify({"success": False, "error": "File not found"}), 404
+
+    logger.info(f"[download] Serving file: {file_path.name} ({file_path.stat().st_size / (1024*1024):.1f}MB)")
     return send_file(file_path, as_attachment=True, download_name=safe_filename)
 
 

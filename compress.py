@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 # Threshold for switching to parallel compression (MB)
-PARALLEL_THRESHOLD_MB = 40.0
+# Files below this use serial (more reliable), above use parallel (faster for large files)
+# Set to 60MB because parallel has overhead from PyPDF2 merge that can inflate smaller files
+PARALLEL_THRESHOLD_MB = 60.0
 
 
 def compress_pdf(
