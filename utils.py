@@ -46,6 +46,12 @@ def _is_safe_url(url: str) -> bool:
         True if URL appears safe, False otherwise.
     """
     try:
+        logger.info(f"[URL_CHECK] Validating: {url[:200] if url else 'EMPTY/NONE'}")
+
+        if not url or not isinstance(url, str):
+            logger.error(f"[URL_CHECK] URL is empty or not a string: {type(url)}")
+            return False
+
         parsed = urlparse(url)
 
         # Only allow http/https schemes
@@ -74,7 +80,8 @@ def _is_safe_url(url: str) -> bool:
             pass  # Not an IP address, hostname is OK
 
         return True
-    except Exception:
+    except Exception as e:
+        logger.error(f"[URL_CHECK] Exception during URL validation: {e}")
         return False
 
 
@@ -92,6 +99,7 @@ def download_pdf(url: str, output_path: Path) -> None:
     """
     # Security: Validate URL to prevent SSRF
     if not _is_safe_url(url):
+        logger.error(f"[URL_BLOCKED] URL failed validation: {url[:300]}")
         raise RuntimeError("Invalid or blocked URL")
 
     logger.info(f"Downloading PDF from {url[:100]}...")
