@@ -121,6 +121,7 @@ def compress_pdf(
         if split_threshold_mb and compressed_size > split_threshold_mb:
             output_paths = split_pdf.split_pdf(
                 output_path, working_dir, input_path.stem,
+                threshold_mb=split_threshold_mb,
                 progress_callback=progress_callback
             )
             return {
@@ -164,6 +165,7 @@ def compress_pdf(
 
         output_paths = split_pdf.split_pdf(
             output_path, working_dir, input_path.stem,
+            threshold_mb=split_threshold_mb,
             progress_callback=progress_callback
         )
 

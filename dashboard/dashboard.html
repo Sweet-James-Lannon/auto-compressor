@@ -909,17 +909,17 @@
             if (!selectedFile) return;
 
             const formData = new FormData();
-            formData.append('pdf', selectedFile);
+            formData.append('file', selectedFile);  // Field name matches /compress-sync
 
             // Reset UI
             resultsDiv.style.display = 'none';
             progressDiv.style.display = 'block';
-            progressBar.style.width = '10%';
-            progressText.textContent = 'Uploading...';
+            progressBar.style.width = '20%';
+            progressText.textContent = 'Uploading & compressing...';
             compressBtn.disabled = true;
             downloadLinks = [];
 
-            showStatus('Uploading PDF...', 'info');
+            showStatus('Compressing PDF (sync)...', 'info');
 
             // Build headers - include auth token if provided
             const headers = {};
@@ -929,8 +929,8 @@
             }
 
             try {
-                // Step 1: Submit compression job
-                const response = await fetch('/compress', {
+                // Single request - sync endpoint returns result directly
+                const response = await fetch('/compress-sync', {
                     method: 'POST',
                     headers: headers,
                     body: formData
@@ -943,21 +943,18 @@
                 }
 
                 if (!response.ok || !result.success) {
-                    throw new Error(result?.error || `Upload failed (HTTP ${response.status})`);
+                    throw new Error(result?.error || `Compression failed (HTTP ${response.status})`);
                 }
 
-                // Step 2: Poll for completion
-                const jobId = result.job_id;
-                progressBar.style.width = '30%';
-                progressText.textContent = 'Processing...';
-                showStatus('Compressing PDF...', 'info');
-
-                const finalResult = await pollForCompletion(jobId, headers);
+                // Calculate reduction percent for display (sync response doesn't include it)
+                if (result.original_mb && result.compressed_mb && !result.reduction_percent) {
+                    result.reduction_percent = ((result.original_mb - result.compressed_mb) / result.original_mb) * 100;
+                }
 
                 progressBar.style.width = '100%';
                 progressText.textContent = 'Done!';
 
-                displayResults(finalResult);
+                displayResults(result);
                 showStatus('Compression successful!', 'success');
 
             } catch (error) {
@@ -968,10 +965,6 @@
                 showStatus(`Error: ${displayMessage}`, 'error');
                 console.error('Compression error:', error);
             } finally {
-                if (pollInterval) {
-                    clearInterval(pollInterval);
-                    pollInterval = null;
-                }
                 setTimeout(() => {
                     progressDiv.style.display = 'none';
                     compressBtn.disabled = false;
@@ -1136,8 +1129,8 @@
                 partsVerification.style.display = 'none';
             }
 
-            // Store download links and create buttons
-            downloadLinks = result.download_links || [];
+            // Store download links and create buttons (sync uses 'files', async uses 'download_links')
+            downloadLinks = result.download_links || result.files || [];
             const linksContainer = document.getElementById('download-links');
             linksContainer.innerHTML = '';
 

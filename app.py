@@ -17,7 +17,7 @@ from werkzeug.utils import secure_filename
 
 from compress import compress_pdf
 from compress_ghostscript import get_ghostscript_command
-from pdf_diagnostics import diagnose_for_job, analyze_pdf, get_quality_warnings
+from pdf_diagnostics import diagnose_for_job, get_quality_warnings
 from exceptions import (
     PDFCompressionError,
     EncryptionError,
@@ -26,6 +26,7 @@ from exceptions import (
     SplitError,
 )
 import job_queue
+import utils
 
 # Config
 logging.basicConfig(
@@ -450,26 +451,52 @@ def get_status(job_id: str):
 @require_auth
 def compress_sync():
     """
-    Synchronous compression for Salesforce integration.
+    Synchronous compression endpoint - handles both Salesforce and dashboard requests.
     Blocks until complete, returns download URLs directly.
 
-    Request:  { "file_download_link": "https://..." }
-    Response: { "success": true, "files": ["/download/part1.pdf", ...] }
+    Accepts two input methods:
+    1. JSON body: {"file_download_link": "https://..."} - for Salesforce/API calls
+    2. Form-data: file field with PDF upload - for dashboard testing
+
+    Response: {"success": true, "files": ["/download/part1.pdf", ...]}
     """
-    if not request.is_json:
-        return jsonify({"success": False, "error": "JSON required"}), 400
-
-    data = request.get_json()
-    file_url = data.get('file_download_link') or data.get('file_url')
-    if not file_url:
-        return jsonify({"success": False, "error": "Missing file_download_link"}), 400
-
+    # Generate unique ID for this request (supports concurrent users)
     file_id = str(uuid.uuid4()).replace('-', '')[:16]
     input_path = UPLOAD_FOLDER / f"{file_id}_input.pdf"
 
     try:
-        logger.info(f"[sync] Starting compression for URL: {file_url[:100]}...")
-        job_queue.download_pdf(file_url, input_path)
+        # Dual input handling - JSON (Salesforce) or form-data (Dashboard)
+        if request.is_json:
+            # Salesforce/API flow - download PDF from URL
+            data = request.get_json()
+            file_url = data.get('file_download_link') or data.get('file_url')
+            if not file_url:
+                return jsonify({"success": False, "error": "Missing file_download_link"}), 400
+            logger.info(f"[sync:{file_id}] Downloading from URL: {file_url[:100]}...")
+            utils.download_pdf(file_url, input_path)
+            # Validate downloaded file is actually a PDF
+            with open(input_path, 'rb') as f:
+                header = f.read(5)
+            if header != b'%PDF-':
+                input_path.unlink(missing_ok=True)
+                return jsonify({"success": False, "error": "Downloaded file is not a valid PDF"}), 400
+            downloaded_mb = input_path.stat().st_size / (1024 * 1024)
+            logger.info(f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB (will split if > {SPLIT_THRESHOLD_MB}MB)")
+
+        elif request.files and 'file' in request.files:
+            # Dashboard flow - direct file upload
+            f = request.files['file']
+            if not f.filename:
+                return jsonify({"success": False, "error": "No file selected"}), 400
+            pdf_bytes = f.read()
+            if len(pdf_bytes) < 5 or pdf_bytes[:5] != b'%PDF-':
+                return jsonify({"success": False, "error": "Invalid PDF file"}), 400
+            input_path.write_bytes(pdf_bytes)
+            logger.info(f"[sync:{file_id}] Received upload: {f.filename} ({len(pdf_bytes) / (1024*1024):.1f}MB)")
+
+        else:
+            return jsonify({"success": False, "error": "No file or URL provided. Send JSON with file_download_link or form-data with file field."}), 400
+
         track_file(input_path)
 
         result = compress_pdf(
@@ -486,18 +513,19 @@ def compress_sync():
             for p in result.get('output_paths', [result['output_path']])
         ]
 
-        logger.info(f"[sync] Compression complete: {len(files)} file(s)")
+        logger.info(f"[sync:{file_id}] Complete: {len(files)} file(s), {result['original_size_mb']:.1f}MB → {result['compressed_size_mb']:.1f}MB")
         return jsonify({
             "success": True,
             "files": files,
             "original_mb": result['original_size_mb'],
             "compressed_mb": result['compressed_size_mb'],
             "was_split": result.get('was_split', False),
-            "total_parts": result.get('total_parts', 1)
+            "total_parts": result.get('total_parts', 1),
+            "part_sizes": result.get('part_sizes')  # Individual file sizes in bytes for verification
         })
 
     except Exception as e:
-        logger.exception(f"[sync] Compression failed: {e}")
+        logger.exception(f"[sync:{file_id}] Failed: {e}")
         return create_error_response(e, get_error_status_code(e))
 
 

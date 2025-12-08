@@ -16,9 +16,11 @@ from compress_ghostscript import optimize_split_part, compress_pdf_with_ghostscr
 from exceptions import EncryptionError, StructureError, SplitError
 from utils import get_file_size_mb
 
-# Constants
+# Constants - Email attachment sizing
+# Outlook/Exchange has ~25MB limit but this includes email headers/body overhead
+# Target slightly under 25MB to leave room for email overhead
 DEFAULT_THRESHOLD_MB: float = 25.0
-SAFETY_BUFFER_MB: float = 0.5  # Target 24.5MB to ensure we're under 25MB limit
+SAFETY_BUFFER_MB: float = 1.5  # Buffer for email headers/body overhead (target ~23.5MB parts)
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +87,13 @@ def split_pdf(
             if total_pages == 0:
                 raise StructureError.for_file(pdf_path.name, "PDF has no pages")
 
-            # SIMPLE: compressed_size ÷ 25MB = number of parts
+            # Calculate number of parts needed and BALANCED target size
             num_parts = math.ceil(file_size_mb / threshold_mb)
-            target_size = threshold_mb - SAFETY_BUFFER_MB  # 24.5MB max per part
-            logger.info(f"Split: {file_size_mb:.2f}MB ÷ {threshold_mb}MB = {num_parts} parts needed")
+            # Target = total / parts (balanced distribution), capped at threshold - buffer
+            balanced_target = file_size_mb / num_parts
+            max_target = threshold_mb - SAFETY_BUFFER_MB
+            target_size = min(balanced_target, max_target)
+            logger.info(f"Split: {file_size_mb:.2f}MB ÷ {threshold_mb}MB = {num_parts} parts, target {target_size:.1f}MB each")
 
             def measure_pages(start_page: int, end_page: int, optimize: bool = True) -> float:
                 """Create a temp PDF, optionally optimize it, and measure its size.
@@ -128,6 +133,11 @@ def split_pdf(
                 if attempt > 0:
                     num_parts += 1
                     logger.info(f"Attempt {attempt + 1}: Trying with {num_parts} parts...")
+
+                # Recalculate balanced target for current number of parts
+                balanced_target = file_size_mb / num_parts
+                target_size = min(balanced_target, max_target)
+                logger.info(f"Target size per part: {target_size:.1f}MB")
 
                 # Find split points using binary search
                 split_points = [0]  # Start of first part

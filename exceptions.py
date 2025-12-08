@@ -82,25 +82,6 @@ class StructureError(PDFCompressionError):
         )
 
 
-class CompressionFailureError(PDFCompressionError):
-    """PDF cannot be compressed any smaller.
-
-    User-friendly message examples:
-    - "This PDF is already as small as it can get."
-    - "This PDF cannot be compressed further - it's already optimized."
-    """
-
-    error_type: str = "CompressionFailureError"
-
-    @staticmethod
-    def for_file(filename: str, original_mb: float, compressed_mb: float) -> "CompressionFailureError":
-        """Create error with simple message for a specific file."""
-        return CompressionFailureError(
-            f"'{filename}' is already optimized and cannot be compressed smaller. "
-            f"Original: {original_mb:.1f}MB, After compression: {compressed_mb:.1f}MB."
-        )
-
-
 class SplitError(PDFCompressionError):
     """PDF cannot be split into small enough parts for email.
 
