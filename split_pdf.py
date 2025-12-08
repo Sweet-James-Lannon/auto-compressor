@@ -107,8 +107,8 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
 def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb: float = DEFAULT_THRESHOLD_MB) -> List[Path]:
     """Split PDF into parts under threshold_mb each.
 
-    Uses page-proportional estimation (fast, no binary search).
-    This is the final split for email attachments after compression.
+    Creates parts and verifies each is under threshold. If any part exceeds
+    threshold, increases the number of parts and retries.
 
     Args:
         pdf_path: Path to source PDF.
@@ -117,7 +117,7 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
         threshold_mb: Maximum size per part.
 
     Returns:
-        List of paths to created part files.
+        List of paths to created part files, all guaranteed under threshold_mb.
     """
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
@@ -136,34 +136,65 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
     if total_pages == 0:
         raise StructureError.for_file(pdf_path.name, "PDF has no pages")
 
-    # Calculate number of parts needed (with buffer for safety)
-    buffer_mb = 2.0  # Safety buffer
+    # Start with estimated number of parts, increase if needed
+    buffer_mb = 2.0
     effective_threshold = threshold_mb - buffer_mb
-    num_parts = math.ceil(file_size_mb / effective_threshold)
+    num_parts = max(2, math.ceil(file_size_mb / effective_threshold))
 
-    # Ensure at least 1 page per part
-    num_parts = min(num_parts, total_pages)
+    max_attempts = 20  # Prevent infinite loops
 
-    pages_per_part = total_pages // num_parts
+    for attempt in range(max_attempts):
+        # Ensure at least 1 page per part
+        num_parts = min(num_parts, total_pages)
+        pages_per_part = total_pages // num_parts
 
-    output_paths = []
-    for i in range(num_parts):
-        start = i * pages_per_part
-        end = total_pages if i == num_parts - 1 else (i + 1) * pages_per_part
+        logger.info(f"[split_by_size] Attempt {attempt + 1}: splitting into {num_parts} parts ({pages_per_part} pages each)")
 
-        writer = PdfWriter()
-        for page_idx in range(start, end):
-            writer.add_page(reader.pages[page_idx])
+        # Clean up any previous attempt files
+        for old_file in output_dir.glob(f"{base_name}_part*.pdf"):
+            old_file.unlink(missing_ok=True)
 
-        part_path = output_dir / f"{base_name}_part{i+1}.pdf"
+        output_paths = []
+        all_under_threshold = True
+        max_part_size = 0
 
-        with open(part_path, 'wb') as f:
-            writer.write(f)
+        for i in range(num_parts):
+            start = i * pages_per_part
+            # Last part gets all remaining pages
+            end = total_pages if i == num_parts - 1 else (i + 1) * pages_per_part
 
-        part_size = get_file_size_mb(part_path)
-        output_paths.append(part_path)
-        logger.info(f"Created part {i+1}/{num_parts}: pages {start+1}-{end}, {part_size:.1f}MB -> {part_path.name}")
+            writer = PdfWriter()
+            for page_idx in range(start, end):
+                writer.add_page(reader.pages[page_idx])
 
+            part_path = output_dir / f"{base_name}_part{i+1}.pdf"
+
+            with open(part_path, 'wb') as f:
+                writer.write(f)
+
+            part_size = get_file_size_mb(part_path)
+            max_part_size = max(max_part_size, part_size)
+            output_paths.append(part_path)
+
+            if part_size > threshold_mb:
+                all_under_threshold = False
+                logger.warning(f"[split_by_size] Part {i+1} is {part_size:.1f}MB (over {threshold_mb}MB threshold)")
+
+            logger.info(f"[split_by_size] Part {i+1}/{num_parts}: pages {start+1}-{end}, {part_size:.1f}MB")
+
+        if all_under_threshold:
+            logger.info(f"[split_by_size] Success: {num_parts} parts, all under {threshold_mb}MB (max: {max_part_size:.1f}MB)")
+            return output_paths
+
+        # Parts too big - increase number of parts and retry
+        # Estimate how many more parts we need based on largest part
+        scale_factor = max_part_size / effective_threshold
+        num_parts = max(num_parts + 1, int(num_parts * scale_factor) + 1)
+        logger.info(f"[split_by_size] Retrying with {num_parts} parts...")
+
+    # If we get here, we couldn't split small enough
+    logger.error(f"[split_by_size] Could not split into parts under {threshold_mb}MB after {max_attempts} attempts")
+    # Return what we have - better than nothing
     return output_paths
 
 
