@@ -204,16 +204,31 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
         for page_idx in range(start, end):
             writer.add_page(reader.pages[page_idx])
 
-        part_path = output_dir / f"{base_name}_part{i+1}.pdf"
-
-        with open(part_path, 'wb') as f:
+        # Write to temp file first (PyPDF2 duplicates resources)
+        temp_part_path = output_dir / f"{base_name}_part{i+1}_temp.pdf"
+        with open(temp_part_path, 'wb') as f:
             writer.write(f)
 
-        part_size = get_file_size_mb(part_path)
+        raw_size = get_file_size_mb(temp_part_path)
+
+        # Optimize with Ghostscript to deduplicate resources
+        part_path = output_dir / f"{base_name}_part{i+1}.pdf"
+        success, _ = optimize_split_part(temp_part_path, part_path)
+
+        if success and part_path.exists():
+            temp_part_path.unlink(missing_ok=True)
+            part_size = get_file_size_mb(part_path)
+            logger.info(f"[split_by_size] Part {i+1}/{num_parts}: pages {start+1}-{end}, {raw_size:.1f}MB -> {part_size:.1f}MB (optimized)")
+        else:
+            # Fallback: just rename if optimization fails
+            temp_part_path.rename(part_path)
+            part_size = raw_size
+            logger.info(f"[split_by_size] Part {i+1}/{num_parts}: pages {start+1}-{end}, {part_size:.1f}MB (raw)")
+
         output_paths.append(part_path)
 
         status = "OK" if part_size <= threshold_mb else "OVER"
-        logger.info(f"[split_by_size] Part {i+1}/{num_parts}: pages {start+1}-{end}, {part_size:.1f}MB [{status}]")
+        logger.info(f"[split_by_size] Part {i+1} final: {part_size:.1f}MB [{status}]")
 
     return output_paths
 
