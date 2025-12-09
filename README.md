@@ -32,7 +32,7 @@ Errors return `error_type`/`error_message` (e.g., `DownloadError`, `FileTooLarge
 | `SPLIT_THRESHOLD_MB` | 25 | Max size per output file |
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete after 24h |
 | `PARALLEL_MAX_WORKERS` | 2 | Ghostscript workers per request (parallel path) |
-| `SYNC_TIMEOUT_SECONDS` | 220 | Timeout for `/compress-sync` before 504 |
+| `SYNC_TIMEOUT_SECONDS` | 540 | Timeout for `/compress-sync` before 504 |
 | `DISABLE_ASYNC_WORKERS` | unset | Set to `1` to skip async worker startup |
 
 ## Deployment

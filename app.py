@@ -46,7 +46,8 @@ UPLOAD_FOLDER = Path(__file__).parent / "uploads"  # Absolute path for Azure com
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
 SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 API_TOKEN = os.environ.get('API_TOKEN')
-SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "220"))
+# Raised default to 540s to align with gunicorn timeout and avoid 499/504s on large files.
+SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "540"))
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 UPLOAD_FOLDER.mkdir(exist_ok=True)
