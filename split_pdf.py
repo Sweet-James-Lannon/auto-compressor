@@ -145,6 +145,30 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
         merger.close()
         logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2 fallback)")
 
+    # === BLOAT DETECTION ===
+    # PyPDF2 fallback can duplicate resources, causing merged file to be larger
+    # than the sum of inputs. Detect and warn loudly.
+    if output_path.exists():
+        input_total_bytes = sum(p.stat().st_size for p in pdf_paths)
+        input_total_mb = input_total_bytes / (1024 * 1024)
+        output_bytes = output_path.stat().st_size
+        output_mb = output_bytes / (1024 * 1024)
+
+        if output_bytes > input_total_bytes:
+            bloat_bytes = output_bytes - input_total_bytes
+            bloat_mb = bloat_bytes / (1024 * 1024)
+            bloat_pct = (bloat_bytes / input_total_bytes) * 100 if input_total_bytes > 0 else 0
+
+            logger.warning(f"[merge_pdfs] ⚠️  BLOAT DETECTED - Output larger than inputs!")
+            logger.warning(f"[merge_pdfs]    Input total:  {input_total_mb:.2f}MB ({input_total_bytes:,} bytes)")
+            logger.warning(f"[merge_pdfs]    Output size:  {output_mb:.2f}MB ({output_bytes:,} bytes)")
+            logger.warning(f"[merge_pdfs]    Bloat: +{bloat_mb:.2f}MB (+{bloat_pct:.1f}%)")
+            logger.warning(f"[merge_pdfs]    Likely cause: PyPDF2 fallback duplicated shared resources")
+        else:
+            saved_bytes = input_total_bytes - output_bytes
+            saved_mb = saved_bytes / (1024 * 1024)
+            logger.info(f"[merge_pdfs] ✓ Merge efficient: {input_total_mb:.2f}MB -> {output_mb:.2f}MB (saved {saved_mb:.2f}MB)")
+
 
 def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb: float = DEFAULT_THRESHOLD_MB) -> List[Path]:
     """Split PDF into parts under threshold_mb each.
@@ -210,34 +234,67 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
 
         raw_size = get_file_size_mb(temp_part_path)
 
-        # Optimize with Ghostscript to deduplicate resources
+        # Optimize with Ghostscript to deduplicate resources (critical for size reduction)
         part_path = output_dir / f"{base_name}_part{i+1}.pdf"
-        success, _ = optimize_split_part(temp_part_path, part_path)
+        success, opt_message = optimize_split_part(temp_part_path, part_path)
 
         if success and part_path.exists():
             temp_part_path.unlink(missing_ok=True)
             part_size = get_file_size_mb(part_path)
-            logger.info(f"[split_by_size] Part {i+1}/{num_parts}: pages {start+1}-{end}, {raw_size:.1f}MB -> {part_size:.1f}MB (optimized)")
+            reduction_pct = ((raw_size - part_size) / raw_size) * 100 if raw_size > 0 else 0
+            reduction_mb = raw_size - part_size
+
+            logger.info(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZED:")
+            logger.info(f"[split_by_size]   Pages: {start+1}-{end}")
+            logger.info(f"[split_by_size]   Before: {raw_size:.2f}MB (raw PyPDF2)")
+            logger.info(f"[split_by_size]   After:  {part_size:.2f}MB (Ghostscript optimized)")
+            logger.info(f"[split_by_size]   Saved:  {reduction_pct:.1f}% (-{reduction_mb:.2f}MB)")
         else:
-            # Fallback: just rename if optimization fails
+            # Optimization failed - use raw PyPDF2 output (may be bloated!)
+            logger.warning(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZATION FAILED:")
+            logger.warning(f"[split_by_size]   Pages: {start+1}-{end}")
+            logger.warning(f"[split_by_size]   Error: {opt_message}")
+            logger.warning(f"[split_by_size]   Using raw PyPDF2 output: {raw_size:.2f}MB")
+            logger.warning(f"[split_by_size]   ⚠️  This part may contain duplicated resources!")
+
             temp_part_path.rename(part_path)
             part_size = raw_size
-            logger.info(f"[split_by_size] Part {i+1}/{num_parts}: pages {start+1}-{end}, {part_size:.1f}MB (raw)")
 
         output_paths.append(part_path)
 
         status = "OK" if part_size <= threshold_mb else "OVER"
         logger.info(f"[split_by_size] Part {i+1} final: {part_size:.1f}MB [{status}]")
 
-    oversize_parts = [p for p in output_paths if get_file_size_mb(p) > threshold_mb]
+    # CRITICAL: Verify ALL parts are under threshold with detailed logging
+    oversize_parts = []
+    verified_count = 0
+
+    for i, p in enumerate(output_paths):
+        part_size_mb = get_file_size_mb(p)
+        part_size_bytes = p.stat().st_size
+
+        if part_size_mb > threshold_mb:
+            oversize_parts.append((i + 1, p.name, part_size_mb))
+            logger.error(f"[split_by_size] ❌ Part {i+1} EXCEEDS THRESHOLD:")
+            logger.error(f"[split_by_size]    File: {p.name}")
+            logger.error(f"[split_by_size]    Size: {part_size_mb:.2f}MB ({part_size_bytes:,} bytes)")
+            logger.error(f"[split_by_size]    Limit: {threshold_mb}MB")
+        else:
+            verified_count += 1
+            logger.info(f"[split_by_size] ✓ Part {i+1} OK: {p.name} = {part_size_mb:.2f}MB")
+
     if oversize_parts:
-        logger.warning(f"[split_by_size] {len(oversize_parts)} part(s) exceeded {threshold_mb}MB. Retrying with binary-search splitter.")
-        # Clean up oversized parts before retrying
+        logger.warning(f"[split_by_size] {len(oversize_parts)}/{len(output_paths)} parts exceeded {threshold_mb}MB")
+        logger.warning(f"[split_by_size] Cleaning up and retrying with binary-search splitter...")
+
+        # Clean up ALL parts before retrying
         for p in output_paths:
             p.unlink(missing_ok=True)
-        # Fallback to precise splitter which iterates until all parts are under threshold
+
+        # Fallback to precise binary-search splitter
         return split_pdf(pdf_path, output_dir, base_name, threshold_mb)
 
+    logger.info(f"[split_by_size] ✓ SUCCESS: All {verified_count} parts verified under {threshold_mb}MB")
     return output_paths
 
 

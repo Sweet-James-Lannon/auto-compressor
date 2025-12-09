@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 PARALLEL_THRESHOLD_MB = 30.0
 # Default to 2 workers for stability unless overridden by env
 MAX_PARALLEL_WORKERS = int(os.environ.get("PARALLEL_MAX_WORKERS", "2"))
+# Skip compression for very small files (already optimized)
+MIN_COMPRESSION_SIZE_MB = float(os.environ.get("MIN_COMPRESSION_SIZE_MB", "1.0"))
 
 
 def compress_pdf(
@@ -92,6 +94,47 @@ def compress_pdf(
     working_dir = working_dir or input_path.parent
     original_size = get_file_size_mb(input_path)
     original_bytes = input_path.stat().st_size
+
+    # Skip compression for very small files - usually already optimized
+    if original_size < MIN_COMPRESSION_SIZE_MB:
+        logger.info(f"[compress] Skipping {input_path.name}: {original_size:.2f}MB < {MIN_COMPRESSION_SIZE_MB}MB threshold")
+
+        # Still split if above threshold (rare for small files)
+        if split_threshold_mb and original_size > split_threshold_mb:
+            output_paths = split_pdf.split_pdf(
+                input_path, working_dir, input_path.stem,
+                threshold_mb=split_threshold_mb,
+                progress_callback=progress_callback
+            )
+            return {
+                "output_path": str(output_paths[0]),
+                "output_paths": [str(p) for p in output_paths],
+                "original_size_mb": round(original_size, 2),
+                "compressed_size_mb": round(original_size, 2),
+                "reduction_percent": 0.0,
+                "compression_method": "skipped",
+                "was_split": len(output_paths) > 1,
+                "total_parts": len(output_paths),
+                "success": True,
+                "note": "File under compression threshold, split only",
+                "page_count": page_count,
+                "part_sizes": [p.stat().st_size for p in output_paths]
+            }
+
+        return {
+            "output_path": str(input_path),
+            "output_paths": [str(input_path)],
+            "original_size_mb": round(original_size, 2),
+            "compressed_size_mb": round(original_size, 2),
+            "reduction_percent": 0.0,
+            "compression_method": "skipped",
+            "was_split": False,
+            "total_parts": 1,
+            "success": True,
+            "note": f"File under {MIN_COMPRESSION_SIZE_MB}MB threshold - already optimized",
+            "page_count": page_count,
+            "part_sizes": [original_bytes]
+        }
 
     logger.info(f"[SIZE_CHECK] Input: {input_path.name} = {original_bytes} bytes ({original_size:.2f}MB)")
 

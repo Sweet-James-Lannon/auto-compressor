@@ -174,8 +174,8 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
         "-dGrayImageResolution=72",
         "-dGrayImageDownsampleThreshold=1.0",
         "-dDownsampleMonoImages=true",
-        "-dMonoImageDownsampleType=/Bicubic",
-        "-dMonoImageResolution=72",
+        "-dMonoImageDownsampleType=/Subsample",  # Faster for 1-bit images
+        "-dMonoImageResolution=150",  # Raised for readable scanned text
         "-dMonoImageDownsampleThreshold=1.0",
         # Optimization
         "-dDetectDuplicateImages=true",
@@ -349,8 +349,19 @@ def compress_parallel(
     # This can happen because PyPDF2 merge duplicates resources across chunks
     # =========================================================================
     if compressed_size_mb >= original_size_mb:
-        logger.warning(f"[PARALLEL] Compression INCREASED size ({original_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB)!")
-        logger.warning(f"[PARALLEL] Falling back to serial compression...")
+        bloat_bytes = int((compressed_size_mb - original_size_mb) * 1024 * 1024)
+        bloat_pct = ((compressed_size_mb - original_size_mb) / original_size_mb) * 100
+
+        logger.warning(f"[PARALLEL] " + "="*50)
+        logger.warning(f"[PARALLEL] ⚠️  PARALLEL COMPRESSION CAUSED BLOAT!")
+        logger.warning(f"[PARALLEL] " + "="*50)
+        logger.warning(f"[PARALLEL]   Original size:     {original_size_mb:.2f}MB")
+        logger.warning(f"[PARALLEL]   After parallel:    {compressed_size_mb:.2f}MB")
+        logger.warning(f"[PARALLEL]   Bloat:             +{bloat_pct:.1f}% (+{bloat_bytes:,} bytes)")
+        logger.warning(f"[PARALLEL]   Chunks processed:  {num_chunks}")
+        logger.warning(f"[PARALLEL]   Root cause: PyPDF2 merge duplicated resources across chunks")
+        logger.warning(f"[PARALLEL]   Action: Falling back to serial compression (single Ghostscript pass)...")
+        logger.warning(f"[PARALLEL] " + "="*50)
 
         # Delete the inflated merged file
         merged_path.unlink(missing_ok=True)
@@ -390,7 +401,15 @@ def compress_parallel(
                 }
 
             # Serial worked - use that result
-            logger.info(f"[PARALLEL] Serial compression succeeded: {serial_size_mb:.1f}MB")
+            serial_reduction_pct = ((original_size_mb - serial_size_mb) / original_size_mb) * 100
+            serial_reduction_mb = original_size_mb - serial_size_mb
+
+            logger.info(f"[PARALLEL] " + "-"*50)
+            logger.info(f"[PARALLEL] ✓ SERIAL FALLBACK SUCCEEDED")
+            logger.info(f"[PARALLEL]   Original:    {original_size_mb:.2f}MB")
+            logger.info(f"[PARALLEL]   Compressed:  {serial_size_mb:.2f}MB")
+            logger.info(f"[PARALLEL]   Reduction:   {serial_reduction_pct:.1f}% (-{serial_reduction_mb:.2f}MB)")
+            logger.info(f"[PARALLEL] " + "-"*50)
 
             # Rename serial output to expected name
             final_compressed = working_dir / f"{base_name}_compressed.pdf"
