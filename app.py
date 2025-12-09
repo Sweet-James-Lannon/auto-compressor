@@ -565,6 +565,8 @@ def compress_sync():
         if file_size_mb > MAX_SYNC_SIZE_MB:
             logger.warning(f"[sync:{file_id}] File too large: {file_size_mb:.1f}MB > {MAX_SYNC_SIZE_MB}MB limit")
             input_path.unlink(missing_ok=True)
+            with file_lock:
+                tracked_files.pop(str(input_path), None)
             return jsonify({
                 "success": False,
                 "error": f"File too large ({file_size_mb:.1f}MB). Maximum for sync endpoint is {MAX_SYNC_SIZE_MB:.0f}MB.",
@@ -573,11 +575,6 @@ def compress_sync():
                 "recommendation": "Reduce file size below limit and retry"
             }), 413
 
-        result = compress_pdf(
-            str(input_path),
-            working_dir=UPLOAD_FOLDER,
-            split_threshold_mb=SPLIT_THRESHOLD_MB
-        )
         # Run compression with a timeout to avoid gateway kills
         def run_compress():
             return compress_pdf(
@@ -586,25 +583,19 @@ def compress_sync():
                 split_threshold_mb=SPLIT_THRESHOLD_MB
             )
 
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(run_compress)
-        try:
-            result = future.result(timeout=SYNC_TIMEOUT_SECONDS)
-        except FuturesTimeoutError:
-            logger.error(f"[sync:{file_id}] Timed out after {SYNC_TIMEOUT_SECONDS}s")
-            future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-            return jsonify({
-                "success": False,
-                "error": f"Processing timed out after {SYNC_TIMEOUT_SECONDS}s. Try a smaller file or retry later.",
-                "error_type": "Timeout",
-                "error_message": f"Processing timed out after {SYNC_TIMEOUT_SECONDS}s. Try a smaller file or retry later."
-            }), 504
-        finally:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_compress)
             try:
-                executor.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
+                result = future.result(timeout=SYNC_TIMEOUT_SECONDS)
+            except FuturesTimeoutError:
+                logger.error(f"[sync:{file_id}] Timed out after {SYNC_TIMEOUT_SECONDS}s")
+                future.cancel()
+                return jsonify({
+                    "success": False,
+                    "error": f"Processing timed out after {SYNC_TIMEOUT_SECONDS}s. Try a smaller file or retry later.",
+                    "error_type": "Timeout",
+                    "error_message": f"Processing timed out after {SYNC_TIMEOUT_SECONDS}s. Try a smaller file or retry later."
+                }), 504
 
         # =====================================================================
         # CRITICAL: Verify all output files exist before returning download URLs
@@ -709,6 +700,11 @@ def download(filename):
     logger.info(f"[download] Serving file: {file_path.name} ({file_path.stat().st_size / (1024*1024):.1f}MB)")
     return send_file(file_path, as_attachment=True, download_name=safe_filename)
 
+
+@app.route('/favicon.ico')
+def favicon():
+    """Serve an empty favicon to stop 500/404 noise."""
+    return jsonify({"status": "ok"}), 200
 
 @app.route('/diagnose/<job_id>', methods=['GET'])
 @require_auth

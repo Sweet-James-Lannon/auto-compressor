@@ -5,6 +5,7 @@ Handles background processing to avoid blocking the main request threads.
 """
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -164,6 +165,9 @@ def _cleanup_expired_jobs() -> None:
 def start_workers(num_workers: int = 8) -> None:
     """Start multiple background worker threads."""
     global _workers_started
+    if os.environ.get("DISABLE_ASYNC_WORKERS", "").lower() in ("1", "true", "yes"):
+        logger.info("Async workers disabled by DISABLE_ASYNC_WORKERS")
+        return
     if _workers_started:
         logger.info("Workers already started, skipping duplicate start")
         return
