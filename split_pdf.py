@@ -372,7 +372,7 @@ def split_pdf(
             target_size = min(balanced_target, max_target)
             logger.info(f"Split: {file_size_mb:.2f}MB ÷ {threshold_mb}MB = {num_parts} parts, target {target_size:.1f}MB each")
 
-            def measure_pages(start_page: int, end_page: int, optimize: bool = True) -> float:
+            def measure_pages(start_page: int, end_page: int, optimize: bool = False) -> float:
                 """Create a temp PDF, optionally optimize it, and measure its size.
 
                 Args:
