@@ -1,6 +1,6 @@
 # SJ PDF Compressor
 
-Compresses scanned PDFs for email attachment compliance. Auto-splits files exceeding 25MB.
+Compresses PDFs and auto-splits into ≤25MB parts for email/Salesforce. Parallel Ghostscript is used for large files; sync limit is 300MB.
 
 ## Usage
 
@@ -22,6 +22,8 @@ Response:
 }
 ```
 
+Errors return `error_type`/`error_message` (e.g., `DownloadError`, `FileTooLarge`, `Timeout`, `InvalidPDF`).
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -29,6 +31,9 @@ Response:
 | `API_TOKEN` | - | Required for authentication |
 | `SPLIT_THRESHOLD_MB` | 25 | Max size per output file |
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete after 24h |
+| `PARALLEL_MAX_WORKERS` | 2 | Ghostscript workers per request (parallel path) |
+| `SYNC_TIMEOUT_SECONDS` | 220 | Timeout for `/compress-sync` before 504 |
+| `DISABLE_ASYNC_WORKERS` | unset | Set to `1` to skip async worker startup |
 
 ## Deployment
 
@@ -41,9 +46,10 @@ Instance count must be 1. Multiple instances cause download failures due to non-
 
 ## Architecture
 
-- Files < 60MB: Serial Ghostscript compression
-- Files > 60MB: Parallel chunk compression (6 workers)
-- If compression increases size: Falls back to split-only
+- Files < ~30MB: Serial Ghostscript compression
+- Files > ~30MB: Parallel chunk compression (workers configurable via `PARALLEL_MAX_WORKERS`)
+- If compression increases size: return original and split if above threshold
+- Final split uses `ceil(size/threshold)` so outputs stay under `SPLIT_THRESHOLD_MB`
 
 ## Endpoints
 
