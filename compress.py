@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # Files below this use serial, above use parallel (faster for large files)
 # Set to 30MB - serial compression can timeout on files 40MB+ due to slow Ghostscript settings
 PARALLEL_THRESHOLD_MB = 30.0
-MAX_PARALLEL_WORKERS = int(os.environ.get("PARALLEL_MAX_WORKERS", "4"))
+# Default to 3 workers for stability unless overridden by env
+MAX_PARALLEL_WORKERS = int(os.environ.get("PARALLEL_MAX_WORKERS", "3"))
 
 
 def compress_pdf(

@@ -3,6 +3,7 @@
 import base64
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import threading
 import time
 import uuid
@@ -45,6 +46,7 @@ UPLOAD_FOLDER = Path(__file__).parent / "uploads"  # Absolute path for Azure com
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
 SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 API_TOKEN = os.environ.get('API_TOKEN')
+SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "220"))
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 UPLOAD_FOLDER.mkdir(exist_ok=True)
@@ -576,6 +578,33 @@ def compress_sync():
             working_dir=UPLOAD_FOLDER,
             split_threshold_mb=SPLIT_THRESHOLD_MB
         )
+        # Run compression with a timeout to avoid gateway kills
+        def run_compress():
+            return compress_pdf(
+                str(input_path),
+                working_dir=UPLOAD_FOLDER,
+                split_threshold_mb=SPLIT_THRESHOLD_MB
+            )
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(run_compress)
+        try:
+            result = future.result(timeout=SYNC_TIMEOUT_SECONDS)
+        except FuturesTimeoutError:
+            logger.error(f"[sync:{file_id}] Timed out after {SYNC_TIMEOUT_SECONDS}s")
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            return jsonify({
+                "success": False,
+                "error": f"Processing timed out after {SYNC_TIMEOUT_SECONDS}s. Try a smaller file or retry later.",
+                "error_type": "Timeout",
+                "error_message": f"Processing timed out after {SYNC_TIMEOUT_SECONDS}s. Try a smaller file or retry later."
+            }), 504
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
         # =====================================================================
         # CRITICAL: Verify all output files exist before returning download URLs
