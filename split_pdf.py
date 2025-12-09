@@ -230,6 +230,15 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
         status = "OK" if part_size <= threshold_mb else "OVER"
         logger.info(f"[split_by_size] Part {i+1} final: {part_size:.1f}MB [{status}]")
 
+    oversize_parts = [p for p in output_paths if get_file_size_mb(p) > threshold_mb]
+    if oversize_parts:
+        logger.warning(f"[split_by_size] {len(oversize_parts)} part(s) exceeded {threshold_mb}MB. Retrying with binary-search splitter.")
+        # Clean up oversized parts before retrying
+        for p in output_paths:
+            p.unlink(missing_ok=True)
+        # Fallback to precise splitter which iterates until all parts are under threshold
+        return split_pdf(pdf_path, output_dir, base_name, threshold_mb)
+
     return output_paths
 
 

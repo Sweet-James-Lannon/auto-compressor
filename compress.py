@@ -129,6 +129,10 @@ def compress_pdf(
         else:
             raise StructureError.for_file(input_path.name, message)
 
+    # Ensure Ghostscript actually produced an output file
+    if not output_path.exists():
+        raise StructureError.for_file(input_path.name, "Compression output not created")
+
     compressed_size = get_file_size_mb(output_path)
     compressed_bytes = output_path.stat().st_size
 
@@ -165,6 +169,7 @@ def compress_pdf(
                 "part_sizes": [p.stat().st_size for p in output_paths]
             }
 
+        single_size = output_path.stat().st_size
         return {
             "output_path": str(output_path),
             "output_paths": [str(output_path)],
@@ -177,7 +182,7 @@ def compress_pdf(
             "success": True,
             "note": "Already optimized",
             "page_count": page_count,
-            "part_sizes": None
+            "part_sizes": [single_size]
         }
 
     reduction = ((original_size - compressed_size) / original_size) * 100
@@ -220,6 +225,8 @@ def compress_pdf(
     logger.info(f"[SIZE_CHECK] Final: {output_path.name} = {compressed_bytes} bytes ({compressed_size:.2f}MB)")
     report_progress(95, "finalizing", "Finalizing...")
 
+    single_size = output_path.stat().st_size
+
     return {
         "output_path": str(output_path),
         "output_paths": [str(output_path)],
@@ -231,5 +238,5 @@ def compress_pdf(
         "total_parts": 1,
         "success": True,
         "page_count": page_count,
-        "part_sizes": None
+        "part_sizes": [single_size]
     }

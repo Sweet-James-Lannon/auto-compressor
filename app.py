@@ -10,6 +10,7 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, render_template, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -24,6 +25,7 @@ from exceptions import (
     StructureError,
     MetadataCorruptionError,
     SplitError,
+    DownloadError,
 )
 import job_queue
 import utils
@@ -99,6 +101,9 @@ def create_error_response(error: Exception, status_code: int = 500):
 
 def get_error_status_code(error: Exception) -> int:
     """Map exception type to appropriate HTTP status code."""
+    if isinstance(error, DownloadError):
+        # DownloadError carries its own status code for clarity
+        return getattr(error, "status_code", 400)
     if isinstance(error, (EncryptionError, StructureError, MetadataCorruptionError, SplitError)):
         return 422  # Unprocessable Entity - valid request but can't process the PDF
     if isinstance(error, FileNotFoundError):
@@ -494,15 +499,28 @@ def compress_sync():
             data = request.get_json()
             file_url = data.get('file_download_link') or data.get('file_url')
             if not file_url:
-                return jsonify({"success": False, "error": "Missing file_download_link"}), 400
-            logger.info(f"[sync:{file_id}] Downloading from URL: {file_url[:100]}...")
+                return jsonify({
+                    "success": False,
+                    "error": "Missing file_download_link",
+                    "error_type": "MissingParameter",
+                    "error_message": "Missing file_download_link"
+                }), 400
+            parsed = urlparse(file_url)
+            host_hint = parsed.hostname or "unknown-host"
+            path_hint = (parsed.path or "")[:50]
+            logger.info(f"[sync:{file_id}] Downloading from host={host_hint} path={path_hint}...")
             utils.download_pdf(file_url, input_path)
             # Validate downloaded file is actually a PDF
             with open(input_path, 'rb') as f:
                 header = f.read(5)
             if header != b'%PDF-':
                 input_path.unlink(missing_ok=True)
-                return jsonify({"success": False, "error": "Downloaded file is not a valid PDF"}), 400
+                return jsonify({
+                    "success": False,
+                    "error": "Downloaded file is not a valid PDF",
+                    "error_type": "InvalidPDF",
+                    "error_message": "Downloaded file is not a valid PDF"
+                }), 400
             downloaded_mb = input_path.stat().st_size / (1024 * 1024)
             logger.info(f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB (will split if > {SPLIT_THRESHOLD_MB}MB)")
 
@@ -510,21 +528,36 @@ def compress_sync():
             # Dashboard flow - direct file upload
             f = request.files['file']
             if not f.filename:
-                return jsonify({"success": False, "error": "No file selected"}), 400
+                return jsonify({
+                    "success": False,
+                    "error": "No file selected",
+                    "error_type": "MissingFile",
+                    "error_message": "No file selected"
+                }), 400
             pdf_bytes = f.read()
             if len(pdf_bytes) < 5 or pdf_bytes[:5] != b'%PDF-':
-                return jsonify({"success": False, "error": "Invalid PDF file"}), 400
+                return jsonify({
+                    "success": False,
+                    "error": "Invalid PDF file",
+                    "error_type": "InvalidPDF",
+                    "error_message": "Invalid PDF file"
+                }), 400
             input_path.write_bytes(pdf_bytes)
             logger.info(f"[sync:{file_id}] Received upload: {f.filename} ({len(pdf_bytes) / (1024*1024):.1f}MB)")
 
         else:
-            return jsonify({"success": False, "error": "No file or URL provided. Send JSON with file_download_link or form-data with file field."}), 400
+            msg = "No file or URL provided. Send JSON with file_download_link or form-data with file field."
+            return jsonify({
+                "success": False,
+                "error": msg,
+                "error_type": "MissingFile",
+                "error_message": msg
+            }), 400
 
         track_file(input_path)
 
-        # Check file size - reject files over 200MB for sync endpoint
-        # Larger files can cause Azure load balancer timeouts (230s hard limit)
-        MAX_SYNC_SIZE_MB = 200.0
+        # Check file size - reject files over 300MB for sync endpoint
+        MAX_SYNC_SIZE_MB = 300.0
         file_size_mb = input_path.stat().st_size / (1024 * 1024)
 
         if file_size_mb > MAX_SYNC_SIZE_MB:
@@ -533,7 +566,9 @@ def compress_sync():
             return jsonify({
                 "success": False,
                 "error": f"File too large ({file_size_mb:.1f}MB). Maximum for sync endpoint is {MAX_SYNC_SIZE_MB:.0f}MB.",
-                "recommendation": "Use the async /compress endpoint for very large files"
+                "error_type": "FileTooLarge",
+                "error_message": f"File too large ({file_size_mb:.1f}MB). Maximum for sync endpoint is {MAX_SYNC_SIZE_MB:.0f}MB.",
+                "recommendation": "Reduce file size below limit and retry"
             }), 413
 
         result = compress_pdf(
@@ -559,17 +594,26 @@ def compress_sync():
                 logger.error(f"[sync:{file_id}] UPLOAD_FOLDER is: {UPLOAD_FOLDER.resolve()}")
                 return jsonify({
                     "success": False,
-                    "error": "Compression failed - output file not created"
+                    "error": "Compression failed - output file not created",
+                    "error_type": "OutputMissing",
+                    "error_message": "Compression failed - output file not created"
                 }), 500
             if p.stat().st_size == 0:
                 logger.error(f"[sync:{file_id}] Output file is empty: {p}")
                 return jsonify({
                     "success": False,
-                    "error": "Compression failed - output file is empty"
+                    "error": "Compression failed - output file is empty",
+                    "error_type": "OutputMissing",
+                    "error_message": "Compression failed - output file is empty"
                 }), 500
 
             logger.info(f"[sync:{file_id}] Verified: {p.name} ({p.stat().st_size / (1024*1024):.1f}MB)")
             track_file(p)
+
+        # Always return part sizes for Salesforce verification
+        part_sizes = result.get('part_sizes')
+        if not part_sizes:
+            part_sizes = [Path(p).stat().st_size for p in output_paths]
 
         files = [
             f"/download/{Path(p).name}"
@@ -585,9 +629,12 @@ def compress_sync():
             "compressed_mb": result['compressed_size_mb'],
             "was_split": result.get('was_split', False),
             "total_parts": result.get('total_parts', 1),
-            "part_sizes": result.get('part_sizes')  # Individual file sizes in bytes for verification
+            "part_sizes": part_sizes  # Individual file sizes in bytes for verification
         })
 
+    except DownloadError as e:
+        logger.warning(f"[sync:{file_id}] Download error: {e}")
+        return create_error_response(e, get_error_status_code(e))
     except Exception as e:
         logger.exception(f"[sync:{file_id}] Failed: {e}")
         return create_error_response(e, get_error_status_code(e))

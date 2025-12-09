@@ -38,6 +38,7 @@ _jobs: Dict[str, Job] = {}
 _job_lock = threading.Lock()
 _work_queue: queue.Queue = queue.Queue()
 _processor: Optional[Callable] = None
+_workers_started = False
 
 
 def create_job() -> str:
@@ -162,6 +163,11 @@ def _cleanup_expired_jobs() -> None:
 
 def start_workers(num_workers: int = 8) -> None:
     """Start multiple background worker threads."""
+    global _workers_started
+    if _workers_started:
+        logger.info("Workers already started, skipping duplicate start")
+        return
+
     for i in range(num_workers):
         worker_thread = threading.Thread(target=_worker, daemon=True, name=f"compression-worker-{i}")
         worker_thread.start()
@@ -170,3 +176,4 @@ def start_workers(num_workers: int = 8) -> None:
     cleanup_thread.start()
     
     logger.info(f"Started {num_workers} compression workers and cleanup thread")
+    _workers_started = True

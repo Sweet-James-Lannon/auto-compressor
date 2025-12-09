@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from exceptions import SplitError
+
 logger = logging.getLogger(__name__)
 
 
@@ -442,11 +444,19 @@ def compress_parallel(
             logger.info(f"[PARALLEL] Keeping merged file as final output")
 
         # Verify all output files exist before returning
+        missing_parts: List[str] = []
         for i, part in enumerate(final_parts):
             if not part.exists():
                 logger.error(f"[PARALLEL] Part {i+1} missing after split: {part}")
+                missing_parts.append(f"missing part {i+1}")
+            elif part.stat().st_size == 0:
+                logger.error(f"[PARALLEL] Part {i+1} is empty after split: {part}")
+                missing_parts.append(f"empty part {i+1}")
             else:
                 logger.info(f"[PARALLEL] Part {i+1} verified: {part.name} ({part.stat().st_size / (1024*1024):.1f}MB)")
+
+        if missing_parts:
+            raise SplitError(f"Parallel split output incomplete: {', '.join(missing_parts)}")
 
         # Get page count from original
         from PyPDF2 import PdfReader
@@ -495,6 +505,6 @@ def compress_parallel(
         "total_parts": 1,
         "success": True,
         "page_count": page_count,
-        "part_sizes": None,
+        "part_sizes": [merged_path.stat().st_size],
         "parallel_chunks": num_chunks
     }

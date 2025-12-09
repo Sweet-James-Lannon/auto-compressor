@@ -11,6 +11,7 @@ class PDFCompressionError(Exception):
     """Base exception for all PDF compression errors."""
 
     error_type: str = "PDFCompressionError"
+    status_code: int = 400
 
     def __init__(
         self,
@@ -20,6 +21,12 @@ class PDFCompressionError(Exception):
         super().__init__(message)
         self.message = message
         self.original_error = original_error
+        # Allow subclasses to override status codes
+        if hasattr(self, "status_code_override"):
+            try:
+                self.status_code = int(getattr(self, "status_code_override"))  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
 
 class EncryptionError(PDFCompressionError):
@@ -101,3 +108,36 @@ class SplitError(PDFCompressionError):
             f"The PDF likely contains high-resolution images that can't be compressed further. "
             f"Try reducing image quality in the original document before uploading."
         )
+
+
+class DownloadError(PDFCompressionError):
+    """Errors related to downloading source PDFs (invalid, blocked, expired, not found)."""
+
+    error_type: str = "DownloadError"
+
+    def __init__(self, message: str, status_code: int = 400) -> None:
+        self.status_code_override = status_code
+        super().__init__(message)
+
+    @staticmethod
+    def invalid_url(url: str) -> "DownloadError":
+        return DownloadError(f"Invalid URL: '{url}'", status_code=400)
+
+    @staticmethod
+    def blocked_url(url: str) -> "DownloadError":
+        return DownloadError(f"URL is blocked for security reasons: '{url}'", status_code=400)
+
+    @staticmethod
+    def expired_or_forbidden(url: str, status_code: int) -> "DownloadError":
+        return DownloadError(
+            f"Download failed (HTTP {status_code}). The link may be expired or access-restricted.",
+            status_code=404 if status_code == 404 else 403
+        )
+
+    @staticmethod
+    def not_found(url: str) -> "DownloadError":
+        return DownloadError(f"Download failed (404). File not found or link expired: '{url}'", status_code=404)
+
+    @staticmethod
+    def too_large(mb: float) -> "DownloadError":
+        return DownloadError(f"File too large: {mb:.1f}MB (limit 300MB)", status_code=413)
