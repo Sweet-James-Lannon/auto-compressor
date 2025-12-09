@@ -2,6 +2,7 @@
 
 import logging
 import shutil
+import os
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 # Files below this use serial, above use parallel (faster for large files)
 # Set to 30MB - serial compression can timeout on files 40MB+ due to slow Ghostscript settings
 PARALLEL_THRESHOLD_MB = 30.0
+MAX_PARALLEL_WORKERS = int(os.environ.get("PARALLEL_MAX_WORKERS", "4"))
 
 
 def compress_pdf(
@@ -103,7 +105,7 @@ def compress_pdf(
             base_name=input_path.stem,
             split_threshold_mb=split_threshold_mb or 25.0,
             progress_callback=progress_callback,
-            max_workers=6
+            max_workers=MAX_PARALLEL_WORKERS
         )
 
     # =========================================================================

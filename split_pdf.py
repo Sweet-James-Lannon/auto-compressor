@@ -178,10 +178,9 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
     if total_pages == 0:
         raise StructureError.for_file(pdf_path.name, "PDF has no pages")
 
-    # Calculate parts needed with safety margin
-    # Use 15MB target per part to leave room for uneven page sizes and email overhead
-    target_size_per_part = 15.0
-    num_parts = max(2, math.ceil(file_size_mb / target_size_per_part))
+    # Calculate parts needed based on actual threshold so we don't oversplit.
+    # Always round up (e.g., 79MB with 25MB threshold -> 4 parts).
+    num_parts = max(2, math.ceil(file_size_mb / threshold_mb))
 
     # Cap at reasonable number - no more than 10 parts
     num_parts = min(num_parts, 10)
