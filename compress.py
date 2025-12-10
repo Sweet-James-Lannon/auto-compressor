@@ -78,18 +78,18 @@ def compress_pdf(
     try:
         with open(input_path, 'rb') as f:
             reader = PdfReader(f)
+            # Do not block on "encrypted" flag; attempt to read pages regardless.
             if reader.is_encrypted:
-                raise EncryptionError.for_file(input_path.name)
+                try:
+                    reader.decrypt("")
+                    logger.info(f"{input_path.name} flagged encrypted; attempted empty password and continuing.")
+                except Exception as de:
+                    logger.warning(f"{input_path.name} flagged encrypted; decrypt attempt failed ({de}), continuing anyway.")
+
             page_count = len(reader.pages)
-    except EncryptionError:
-        raise
     except Exception as e:
-        # If we can't read it at all, it might be encrypted or corrupted
-        error_str = str(e).lower()
-        if 'encrypt' in error_str or 'password' in error_str:
-            raise EncryptionError.for_file(input_path.name) from e
-        # Let Ghostscript try - it might handle some edge cases
-        logger.warning(f"PDF pre-validation warning: {e}")
+        # Let Ghostscript try - it might handle edge cases
+        logger.warning(f"PDF pre-validation warning (will continue): {e}")
 
     working_dir = working_dir or input_path.parent
     original_size = get_file_size_mb(input_path)

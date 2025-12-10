@@ -355,9 +355,13 @@ def split_pdf(
         with open(pdf_path, 'rb') as f:
             reader = PdfReader(f)
 
-            # Check for encrypted PDFs FIRST - don't waste time on password-protected files
+            # Do not block on "encrypted" flag; attempt empty password and continue.
             if reader.is_encrypted:
-                raise EncryptionError.for_file(pdf_path.name)
+                try:
+                    reader.decrypt("")
+                    logger.info(f"{pdf_path.name} flagged encrypted; attempted empty password and continuing split.")
+                except Exception as de:
+                    logger.warning(f"{pdf_path.name} flagged encrypted; decrypt attempt failed ({de}), continuing anyway.")
 
             total_pages = len(reader.pages)
 
