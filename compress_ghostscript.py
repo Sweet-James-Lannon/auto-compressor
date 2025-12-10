@@ -1,6 +1,7 @@
 """Ghostscript PDF compression for scanned legal documents."""
 
 import logging
+import math
 import shutil
 import subprocess
 import uuid
