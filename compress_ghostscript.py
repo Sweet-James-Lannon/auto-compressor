@@ -271,9 +271,11 @@ def compress_parallel(
 
     logger.info(f"[PARALLEL] Starting parallel compression for {input_path.name} ({original_size_mb:.1f}MB)")
 
-    # Step 1: Calculate optimal number of chunks (~20MB per chunk)
-    num_chunks = max(2, min(max_workers, int(original_size_mb / 20)))
-    report_progress(5, "splitting", f"Splitting into {num_chunks} chunks for parallel compression...")
+    # Step 1: Calculate number of chunks targeting ~40MB each.
+    # Do NOT cap by max_workers; extra chunks are processed by the thread pool in batches.
+    # This keeps each Ghostscript run shorter on very large files (300MB), reducing timeouts.
+    num_chunks = max(2, min(10, math.ceil(original_size_mb / 40)))
+    report_progress(5, "splitting", f"Splitting into {num_chunks} chunks (~40MB each) for parallel compression...")
 
     # Step 2: Split by page count (fast, no Ghostscript)
     chunk_paths = split_by_pages(input_path, working_dir, num_chunks, base_name)
