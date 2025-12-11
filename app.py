@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, render_template, send_file
+from flask import Flask, jsonify, request, render_template, send_file, has_request_context
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
@@ -46,6 +46,8 @@ UPLOAD_FOLDER = Path(__file__).parent / "uploads"  # Absolute path for Azure com
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
 SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 API_TOKEN = os.environ.get('API_TOKEN')
+# Public base URL for download links (e.g., https://yourapp.azurewebsites.net)
+BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
 # Raised default to 540s to align with gunicorn timeout and avoid 499/504s on large files.
 SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "540"))
 
@@ -79,6 +81,20 @@ def require_auth(f):
 
         return f(*args, **kwargs)
     return decorated
+
+
+def build_download_url(path_str: str) -> str:
+    """
+    Build a public download URL from a local path or filename.
+
+    Keeps backward compatibility: if BASE_URL is not set, returns a relative /download path.
+    """
+    name = Path(path_str).name
+    rel = f"/download/{name}"
+    base = BASE_URL
+    if not base and has_request_context():
+        base = request.url_root.rstrip('/')
+    return f"{base}{rel}" if base else rel
 
 
 def create_error_response(error: Exception, status_code: int = 500):
@@ -470,11 +486,17 @@ def get_status(job_id: str):
                 response["error_message"] = job.result["error_message"]
         return jsonify(response)
 
-    # Completed
+    # Completed - normalize download URLs to be absolute
+    result = dict(job.result or {})
+    output_paths = result.get("output_paths") or ([result["output_path"]] if "output_path" in result else [])
+    files = [build_download_url(p) for p in output_paths] if output_paths else []
+    if files:
+        result["files"] = files
+
     return jsonify({
         "success": True,
         "status": "completed",
-        **job.result
+        **result
     })
 
 
@@ -636,10 +658,7 @@ def compress_sync():
         if not part_sizes:
             part_sizes = [Path(p).stat().st_size for p in output_paths]
 
-        files = [
-            f"/download/{Path(p).name}"
-            for p in output_paths
-        ]
+        files = [build_download_url(p) for p in output_paths]
 
         logger.info(f"[sync:{file_id}] Complete: {len(files)} file(s), {result['original_size_mb']:.1f}MB → {result['compressed_size_mb']:.1f}MB")
         logger.info(f"[sync:{file_id}] Download URLs: {files}")
