@@ -94,6 +94,11 @@ def build_download_url(path_str: str) -> str:
     base = BASE_URL
     if not base and has_request_context():
         base = request.url_root.rstrip('/')
+
+    # Normalize to HTTPS to avoid mixed-content when the page is served over TLS
+    if base and base.startswith("http://"):
+        base = "https://" + base[len("http://"):]
+
     return f"{base}{rel}" if base else rel
 
 
