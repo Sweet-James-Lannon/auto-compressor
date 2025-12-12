@@ -26,8 +26,9 @@ logger = logging.getLogger(__name__)
 # Files below this use serial, above use parallel (faster for large files)
 # Set to 30MB - serial compression can timeout on files 40MB+ due to slow Ghostscript settings
 PARALLEL_THRESHOLD_MB = 30.0
-# Default to 2 workers for stability unless overridden by env
-MAX_PARALLEL_WORKERS = int(os.environ.get("PARALLEL_MAX_WORKERS", "2"))
+# Cap workers to env or available CPU to avoid thrash on small instances
+_ENV_WORKERS = int(os.environ.get("PARALLEL_MAX_WORKERS", "4"))
+MAX_PARALLEL_WORKERS = min(_ENV_WORKERS, os.cpu_count() or 2)
 # Skip compression for very small files (already optimized)
 MIN_COMPRESSION_SIZE_MB = float(os.environ.get("MIN_COMPRESSION_SIZE_MB", "1.0"))
 

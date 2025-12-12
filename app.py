@@ -42,9 +42,12 @@ app = Flask(__name__, template_folder='dashboard')
 
 # Constants
 MAX_CONTENT_LENGTH = 314572800  # 300 MB
+HARD_SYNC_LIMIT_MB = 300.0  # Absolute ceiling for sync endpoint
 UPLOAD_FOLDER = Path(__file__).parent / "uploads"  # Absolute path for Azure compatibility
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
 SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
+# Cap SYNC_MAX_MB at the hard ceiling even if env is higher
+SYNC_MAX_MB = min(float(os.environ.get("SYNC_MAX_MB", str(HARD_SYNC_LIMIT_MB))), HARD_SYNC_LIMIT_MB)
 API_TOKEN = os.environ.get('API_TOKEN')
 # Public base URL for download links (e.g., https://yourapp.azurewebsites.net)
 BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
@@ -586,21 +589,23 @@ def compress_sync():
 
         track_file(input_path)
 
-        # Check file size - reject files over 300MB for sync endpoint
-        MAX_SYNC_SIZE_MB = 300.0
+        # Check file size - reject files over configured or hard limit for sync endpoint
         file_size_mb = input_path.stat().st_size / (1024 * 1024)
 
-        if file_size_mb > MAX_SYNC_SIZE_MB:
-            logger.warning(f"[sync:{file_id}] File too large: {file_size_mb:.1f}MB > {MAX_SYNC_SIZE_MB}MB limit")
+        if file_size_mb > SYNC_MAX_MB:
+            logger.warning(
+                f"[sync:{file_id}] File too large for sync: {file_size_mb:.1f}MB > {SYNC_MAX_MB:.1f}MB limit "
+                f"(hard cap {HARD_SYNC_LIMIT_MB:.0f}MB, Azure HTTP timeout is ~230s)"
+            )
             input_path.unlink(missing_ok=True)
             with file_lock:
                 tracked_files.pop(str(input_path), None)
             return jsonify({
                 "success": False,
-                "error": f"File too large ({file_size_mb:.1f}MB). Maximum for sync endpoint is {MAX_SYNC_SIZE_MB:.0f}MB.",
+                "error": f"File too large for sync ({file_size_mb:.1f}MB). Max allowed: {SYNC_MAX_MB:.0f}MB.",
                 "error_type": "FileTooLarge",
-                "error_message": f"File too large ({file_size_mb:.1f}MB). Maximum for sync endpoint is {MAX_SYNC_SIZE_MB:.0f}MB.",
-                "recommendation": "Reduce file size below limit and retry"
+                "error_message": f"File exceeds sync processing limit. Azure HTTP timeout is ~230s; split the file and retry.",
+                "recommendation": "Pre-split the file into smaller parts before upload or use the async endpoint"
             }), 413
 
         # Run compression with a timeout to avoid gateway kills
