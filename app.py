@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import urlparse
 
+import requests
+
 from flask import Flask, jsonify, request, render_template, send_file, has_request_context
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
@@ -103,6 +105,40 @@ def build_download_url(path_str: str) -> str:
         base = "https://" + base[len("http://"):]
 
     return f"{base}{rel}" if base else rel
+
+
+def send_salesforce_callback(callback_url: str, payload: dict, job_id: str, max_retries: int = 3, timeout: int = 5) -> bool:
+    """Send callback to Salesforce with basic retry/backoff. Runs in a worker thread."""
+    headers = {"Content-Type": "application/json"}
+
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(callback_url, json=payload, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            logger.info(f"[{job_id}] Callback succeeded: {resp.status_code}")
+            return True
+        except requests.exceptions.Timeout:
+            logger.warning(f"[{job_id}] Callback timeout (attempt {attempt + 1}/{max_retries})")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"[{job_id}] Callback failed (attempt {attempt + 1}/{max_retries}): {e}")
+
+        if attempt < max_retries - 1:
+            backoff = 2 ** attempt
+            time.sleep(backoff)
+
+    logger.error(f"[{job_id}] Callback failed after {max_retries} attempts")
+    return False
+
+
+def spawn_callback(callback_url: str, payload: dict, job_id: str) -> None:
+    """Spawn a daemon thread to send the Salesforce callback without blocking workers."""
+    thread = threading.Thread(
+        target=send_salesforce_callback,
+        args=(callback_url, payload, job_id),
+        daemon=True,
+        name=f"callback-{job_id}"
+    )
+    thread.start()
 
 
 def create_error_response(error: Exception, status_code: int = 500):
@@ -300,6 +336,10 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             warnings
         )
 
+        matter_id = task_data.get("matter_id")
+        callback_url = task_data.get("callback_url")
+        base_url_hint = (task_data.get("base_url") or BASE_URL or "").rstrip("/")
+
         job_queue.update_job(job_id, "completed", result={
             "was_split": result.get('was_split', False),
             "total_parts": result.get('total_parts', 1),
@@ -313,10 +353,36 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             "part_sizes": result.get('part_sizes'),
             "quality_warnings": warnings,
             "processing_time": timings,
-            "performance_notes": perf_notes
+            "performance_notes": perf_notes,
+            "matter_id": matter_id,
         })
 
         logger.info(f"[{job_id}] Job completed: {len(download_links)} file(s)")
+
+        # Send callback to Salesforce if requested
+        if matter_id and callback_url:
+            def to_absolute(link: str) -> str:
+                if link.startswith("http://") or link.startswith("https://"):
+                    return link
+                base = base_url_hint
+                if not base and has_request_context():
+                    base = request.url_root.rstrip('/')
+                if base and base.startswith("http://"):
+                    base = "https://" + base[len("http://"):]
+                if base:
+                    if link.startswith("/"):
+                        return f"{base}{link}"
+                    return f"{base}/{link.lstrip('/')}"
+                return link  # Fallback to relative if no base available
+
+            absolute_links = [to_absolute(l) for l in download_links]
+            compressed_links = absolute_links[0] if len(absolute_links) == 1 else absolute_links
+
+            payload = {
+                "matterId": matter_id,
+                "compressedLinks": compressed_links
+            }
+            spawn_callback(callback_url, payload, job_id)
 
     except PDFCompressionError as e:
         # Our custom exceptions - log and return structured error
@@ -325,6 +391,16 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             "error_type": e.error_type,
             "error_message": e.message,
         })
+        # Send error callback if requested
+        matter_id = task_data.get("matter_id")
+        callback_url = task_data.get("callback_url")
+        if matter_id and callback_url:
+            payload = {
+                "matterId": matter_id,
+                "compressedLinks": [],
+                "error": e.message or str(e)
+            }
+            spawn_callback(callback_url, payload, job_id)
     except Exception as e:
         # Unexpected errors - log full stack trace
         logger.exception(f"[{job_id}] Job failed with unexpected error: {e}")
@@ -332,6 +408,15 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             "error_type": "UnknownError",
             "error_message": str(e),
         })
+        matter_id = task_data.get("matter_id")
+        callback_url = task_data.get("callback_url")
+        if matter_id and callback_url:
+            payload = {
+                "matterId": matter_id,
+                "compressedLinks": [],
+                "error": str(e)
+            }
+            spawn_callback(callback_url, payload, job_id)
 
 
 # Configure and start job queue worker
@@ -531,6 +616,7 @@ def compress_sync():
             # Salesforce/API flow - download PDF from URL
             data = request.get_json()
             file_url = data.get('file_download_link') or data.get('file_url')
+            matter_id = data.get('matterId')  # Salesforce sends camelCase
             if not file_url:
                 return jsonify({
                     "success": False,
@@ -538,6 +624,34 @@ def compress_sync():
                     "error_type": "MissingParameter",
                     "error_message": "Missing file_download_link"
                 }), 400
+
+            # If matterId is provided, switch to async callback flow to avoid Salesforce timeout
+            if matter_id:
+                callback_url = os.environ.get("SALESFORCE_CALLBACK_URL")
+                if not callback_url:
+                    return jsonify({
+                        "success": False,
+                        "error": "SALESFORCE_CALLBACK_URL not configured"
+                    }), 500
+
+                base_url_hint = BASE_URL or request.url_root.rstrip('/')
+                job_id = job_queue.create_job()
+                task_data = {
+                    "download_url": file_url,
+                    "matter_id": matter_id,
+                    "callback_url": callback_url,
+                    "base_url": base_url_hint,
+                }
+                job_queue.enqueue(job_id, task_data)
+
+                logger.info(f"[{job_id}] Async callback flow started for matterId={matter_id}")
+                return jsonify({
+                    "success": True,
+                    "message": "Processing started",
+                    "matterId": matter_id,
+                    "job_id": job_id
+                }), 202
+
             parsed = urlparse(file_url)
             host_hint = parsed.hostname or "unknown-host"
             path_hint = (parsed.path or "")[:50]

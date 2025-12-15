@@ -652,6 +652,23 @@
             <p>This UI uses the synchronous <code>/compress-sync</code> flow (no polling). Keep tests under 300MB per the sync limit.</p>
         </div>
 
+        <div class="info-section" style="background:#f8fafc; border-color:#0ea5e9;">
+            <h4>Salesforce Async Callback Smoke Test</h4>
+            <p>Use this to trigger the new async flow (returns 202 immediately, then posts to Salesforce callback).</p>
+            <div style="margin-top:10px;">
+                <label style="display:block; font-size:0.65em; margin-bottom:6px;">Download URL</label>
+                <input id="async-url" type="text" style="width:100%; padding:10px; border:3px solid #000;" placeholder="https://...pdf">
+            </div>
+            <div style="margin-top:10px;">
+                <label style="display:block; font-size:0.65em; margin-bottom:6px;">matterId</label>
+                <input id="async-matter" type="text" style="width:100%; padding:10px; border:3px solid #000;" placeholder="a0L...">
+            </div>
+            <div style="margin-top:12px; text-align:center;">
+                <button class="btn" id="async-btn" style="padding:10px 20px; font-size:0.7em;">Send Async Test</button>
+            </div>
+            <div id="async-status" style="margin-top:10px; font-size:0.65em; color:#0c4a6e;"></div>
+        </div>
+
         <div class="auth-section">
             <label for="api-token">API Token</label>
             <input type="password" id="api-token" placeholder="Enter your API token">
@@ -802,6 +819,10 @@
         const progressText = document.getElementById('progress-text');
         const resultsDiv = document.getElementById('results');
         const healthIndicator = document.getElementById('health-indicator');
+        const asyncBtn = document.getElementById('async-btn');
+        const asyncUrlInput = document.getElementById('async-url');
+        const asyncMatterInput = document.getElementById('async-matter');
+        const asyncStatus = document.getElementById('async-status');
 
         // Debug toggle functionality
         document.getElementById('debug-header').addEventListener('click', () => {
@@ -933,6 +954,48 @@
 
         // Compress button
         compressBtn.addEventListener('click', compressPDF);
+
+        // Async Salesforce-style test (returns 202 and triggers callback)
+        asyncBtn.addEventListener('click', async () => {
+            const url = asyncUrlInput.value.trim();
+            const matter = asyncMatterInput.value.trim();
+            asyncStatus.style.color = '#0c4a6e';
+            asyncStatus.textContent = '';
+
+            if (!url || !matter) {
+                asyncStatus.style.color = '#b91c1c';
+                asyncStatus.textContent = 'Provide both download URL and matterId.';
+                return;
+            }
+
+            const headers = { 'Content-Type': 'application/json' };
+            const token = apiTokenInput.value.trim();
+            if (token) headers['Authorization'] = `Bearer ${token}`;
+
+            asyncStatus.textContent = 'Sending async request...';
+
+            try {
+                const resp = await fetch('/compress-sync', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({
+                        file_download_link: url,
+                        matterId: matter
+                    })
+                });
+                const { data, error } = await safeParseJson(resp);
+                if (error) throw new Error(error);
+                if (!resp.ok || !data.success) {
+                    const msg = data?.error || `HTTP ${resp.status}`;
+                    throw new Error(msg);
+                }
+                asyncStatus.style.color = '#065f46';
+                asyncStatus.textContent = `Accepted (job ${data.job_id || 'n/a'}). Callback will post to Salesforce.`;
+            } catch (err) {
+                asyncStatus.style.color = '#b91c1c';
+                asyncStatus.textContent = `Error: ${err.message}`;
+            }
+        });
 
         async function compressPDF() {
             if (!selectedFile) return;

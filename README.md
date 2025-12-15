@@ -24,51 +24,46 @@ Response:
 
 Errors return `error_type`/`error_message` (e.g., `DownloadError`, `FileTooLarge`, `Timeout`, `InvalidPDF`).
 
-## Configuration
+## How it works (backend flow)
+
+- Two modes:
+  - `/compress-sync` (blocking) for dashboard/manual tests or legacy callers.
+  - `/compress-sync` with `matterId` (new Salesforce flow): returns `202` fast, does the work in background, then POSTs results to `SALESFORCE_CALLBACK_URL`.
+- Compression pipeline:
+  - Downloads the PDF (or accepts upload/base64), validates header, tracks files for cleanup.
+  - Uses Ghostscript; small files compress serially, big files can use parallel chunks.
+  - If output is still large, auto-splits into ≤ `SPLIT_THRESHOLD_MB` parts and logs part sizes.
+- Outputs are served from `/download/{file}`; `BASE_URL` makes links absolute and HTTPS for callbacks.
+- Cleanup daemon deletes old files after `FILE_RETENTION_SECONDS`.
+
+## Why this is better than iLovePDF (for our use case)
+
+- Self-hosted and API-driven: no external throttling or account limits; predictable SLAs.
+- Tuned for Salesforce: async callback avoids Apex timeouts; includes `matterId` correlation and part sizes for verification.
+- Auto-splitting built in: guarantees parts stay under our configured threshold without manual steps.
+- Observability: structured errors, progress updates (async), and detailed logging for download/compression/splitting.
+- Security/control: bearer auth option, no third-party data sharing, short-lived on-disk storage with cleanup.
+
+## Quick testing (dashboard)
+
+- Navigate to `/` to open the dashboard.
+- Upload a PDF (or supply a URL) and submit; the dashboard uses `/compress-sync` (blocking) and returns download links directly.
+- For Salesforce-style async: send JSON to `/compress-sync` with `file_download_link` and `matterId`; you will get `202` + `job_id`, and the service will callback with absolute download URLs.
+
+## Configuration (essentials)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `API_TOKEN` | - | Required for authentication |
-| `SPLIT_THRESHOLD_MB` | 25 | Max size per output file |
-| `FILE_RETENTION_SECONDS` | 86400 | Auto-delete after 24h |
-| `PARALLEL_MAX_WORKERS` | 2 | Ghostscript workers per request (parallel path) |
-| `SYNC_TIMEOUT_SECONDS` | 540 | Timeout for `/compress-sync` before 504 |
-| `DISABLE_ASYNC_WORKERS` | unset | Set to `1` to skip async worker startup |
+| `API_TOKEN` | - | Bearer token for auth (set to lock down endpoints) |
+| `BASE_URL` | empty | Public HTTPS host used to build absolute download links |
+| `SALESFORCE_CALLBACK_URL` | empty | Where to POST async results when `matterId` is present |
+| `SPLIT_THRESHOLD_MB` | 25 | Max size per output file after splitting |
+| `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
+| `SYNC_TIMEOUT_SECONDS` | 540 | Timeout for `/compress-sync` work before 504 |
+| `DISABLE_ASYNC_WORKERS` | unset | Set to `1` to disable background workers |
 
-## Deployment
+## Deployment notes
 
-Azure App Service startup command:
-```bash
-apt-get update && apt-get install -y ghostscript && gunicorn --bind=0.0.0.0:8000 --timeout=600 --workers=1 --threads=16 app:app
-```
-
-Instance count must be 1. Multiple instances cause download failures due to non-shared local storage.
-
-## Architecture
-
-- Files < ~30MB: Serial Ghostscript compression
-- Files > ~30MB: Parallel chunk compression (workers configurable via `PARALLEL_MAX_WORKERS`)
-- If compression increases size: return original and split if above threshold
-- Final split uses `ceil(size/threshold)` so outputs stay under `SPLIT_THRESHOLD_MB`
-
-## Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | /compress-sync | Synchronous compression |
-| POST | /compress | Async compression (returns job_id) |
-| GET | /status/{job_id} | Poll async job status |
-| GET | /download/{filename} | Download compressed file |
-| GET | /health | Service health check |
-
-## Local Development
-
-```bash
-brew install ghostscript
-pip install -r requirements.txt
-python app.py
-```
-
-## License
-
-MIT
+- Azure App Service: install Ghostscript, run gunicorn (see `startup.sh`).
+- Use a single instance (local file storage is not shared).
+- Ensure `BASE_URL` and `SALESFORCE_CALLBACK_URL` are set; restart after config changes.
