@@ -18,6 +18,7 @@ from utils import download_pdf  # noqa: F401 - re-exported for backwards compati
 
 # Constants
 JOB_TTL_SECONDS: int = 3600  # Jobs expire after 1 hour
+MAX_QUEUE_SIZE: int = int(os.environ.get("MAX_QUEUE_SIZE", "50"))  # Prevent unbounded growth
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +109,12 @@ def enqueue(job_id: str, task_data: Dict[str, Any]) -> None:
         job_id: The job identifier.
         task_data: Data needed to process the job (pdf_bytes, download_url, etc).
     """
+    if MAX_QUEUE_SIZE and _work_queue.qsize() >= MAX_QUEUE_SIZE:
+        logger.warning(f"[{job_id}] Queue full ({MAX_QUEUE_SIZE}), rejecting job")
+        raise queue.Full("Job queue is full")
+
     _work_queue.put((job_id, task_data))
-    logger.info(f"[{job_id}] Job enqueued")
+    logger.info(f"[{job_id}] Job enqueued (size={_work_queue.qsize()})")
 
 
 def set_processor(processor_func: Callable[[str, Dict[str, Any]], None]) -> None:

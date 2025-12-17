@@ -529,7 +529,15 @@ def compress():
 
     # Create job and enqueue for processing
     job_id = job_queue.create_job()
-    job_queue.enqueue(job_id, task_data)
+    try:
+        job_queue.enqueue(job_id, task_data)
+    except Exception as e:
+        logger.warning(f"[{job_id}] Queue full or enqueue failed: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Server is busy. Please retry shortly.",
+            "error_type": "ServerBusy"
+        }), 503
 
     return jsonify({
         "success": True,
@@ -642,7 +650,15 @@ def compress_sync():
                     "callback_url": callback_url,
                     "base_url": base_url_hint,
                 }
-                job_queue.enqueue(job_id, task_data)
+                try:
+                    job_queue.enqueue(job_id, task_data)
+                except Exception as e:
+                    logger.warning(f"[{job_id}] Queue full or enqueue failed: {e}")
+                    return jsonify({
+                        "success": False,
+                        "error": "Server is busy. Please retry shortly.",
+                        "error_type": "ServerBusy"
+                    }), 503
 
                 logger.info(f"[{job_id}] Async callback flow started for matterId={matter_id}")
                 return jsonify({
