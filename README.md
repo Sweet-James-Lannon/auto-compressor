@@ -36,6 +36,14 @@ Errors return `error_type`/`error_message` (e.g., `DownloadError`, `FileTooLarge
 - Outputs are served from `/download/{file}`; `BASE_URL` makes links absolute and HTTPS for callbacks.
 - Cleanup daemon deletes old files after `FILE_RETENTION_SECONDS`.
 
+## Salesforce integration
+
+- Entry point: Salesforce calls `POST /compress-sync` with `file_download_link` (presigned URL) and, for async, a `matterId`.
+- Async behavior: when `matterId` is present, we enqueue the job and immediately return `202 + job_id`. A worker downloads the PDF, compresses/splits, then posts results to the prod callback URL in `SALESFORCE_CALLBACK_URL`. Download links in the callback are absolute, built with `BASE_URL`.
+- Error callbacks: if download or processing fails, we still send a callback with `compressedLinks: []` and an `error` message. Download failures are usually expired/invalid presigned URLs (404/401/403).
+- Auth: if `API_TOKEN` is set, Salesforce must send `Authorization: Bearer <token>`.
+- Large files: use the async path (`matterId`) to avoid sync timeouts on big uploads.
+
 ## Why this is better than iLovePDF (for our use case)
 
 - Self-hosted and API-driven: no external throttling or account limits; predictable SLAs.
