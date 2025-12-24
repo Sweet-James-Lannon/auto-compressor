@@ -77,6 +77,8 @@ API_TOKEN = os.environ.get('API_TOKEN')
 BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
 # Raised default to 540s to align with gunicorn timeout and avoid 499/504s on large files.
 SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "540"))
+# Auto-switch large sync requests to async to avoid HTTP timeouts.
+SYNC_AUTO_ASYNC_MB = float(os.environ.get("SYNC_AUTO_ASYNC_MB", "120"))
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -321,22 +323,28 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         })
 
     try:
-        input_path = UPLOAD_FOLDER / f"{job_id}_input.pdf"
+        input_path: Path
 
         progress_callback(5, "uploading", "Receiving file...")
 
-        # Get PDF bytes - either from task_data or download from URL
-        if 'pdf_bytes' in task_data:
-            pdf_bytes = task_data['pdf_bytes']
-            input_path.write_bytes(pdf_bytes)
-        elif 'download_url' in task_data:
-            job_queue.download_pdf(
-                task_data['download_url'],
-                input_path,
-                max_download_size_bytes=int(ASYNC_MAX_MB * 1024 * 1024),
-            )
+        # Get PDF bytes - either from task_data, a pre-downloaded file, or download from URL
+        if 'input_path' in task_data:
+            input_path = Path(task_data['input_path'])
+            if not input_path.exists():
+                raise FileNotFoundError(f"Input file not found: {input_path}")
         else:
-            raise ValueError("No PDF data provided")
+            input_path = UPLOAD_FOLDER / f"{job_id}_input.pdf"
+            if 'pdf_bytes' in task_data:
+                pdf_bytes = task_data['pdf_bytes']
+                input_path.write_bytes(pdf_bytes)
+            elif 'download_url' in task_data:
+                job_queue.download_pdf(
+                    task_data['download_url'],
+                    input_path,
+                    max_download_size_bytes=int(ASYNC_MAX_MB * 1024 * 1024),
+                )
+            else:
+                raise ValueError("No PDF data provided")
 
         track_file(input_path)
         download_time = round(time.time() - start_time, 2)
@@ -660,6 +668,7 @@ def compress_sync():
     2. Form-data: file field with PDF upload - for dashboard testing
 
     Response: {"success": true, "files": ["/download/part1.pdf", ...]}
+    Large files may be auto-queued and return 202 + job_id for polling.
     """
     # Generate unique ID for this request (supports concurrent users)
     file_id = str(uuid.uuid4()).replace('-', '')[:16]
@@ -788,6 +797,37 @@ def compress_sync():
                 "error_message": f"File exceeds sync processing limit. Azure HTTP timeout is ~230s; split the file and retry.",
                 "recommendation": "Pre-split the file into smaller parts before upload or use the async endpoint"
             }), 413
+
+        auto_async_mb = min(SYNC_AUTO_ASYNC_MB, SYNC_MAX_MB)
+        if file_size_mb > auto_async_mb:
+            job_id = job_queue.create_job()
+            task_data = {
+                "input_path": str(input_path),
+            }
+            try:
+                job_queue.enqueue(job_id, task_data)
+            except Exception as e:
+                logger.warning(f"[{job_id}] Queue full or enqueue failed: {e}")
+                input_path.unlink(missing_ok=True)
+                with file_lock:
+                    tracked_files.pop(str(input_path), None)
+                return jsonify({
+                    "success": False,
+                    "error": "Server is busy. Please retry shortly.",
+                    "error_type": "ServerBusy"
+                }), 503
+
+            logger.info(
+                f"[sync:{file_id}] Auto-async for {file_size_mb:.1f}MB (> {auto_async_mb:.1f}MB). "
+                f"Job queued as {job_id}."
+            )
+            return jsonify({
+                "success": True,
+                "status": "processing",
+                "job_id": job_id,
+                "status_url": f"/status/{job_id}",
+                "message": "Large file queued for async processing. Poll status_url for results."
+            }), 202
 
         # Run compression with a timeout to avoid gateway kills
         def run_compress():

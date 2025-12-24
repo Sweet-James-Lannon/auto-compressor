@@ -1040,6 +1040,31 @@
                     throw new Error(combined);
                 }
 
+                // Auto-async path: poll until completion if server queued the job.
+                if (response.status === 202 || result.status === 'processing' || result.job_id) {
+                    const jobId = result.job_id;
+                    if (!jobId) {
+                        throw new Error('Async job started but no job_id returned');
+                    }
+
+                    progressBar.style.width = '25%';
+                    progressText.textContent = 'Queued for processing...';
+                    showStatus(`Queued job ${jobId}. Processing...`, 'info');
+
+                    const finalResult = await pollForCompletion(jobId, headers);
+
+                    if (finalResult.original_mb && finalResult.compressed_mb && !finalResult.reduction_percent) {
+                        finalResult.reduction_percent = ((finalResult.original_mb - finalResult.compressed_mb) / finalResult.original_mb) * 100;
+                    }
+
+                    progressBar.style.width = '100%';
+                    progressText.textContent = 'Done!';
+
+                    displayResults(finalResult);
+                    showStatus('Compression successful!', 'success');
+                    return;
+                }
+
                 // Calculate reduction percent for display (sync response doesn't include it)
                 if (result.original_mb && result.compressed_mb && !result.reduction_percent) {
                     result.reduction_percent = ((result.original_mb - result.compressed_mb) / result.original_mb) * 100;

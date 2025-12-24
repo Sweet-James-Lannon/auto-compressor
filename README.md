@@ -77,6 +77,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
 | `UPLOAD_FOLDER` | empty | Absolute path for storing PDFs; on Azure use a persistent path under `/home` |
 | `SYNC_TIMEOUT_SECONDS` | 540 | Timeout for `/compress-sync` work before 504 |
+| `SYNC_AUTO_ASYNC_MB` | 120 | Auto-queue sync requests above this size and return `202` + job_id |
 | `ASYNC_MAX_MB` | 450 | Max PDF size allowed for async jobs (downloaded via signed URL) |
 | `DISABLE_ASYNC_WORKERS` | unset | Set to `1` to disable background workers |
 
