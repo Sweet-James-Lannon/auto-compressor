@@ -129,7 +129,7 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, timeout=900)
         if result.returncode != 0:
             logger.warning(f"Ghostscript merge failed (code {result.returncode}), falling back to PyPDF2")
             # Fallback to PyPDF2
@@ -393,6 +393,62 @@ def split_pdf(
             if total_pages == 0:
                 raise StructureError.for_file(pdf_path.name, "PDF has no pages")
 
+            def measure_pages_raw_and_optimized(start_page: int, end_page: int) -> tuple[float, float]:
+                """Measure raw and optimized sizes for a page range.
+
+                Uses Ghostscript optimization once to estimate how much PyPDF2
+                output shrinks after de-duplication. This helps prevent
+                over-splitting when PyPDF2 inflates sizes.
+                """
+                unique_id = str(uuid.uuid4())[:8]
+                writer = PdfWriter()
+                for idx in range(start_page, end_page):
+                    writer.add_page(reader.pages[idx])
+                temp_path = output_dir / f"{base_name}_{unique_id}_sample_temp.pdf"
+                with open(temp_path, 'wb') as f:
+                    writer.write(f)
+
+                raw_size = get_file_size_mb(temp_path)
+                optimized_path = output_dir / f"{base_name}_{unique_id}_sample_opt.pdf"
+                success, _ = optimize_split_part(temp_path, optimized_path)
+                if success and optimized_path.exists():
+                    opt_size = get_file_size_mb(optimized_path)
+                else:
+                    opt_size = raw_size
+
+                optimized_path.unlink(missing_ok=True)
+                temp_path.unlink(missing_ok=True)
+                return raw_size, opt_size
+
+            # Estimate how much optimization shrinks PyPDF2 output to avoid over-splitting.
+            size_ratio = 1.0
+            ratio_samples: List[float] = []
+            if total_pages >= 2 and file_size_mb > threshold_mb:
+                sample_pages = min(20, total_pages)
+                sample_starts = [0]
+                if total_pages > sample_pages * 2:
+                    sample_starts.append(total_pages // 2)
+                if total_pages > sample_pages * 3:
+                    sample_starts.append(max(total_pages - sample_pages, 0))
+
+                for start in sample_starts:
+                    raw_size, opt_size = measure_pages_raw_and_optimized(
+                        start,
+                        min(start + sample_pages, total_pages),
+                    )
+                    if raw_size > 0 and opt_size > 0:
+                        ratio_samples.append(opt_size / raw_size)
+
+                if ratio_samples:
+                    worst_ratio = max(ratio_samples)
+                    if worst_ratio < 0.98:
+                        # Add 10% headroom so we don't overshoot the threshold.
+                        size_ratio = min(1.0, worst_ratio * 1.1)
+                        logger.info(
+                            f"[split_pdf] Estimated optimized size ratio: {size_ratio:.2f} "
+                            f"(from {len(ratio_samples)} sample range(s))"
+                        )
+
             max_target = threshold_mb - SAFETY_BUFFER_MB
             # Use a greedy "fill to max" strategy: pack as many pages as possible into each part
             # while staying under a conservative per-part target (threshold - buffer).
@@ -433,6 +489,9 @@ def split_pdf(
                     size = get_file_size_mb(temp_path)
 
                 temp_path.unlink(missing_ok=True)
+                if not optimize and size_ratio < 0.98:
+                    # Adjust raw PyPDF2 size using estimated optimization ratio.
+                    size *= size_ratio
                 return size
 
             # Greedy split: repeatedly find the largest end page that keeps this part under target_size.
