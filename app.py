@@ -52,7 +52,20 @@ def resolve_upload_folder() -> Path:
     """Resolve the upload folder, preferring persistent storage on Azure."""
     env_override = os.environ.get("UPLOAD_FOLDER")
     if env_override:
-        return Path(env_override)
+        override_path = Path(env_override)
+        # Ignore unsafe Azure overrides that point at ephemeral /root.
+        if (os.environ.get("WEBSITE_INSTANCE_ID") or os.environ.get("WEBSITE_SITE_NAME")) and str(override_path).startswith("/root"):
+            logger.warning("UPLOAD_FOLDER=%s is not persistent on Azure; falling back to /home", override_path)
+        else:
+            return override_path
+
+    # Prefer Azure's persistent /home, even if HOME is misconfigured.
+    for base in (Path("/home/site/wwwroot"), Path("/home")):
+        try:
+            if base.exists():
+                return base / "uploads"
+        except OSError:
+            continue
 
     # Azure App Service: /home is persistent and shared across instances.
     if os.environ.get("WEBSITE_INSTANCE_ID") or os.environ.get("WEBSITE_SITE_NAME"):
@@ -67,6 +80,8 @@ def resolve_upload_folder() -> Path:
 
 UPLOAD_FOLDER = resolve_upload_folder()
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
+MIN_FILE_RETENTION_SECONDS = int(os.environ.get('MIN_FILE_RETENTION_SECONDS', '3600'))  # 1 hour minimum
+EFFECTIVE_FILE_RETENTION_SECONDS = max(FILE_RETENTION_SECONDS, MIN_FILE_RETENTION_SECONDS)
 SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 # Cap SYNC_MAX_MB at the hard ceiling even if env is higher
 SYNC_MAX_MB = min(float(os.environ.get("SYNC_MAX_MB", str(HARD_SYNC_LIMIT_MB))), HARD_SYNC_LIMIT_MB)
@@ -82,7 +97,12 @@ SYNC_AUTO_ASYNC_MB = float(os.environ.get("SYNC_AUTO_ASYNC_MB", "120"))
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
-logger.info(f"Upload folder resolved to: {UPLOAD_FOLDER.resolve()}")
+logger.info(
+    "Upload folder resolved to: %s (retention=%ss, min=%ss)",
+    UPLOAD_FOLDER.resolve(),
+    FILE_RETENTION_SECONDS,
+    MIN_FILE_RETENTION_SECONDS,
+)
 
 
 def require_auth(f):
@@ -268,7 +288,7 @@ def cleanup_daemon():
     """Background cleanup - removes old files."""
     while True:
         time.sleep(60)
-        cutoff = time.time() - FILE_RETENTION_SECONDS
+        cutoff = time.time() - EFFECTIVE_FILE_RETENTION_SECONDS
         with file_lock:
             tracked_snapshot = dict(tracked_files)
         expired = {p for p, t in tracked_snapshot.items() if t < cutoff}
@@ -365,17 +385,33 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
 
         compress_time = round(time.time() - compress_start, 2)
 
+        output_paths = [Path(p) for p in result.get("output_paths", [])]
+        if not output_paths and result.get("output_path"):
+            output_paths = [Path(result["output_path"])]
+
+        expected_parts = result.get("total_parts") or len(output_paths) or 1
+        if expected_parts > len(output_paths):
+            recovered = sorted(UPLOAD_FOLDER.glob(f"{input_path.stem}_part*.pdf"))
+            if len(recovered) >= expected_parts:
+                output_paths = recovered[:expected_parts]
+                logger.warning(f"[{job_id}] Recovered {len(output_paths)} split parts from disk")
+            else:
+                logger.warning(
+                    f"[{job_id}] Expected {expected_parts} parts but only found {len(output_paths)} output paths"
+                )
+
+        if not output_paths:
+            raise SplitError("Compression produced no output files")
+
         # Track all output files
-        for path_str in result.get('output_paths', [result['output_path']]):
-            track_file(Path(path_str))
+        for path in output_paths:
+            track_file(path)
 
         progress_callback(98, "finalizing", "Preparing download links...")
 
         # Build download links
-        download_links = [
-            f"/download/{Path(p).name}"
-            for p in result.get('output_paths', [result['output_path']])
-        ]
+        download_links = [f"/download/{p.name}" for p in output_paths]
+        files = [build_download_url(link) for link in download_links]
 
         # Build timing info
         timings = {
@@ -399,6 +435,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             "was_split": result.get('was_split', False),
             "total_parts": result.get('total_parts', 1),
             "download_links": download_links,
+            "files": files,
             "original_mb": result['original_size_mb'],
             "compressed_mb": result['compressed_size_mb'],
             "reduction_percent": result['reduction_percent'],
@@ -431,11 +468,14 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
                 return link  # Fallback to relative if no base available
 
             absolute_links = [to_absolute(l) for l in download_links]
-            compressed_links = absolute_links[0] if len(absolute_links) == 1 else absolute_links
-
             payload = {
                 "matterId": matter_id,
-                "compressedLinks": compressed_links
+                "compressedLinks": absolute_links,
+                "compressedLink": absolute_links[0] if absolute_links else None,
+                "downloadLinks": absolute_links,
+                "totalParts": len(absolute_links),
+                "wasSplit": len(absolute_links) > 1,
+                "partSizes": result.get("part_sizes"),
             }
             spawn_callback(callback_url, payload, job_id)
 
@@ -644,10 +684,27 @@ def get_status(job_id: str):
 
     # Completed - normalize download URLs to be absolute
     result = dict(job.result or {})
-    output_paths = result.get("output_paths") or ([result["output_path"]] if "output_path" in result else [])
-    files = [build_download_url(p) for p in output_paths] if output_paths else []
-    if files:
+    download_links = result.get("download_links")
+    if isinstance(download_links, str):
+        download_links = [download_links]
+        result["download_links"] = download_links
+
+    files = result.get("files")
+    if isinstance(files, str):
+        files = [files]
         result["files"] = files
+
+    output_paths = result.get("output_paths") or ([result["output_path"]] if "output_path" in result else [])
+
+    if not files:
+        if output_paths:
+            files = [build_download_url(p) for p in output_paths]
+        elif download_links:
+            files = [build_download_url(link) for link in download_links]
+        if files:
+            result["files"] = files
+    if not download_links and files:
+        result["download_links"] = files
 
     return jsonify({
         "success": True,
@@ -896,6 +953,7 @@ def compress_sync():
         return jsonify({
             "success": True,
             "files": files,
+            "download_links": files,
             "original_mb": result['original_size_mb'],
             "compressed_mb": result['compressed_size_mb'],
             "was_split": result.get('was_split', False),

@@ -75,6 +75,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 | `SALESFORCE_CALLBACK_URL` | empty | Where to POST async results when `matterId` is present |
 | `SPLIT_THRESHOLD_MB` | 25 | Max size per output file after splitting |
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
+| `MIN_FILE_RETENTION_SECONDS` | 3600 | Minimum retention enforced even if `FILE_RETENTION_SECONDS` is lower |
 | `UPLOAD_FOLDER` | empty | Absolute path for storing PDFs; on Azure use a persistent path under `/home` |
 | `SYNC_TIMEOUT_SECONDS` | 540 | Timeout for `/compress-sync` work before 504 |
 | `SYNC_AUTO_ASYNC_MB` | 120 | Auto-queue sync requests above this size and return `202` + job_id |
