@@ -15,7 +15,12 @@ from typing import Callable, List, Optional
 from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 from PyPDF2.errors import PdfReadError
 
-from compress_ghostscript import optimize_split_part, compress_pdf_with_ghostscript, get_ghostscript_command
+from compress_ghostscript import (
+    optimize_split_part,
+    compress_pdf_with_ghostscript,
+    compress_ultra_aggressive,
+    get_ghostscript_command,
+)
 from exceptions import EncryptionError, StructureError, SplitError
 from utils import get_file_size_mb
 
@@ -239,16 +244,27 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
         success, opt_message = optimize_split_part(temp_part_path, part_path)
 
         if success and part_path.exists():
-            temp_part_path.unlink(missing_ok=True)
             part_size = get_file_size_mb(part_path)
-            reduction_pct = ((raw_size - part_size) / raw_size) * 100 if raw_size > 0 else 0
-            reduction_mb = raw_size - part_size
 
-            logger.info(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZED:")
-            logger.info(f"[split_by_size]   Pages: {start+1}-{end}")
-            logger.info(f"[split_by_size]   Before: {raw_size:.2f}MB (raw PyPDF2)")
-            logger.info(f"[split_by_size]   After:  {part_size:.2f}MB (Ghostscript optimized)")
-            logger.info(f"[split_by_size]   Saved:  {reduction_pct:.1f}% (-{reduction_mb:.2f}MB)")
+            # If optimization made it bigger, keep the raw part (email size limit matters most).
+            if part_size > raw_size:
+                logger.warning(
+                    f"[split_by_size] Optimization increased size for part {i+1}: "
+                    f"{raw_size:.2f}MB -> {part_size:.2f}MB. Keeping raw output."
+                )
+                part_path.unlink(missing_ok=True)
+                temp_part_path.rename(part_path)
+                part_size = raw_size
+            else:
+                temp_part_path.unlink(missing_ok=True)
+                reduction_pct = ((raw_size - part_size) / raw_size) * 100 if raw_size > 0 else 0
+                reduction_mb = raw_size - part_size
+
+                logger.info(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZED:")
+                logger.info(f"[split_by_size]   Pages: {start+1}-{end}")
+                logger.info(f"[split_by_size]   Before: {raw_size:.2f}MB (raw PyPDF2)")
+                logger.info(f"[split_by_size]   After:  {part_size:.2f}MB (Ghostscript optimized)")
+                logger.info(f"[split_by_size]   Saved:  {reduction_pct:.1f}% (-{reduction_mb:.2f}MB)")
         else:
             # Optimization failed - use raw PyPDF2 output (may be bloated!)
             logger.warning(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZATION FAILED:")
@@ -257,6 +273,7 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
             logger.warning(f"[split_by_size]   Using raw PyPDF2 output: {raw_size:.2f}MB")
             logger.warning(f"[split_by_size]   ⚠️  This part may contain duplicated resources!")
 
+            part_path.unlink(missing_ok=True)
             temp_part_path.rename(part_path)
             part_size = raw_size
 
@@ -264,6 +281,16 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
 
         status = "OK" if part_size <= threshold_mb else "OVER"
         logger.info(f"[split_by_size] Part {i+1} final: {part_size:.1f}MB [{status}]")
+
+        # Early exit: equal-page splitting won't work for this PDF. Switch immediately to the
+        # size-based splitter to avoid wasting time generating the remaining parts.
+        if part_size > threshold_mb:
+            logger.warning(
+                f"[split_by_size] Part {i+1} exceeds {threshold_mb}MB; switching to size-based splitter..."
+            )
+            for p in output_paths:
+                p.unlink(missing_ok=True)
+            return split_pdf(pdf_path, output_dir, base_name, threshold_mb)
 
     # CRITICAL: Verify ALL parts are under threshold with detailed logging
     oversize_parts = []
@@ -285,13 +312,13 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
 
     if oversize_parts:
         logger.warning(f"[split_by_size] {len(oversize_parts)}/{len(output_paths)} parts exceeded {threshold_mb}MB")
-        logger.warning(f"[split_by_size] Cleaning up and retrying with binary-search splitter...")
+        logger.warning(f"[split_by_size] Cleaning up and retrying with size-based splitter...")
 
         # Clean up ALL parts before retrying
         for p in output_paths:
             p.unlink(missing_ok=True)
 
-        # Fallback to precise binary-search splitter
+        # Fallback to size-based splitter
         return split_pdf(pdf_path, output_dir, base_name, threshold_mb)
 
     logger.info(f"[split_by_size] ✓ SUCCESS: All {verified_count} parts verified under {threshold_mb}MB")
@@ -309,13 +336,11 @@ def split_pdf(
     threshold_mb: float = DEFAULT_THRESHOLD_MB,
     progress_callback: Optional[Callable[[int, str, str], None]] = None
 ) -> List[Path]:
-    """Split PDF into optimal number of parts using smart byte-based distribution.
+    """Split a PDF into multiple parts under a size threshold.
 
-    Uses Adobe-style splitting: calculates exact parts needed (ceil(size/threshold)),
-    then distributes pages to achieve balanced part sizes. Estimates page sizes
-    from content streams to ensure each part is roughly (total_size / num_parts).
-
-    Example: 53MB file -> ceil(53/24.5) = 3 parts of ~17.8MB each.
+    Uses a greedy, size-based splitter: for each part, binary-search the largest
+    page range that stays under a conservative target (`threshold_mb - buffer`),
+    then repeat for the remainder until all pages are assigned.
 
     Args:
         pdf_path: Path to the source PDF file.
@@ -324,7 +349,7 @@ def split_pdf(
         threshold_mb: Maximum size per part in MB. Defaults to SPLIT_THRESHOLD_MB.
 
     Returns:
-        List of paths to the created PDF parts, all guaranteed under threshold_mb.
+        List of paths to the created PDF parts, all verified under threshold_mb.
 
     Raises:
         FileNotFoundError: If source PDF doesn't exist.
@@ -368,13 +393,14 @@ def split_pdf(
             if total_pages == 0:
                 raise StructureError.for_file(pdf_path.name, "PDF has no pages")
 
-            # Calculate number of parts needed and BALANCED target size
-            num_parts = math.ceil(file_size_mb / threshold_mb)
-            # Target = total / parts (balanced distribution), capped at threshold - buffer
-            balanced_target = file_size_mb / num_parts
             max_target = threshold_mb - SAFETY_BUFFER_MB
-            target_size = min(balanced_target, max_target)
-            logger.info(f"Split: {file_size_mb:.2f}MB ÷ {threshold_mb}MB = {num_parts} parts, target {target_size:.1f}MB each")
+            # Use a greedy "fill to max" strategy: pack as many pages as possible into each part
+            # while staying under a conservative per-part target (threshold - buffer).
+            target_size = max_target if max_target > 0 else threshold_mb
+            logger.info(
+                f"Split: {file_size_mb:.2f}MB target {target_size:.1f}MB parts "
+                f"(limit {threshold_mb:.1f}MB, buffer {SAFETY_BUFFER_MB:.1f}MB)"
+            )
 
             def measure_pages(start_page: int, end_page: int, optimize: bool = False) -> float:
                 """Create a temp PDF, optionally optimize it, and measure its size.
@@ -409,90 +435,66 @@ def split_pdf(
                 temp_path.unlink(missing_ok=True)
                 return size
 
-            # Try to find split points, increasing num_parts if needed
-            max_attempts = 10  # Prevent infinite loops
-            groups = None
+            # Greedy split: repeatedly find the largest end page that keeps this part under target_size.
+            report_progress(70, "Calculating split points...")
+            page_ranges: List[tuple[int, int]] = []
+            start_page = 0
 
-            for attempt in range(max_attempts):
-                if attempt > 0:
-                    num_parts += 1
-                    logger.info(f"Attempt {attempt + 1}: Trying with {num_parts} parts...")
+            while start_page < total_pages:
+                # Binary search for the maximum end_page where size(start_page, end_page) <= target_size.
+                low = start_page + 1
+                high = total_pages
+                best_end: Optional[int] = None
 
-                # Recalculate balanced target for current number of parts
-                balanced_target = file_size_mb / num_parts
-                target_size = min(balanced_target, max_target)
-                logger.info(f"Target size per part: {target_size:.1f}MB")
-
-                # Find split points using binary search
-                split_points = [0]  # Start of first part
-
-                for part_idx in range(num_parts - 1):
-                    start = split_points[-1]
-                    remaining_parts = num_parts - part_idx
-                    remaining_pages = total_pages - start
-
-                    # Binary search for the page where this part is just under target_size
-                    low = start + 1
-                    high = start + remaining_pages - (remaining_parts - 1)  # Leave pages for other parts
-                    best_split = low
-
-                    report_progress(72 + part_idx * 2, f"Finding split point {part_idx + 1}...")
-                    logger.info(f"Finding split point {part_idx + 1}: searching pages {low}-{high}")
-
-                    while low <= high:
-                        mid = (low + high) // 2
-                        size = measure_pages(start, mid)
-                        logger.info(f"  Pages {start}-{mid}: {size:.1f}MB")
-
-                        if size <= target_size:
-                            best_split = mid
-                            low = mid + 1  # Try more pages
-                        else:
-                            high = mid - 1  # Too big, try fewer pages
-
-                    split_points.append(best_split)
-                    logger.info(f"Split point {part_idx + 1}: page {best_split}")
-
-                split_points.append(total_pages)  # End of last part
-
-                # Build groups from split points
-                groups = []
-                for i in range(len(split_points) - 1):
-                    groups.append(list(range(split_points[i], split_points[i + 1])))
-
-                logger.info(f"Candidate split: {[f'pages {g[0]+1}-{g[-1]+1}' for g in groups]}")
-
-                # CRITICAL: Verify ALL parts including the last one
-                all_parts_valid = True
-                for part_idx, group in enumerate(groups, 1):
-                    part_size = measure_pages(group[0], group[-1] + 1)
-                    logger.info(f"Verifying Part {part_idx} (pages {group[0]+1}-{group[-1]+1}): {part_size:.1f}MB")
-
-                    if part_size > threshold_mb:
-                        logger.warning(f"Part {part_idx} exceeds {threshold_mb}MB! Need more parts.")
-                        all_parts_valid = False
-                        break
-
-                if all_parts_valid:
-                    logger.info(f"All {num_parts} parts verified under {threshold_mb}MB")
-                    break
-
-            if not all_parts_valid:
-                raise SplitError(
-                    f"Could not split PDF into parts under {threshold_mb}MB after {max_attempts} attempts. "
-                    f"The PDF may have individual pages that are too large."
+                # Progress based on how many pages have been assigned to parts so far.
+                progress_pct = 70 + int(10 * start_page / max(total_pages, 1))
+                report_progress(progress_pct, f"Finding end of part {len(page_ranges) + 1}...")
+                logger.info(
+                    f"Finding part {len(page_ranges) + 1}: searching pages {start_page + 1}-{total_pages}"
                 )
+
+                while low <= high:
+                    mid = (low + high) // 2
+                    size = measure_pages(start_page, mid)
+                    logger.info(f"  Pages {start_page + 1}-{mid}: {size:.1f}MB")
+
+                    if size <= target_size:
+                        best_end = mid
+                        low = mid + 1  # Try more pages
+                    else:
+                        high = mid - 1  # Too big, try fewer pages
+
+                if best_end is None:
+                    # Even a single page is above the target_size. Accept it if it's still under the hard limit,
+                    # otherwise this PDF can't be split to meet the threshold.
+                    single_page_size = measure_pages(start_page, start_page + 1)
+                    if single_page_size <= threshold_mb:
+                        best_end = start_page + 1
+                        logger.warning(
+                            f"Page {start_page + 1} alone is {single_page_size:.1f}MB "
+                            f"(over target {target_size:.1f}MB, under limit {threshold_mb:.1f}MB)."
+                        )
+                    else:
+                        raise SplitError(
+                            f"Cannot split {pdf_path.name}: page {start_page + 1} alone is "
+                            f"{single_page_size:.1f}MB, exceeding the {threshold_mb:.1f}MB limit."
+                        )
+
+                page_ranges.append((start_page, best_end))
+                logger.info(f"Split point {len(page_ranges)}: pages {start_page + 1}-{best_end}")
+                start_page = best_end
 
             # Now create the actual split parts - ALWAYS optimize to match measured sizes
             output_paths: List[Path] = []
 
-            for part_num, page_indices in enumerate(groups, 1):
-                report_progress(80 + part_num * 3, f"Creating part {part_num} of {len(groups)}...")
+            total_parts = len(page_ranges)
+            for part_num, (range_start, range_end) in enumerate(page_ranges, 1):
+                report_progress(80 + int(15 * part_num / max(total_parts, 1)), f"Creating part {part_num} of {total_parts}...")
                 # Unique ID prevents file collisions when multiple jobs run in parallel
                 part_unique_id = str(uuid.uuid4())[:8]
 
                 writer = PdfWriter()
-                for page_idx in page_indices:
+                for page_idx in range(range_start, range_end):
                     writer.add_page(reader.pages[page_idx])
 
                 # Write raw PyPDF2 part to temporary path
@@ -501,48 +503,98 @@ def split_pdf(
                     writer.write(out_f)
 
                 raw_size_mb = get_file_size_mb(temp_part_path)
-                pages_in_part = len(page_indices)
+                pages_in_part = range_end - range_start
                 logger.info(f"Created {temp_part_path.name}: {pages_in_part} pages, {raw_size_mb:.1f}MB (raw)")
 
                 part_path = output_dir / f"{base_name}_part{part_num}.pdf"
 
                 # ALWAYS optimize - this matches what we measured during binary search
                 success, message = optimize_split_part(temp_part_path, part_path)
-                if success:
+                if success and part_path.exists():
                     optimized_size_mb = get_file_size_mb(part_path)
                     logger.info(f"Optimized {part_path.name}: {raw_size_mb:.1f}MB -> {optimized_size_mb:.1f}MB")
-                    temp_part_path.unlink()
 
-                    # If still over threshold after optimization, try full compression
-                    if optimized_size_mb > target_size:
-                        logger.info(f"Part {part_num} still {optimized_size_mb:.1f}MB, trying full compression...")
-                        compressed_path = part_path.with_suffix('.compressed.pdf')
-                        success2, msg2 = compress_pdf_with_ghostscript(part_path, compressed_path)
-                        if success2:
-                            new_size = get_file_size_mb(compressed_path)
-                            if new_size < optimized_size_mb:
-                                part_path.unlink()
-                                compressed_path.rename(part_path)
-                                logger.info(f"Full compression: {optimized_size_mb:.1f}MB -> {new_size:.1f}MB")
-                            else:
-                                compressed_path.unlink()
-                        else:
-                            logger.warning(f"Full compression failed: {msg2}")
+                    # If optimization made it bigger, keep the raw output instead.
+                    if optimized_size_mb > raw_size_mb:
+                        logger.warning(
+                            f"Optimization increased size for {part_path.name}: "
+                            f"{raw_size_mb:.1f}MB -> {optimized_size_mb:.1f}MB. Keeping raw output."
+                        )
+                        part_path.unlink(missing_ok=True)
+                        temp_part_path.rename(part_path)
+                        current_size_mb = raw_size_mb
+                    else:
+                        temp_part_path.unlink(missing_ok=True)
+                        current_size_mb = optimized_size_mb
                 else:
                     # Optimization failed - just rename
                     logger.warning(f"Optimization failed: {message}")
+                    part_path.unlink(missing_ok=True)
                     temp_part_path.rename(part_path)
+                    current_size_mb = raw_size_mb
+
+                def try_replace_with_smaller(label: str, suffix: str, compress_fn) -> None:
+                    nonlocal current_size_mb
+                    candidate_path = part_path.with_suffix(suffix)
+                    candidate_path.unlink(missing_ok=True)
+                    ok, msg = compress_fn(part_path, candidate_path)
+                    if not ok or not candidate_path.exists():
+                        logger.warning(f"{label} failed for {part_path.name}: {msg}")
+                        candidate_path.unlink(missing_ok=True)
+                        return
+
+                    new_size_mb = get_file_size_mb(candidate_path)
+                    if new_size_mb < current_size_mb:
+                        part_path.unlink(missing_ok=True)
+                        candidate_path.rename(part_path)
+                        logger.info(f"{label}: {current_size_mb:.1f}MB -> {new_size_mb:.1f}MB")
+                        current_size_mb = new_size_mb
+                    else:
+                        candidate_path.unlink(missing_ok=True)
+
+                # If still over the hard limit, try progressively more aggressive compression.
+                if current_size_mb > threshold_mb:
+                    logger.info(
+                        f"Part {part_num} is {current_size_mb:.1f}MB (> {threshold_mb:.1f}MB), "
+                        f"trying full compression..."
+                    )
+                    try_replace_with_smaller("Full compression", ".compressed.pdf", compress_pdf_with_ghostscript)
+
+                if current_size_mb > threshold_mb:
+                    logger.warning(
+                        f"Part {part_num} still {current_size_mb:.1f}MB (> {threshold_mb:.1f}MB), "
+                        f"trying ultra compression (quality reduction)..."
+                    )
+
+                    def ultra_fn(inp: Path, out: Path):
+                        return compress_ultra_aggressive(inp, out)
+
+                    try_replace_with_smaller("Ultra compression", ".ultra.pdf", ultra_fn)
 
                 if not part_path.exists():
                     raise SplitError(f"Failed to create part {part_num}: file not written")
 
                 output_paths.append(part_path)
 
-            # Return the parts - all verified under threshold
+            # Final verification: ensure every part is under the requested threshold.
+            oversize: List[tuple[int, Path, float]] = []
+            for i, p in enumerate(output_paths, 1):
+                size_mb = get_file_size_mb(p)
+                logger.info(f"  Part {i}: {size_mb:.1f}MB")
+                if size_mb > threshold_mb:
+                    oversize.append((i, p, size_mb))
+
+            if oversize:
+                details = ", ".join([f"part {i}={s:.1f}MB" for i, _, s in oversize])
+                for p in output_paths:
+                    p.unlink(missing_ok=True)
+                raise SplitError(
+                    f"Split produced oversized parts for {pdf_path.name}: {details} (limit {threshold_mb:.1f}MB)."
+                )
+
+            # Return the parts
             logger.info(f"Split complete: {len(output_paths)} parts")
-            for i, p in enumerate(output_paths):
-                size = get_file_size_mb(p)
-                logger.info(f"  Part {i+1}: {size:.1f}MB")
+            report_progress(95, "Split complete")
             return output_paths
 
     except (EncryptionError, StructureError, SplitError):

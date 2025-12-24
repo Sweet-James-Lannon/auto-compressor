@@ -220,6 +220,90 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
         return False, str(e)
 
 
+def compress_ultra_aggressive(input_path: Path, output_path: Path, jpeg_quality: int = 50) -> Tuple[bool, str]:
+    """
+    Ultra-aggressive compression for oversized split parts.
+
+    Uses the same 72 DPI pipeline as `compress_pdf_with_ghostscript` but lowers JPEG quality
+    to squeeze parts under strict size limits. This will reduce image quality; only use when
+    standard compression cannot get a part under the threshold.
+    """
+    gs_cmd = get_ghostscript_command()
+    if not gs_cmd:
+        return False, "Ghostscript not installed"
+
+    if not input_path.exists():
+        return False, f"File not found: {input_path}"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # /screen preset + lower JPEG quality for maximum size reduction.
+    cmd = [
+        gs_cmd,
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        "-dPDFSETTINGS=/screen",
+        "-dNOPAUSE",
+        "-dBATCH",
+        "-dQUIET",
+        f"-dJPEGQ={int(jpeg_quality)}",
+        # Force JPEG encoding (converts JPEG2000 to JPEG)
+        "-dAutoFilterColorImages=false",
+        "-dColorImageFilter=/DCTEncode",
+        "-dAutoFilterGrayImages=false",
+        "-dGrayImageFilter=/DCTEncode",
+        # Downsample images (72 DPI baseline)
+        "-dDownsampleColorImages=true",
+        "-dColorImageDownsampleType=/Bicubic",
+        "-dColorImageResolution=72",
+        "-dColorImageDownsampleThreshold=1.0",
+        "-dDownsampleGrayImages=true",
+        "-dGrayImageDownsampleType=/Bicubic",
+        "-dGrayImageResolution=72",
+        "-dGrayImageDownsampleThreshold=1.0",
+        "-dDownsampleMonoImages=true",
+        "-dMonoImageDownsampleType=/Subsample",
+        "-dMonoImageResolution=150",
+        "-dMonoImageDownsampleThreshold=1.0",
+        # Optimization
+        "-dDetectDuplicateImages=true",
+        "-dCompressFonts=true",
+        "-dSubsetFonts=true",
+        "-dFastWebView=true",
+        f"-sOutputFile={output_path}",
+        str(input_path),
+    ]
+
+    try:
+        file_mb = input_path.stat().st_size / (1024 * 1024)
+        timeout = max(600, int(file_mb * 10))
+
+        logger.info(
+            f"[ULTRA] Compressing {input_path.name} ({file_mb:.1f}MB) "
+            f"with JPEGQ={jpeg_quality}"
+        )
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+        if result.returncode != 0:
+            return False, translate_ghostscript_error(result.stderr, result.returncode)
+
+        if not output_path.exists():
+            return False, "Output file not created"
+
+        out_mb = output_path.stat().st_size / (1024 * 1024)
+        reduction = ((file_mb - out_mb) / file_mb) * 100 if file_mb > 0 else 0.0
+
+        logger.info(f"[ULTRA] Result: {file_mb:.1f}MB -> {out_mb:.1f}MB ({reduction:.1f}% reduction)")
+
+        return True, f"{reduction:.1f}% reduction"
+
+    except subprocess.TimeoutExpired:
+        return False, "Timeout exceeded"
+    except Exception as e:
+        return False, str(e)
+
+
 # =============================================================================
 # PARALLEL COMPRESSION - Uses multiple CPU cores
 # =============================================================================
@@ -290,6 +374,26 @@ def compress_parallel(
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
         success, message = compress_pdf_with_ghostscript(chunk_path, compressed_path)
+
+        # If Ghostscript "compression" makes this chunk larger, keep the original chunk.
+        # This is common for vector/text-heavy PDFs where re-encoding can bloat output.
+        try:
+            if success and compressed_path.exists():
+                original_bytes = chunk_path.stat().st_size
+                compressed_bytes = compressed_path.stat().st_size
+                if compressed_bytes >= original_bytes:
+                    compressed_path.unlink(missing_ok=True)
+                    original_mb = original_bytes / (1024 * 1024)
+                    compressed_mb = compressed_bytes / (1024 * 1024)
+                    return (
+                        chunk_path,
+                        False,
+                        f"Compression increased size ({original_mb:.1f}MB -> {compressed_mb:.1f}MB), using original",
+                    )
+        except Exception:
+            # If stats fail for any reason, fall back to the normal success path below.
+            pass
+
         return compressed_path, success, message
 
     compressed_chunks = []

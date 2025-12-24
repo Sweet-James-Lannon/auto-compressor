@@ -58,6 +58,14 @@ Errors return `error_type`/`error_message` (e.g., `DownloadError`, `FileTooLarge
 - Upload a PDF (or supply a URL) and submit; the dashboard uses `/compress-sync` (blocking) and returns download links directly.
 - For Salesforce-style async: send JSON to `/compress-sync` with `file_download_link` and `matterId`; you will get `202` + `job_id`, and the service will callback with absolute download URLs.
 
+## Testing
+
+Run unit tests:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
 ## Configuration (essentials)
 
 | Variable | Default | Description |

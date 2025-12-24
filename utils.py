@@ -140,6 +140,10 @@ def download_pdf(url: str, output_path: Path) -> None:
             redirect_url = urljoin(url, redirect_target)
             _is_safe_url(redirect_url)  # Re-validate redirect destination
             logger.info(f"[URL_REDIRECT] Following redirect to {redirect_url[:200]}")
+            try:
+                response.close()
+            except Exception:
+                pass
             response = _perform_request(redirect_url)
 
         status = response.status_code
@@ -150,11 +154,29 @@ def download_pdf(url: str, output_path: Path) -> None:
         if status >= 400:
             raise DownloadError(f"Download failed (HTTP {status})", status_code=status)
 
-        # Check content length if available
+        # Check Content-Length if available
+        expected_bytes = None
         content_length = response.headers.get('content-length')
-        if content_length and int(content_length) > MAX_DOWNLOAD_SIZE:
-            size_mb = int(content_length) / (1024 * 1024)
+        if content_length:
+            try:
+                expected_bytes = int(content_length)
+            except Exception:
+                expected_bytes = None
+
+        if expected_bytes and expected_bytes > MAX_DOWNLOAD_SIZE:
+            size_mb = expected_bytes / (1024 * 1024)
             raise DownloadError.too_large(size_mb)
+
+        # If the server applies Content-Encoding, requests may transparently decompress the body,
+        # making `downloaded` larger than the on-the-wire Content-Length. Only enforce strict
+        # byte-for-byte matching when Content-Encoding is identity/absent.
+        content_encoding = (response.headers.get("content-encoding") or "").strip().lower()
+        strict_length = expected_bytes is not None and content_encoding in ("", "identity")
+        if expected_bytes is not None and not strict_length:
+            logger.info(
+                f"[DOWNLOAD_SIZE] Content-Encoding='{content_encoding}' detected; "
+                f"skipping strict Content-Length verification"
+            )
 
         # Stream download with size check
         downloaded = 0
@@ -165,18 +187,40 @@ def download_pdf(url: str, output_path: Path) -> None:
                 downloaded += len(chunk)
                 if downloaded > MAX_DOWNLOAD_SIZE:
                     raise DownloadError.too_large(downloaded / (1024 * 1024))
+                if strict_length and expected_bytes is not None and downloaded > expected_bytes:
+                    raise DownloadError(
+                        f"Download exceeded Content-Length ({downloaded:,} > {expected_bytes:,} bytes). "
+                        f"The source may be misreporting file size.",
+                        status_code=502,
+                    )
                 f.write(chunk)
 
-        logger.info(f"Downloaded {downloaded / (1024*1024):.1f}MB to {output_path.name}")
+        if strict_length and expected_bytes is not None and downloaded != expected_bytes:
+            raise DownloadError(
+                f"Download size mismatch (expected {expected_bytes:,} bytes, got {downloaded:,} bytes). "
+                f"The download may be incomplete.",
+                status_code=502,
+            )
+
+        logger.info(
+            f"Downloaded {downloaded:,} bytes "
+            f"({downloaded / 1_000_000:.1f}MB, {downloaded / (1024 * 1024):.1f}MiB) "
+            f"to {output_path.name}"
+        )
+        if strict_length and expected_bytes is not None:
+            logger.info(f"[DOWNLOAD_SIZE] Verified Content-Length: {expected_bytes:,} bytes")
 
         # Basic sanity check: ensure we actually downloaded something
         if downloaded == 0 or output_path.stat().st_size == 0:
             raise DownloadError("Downloaded file is empty", status_code=400)
 
     except DownloadError:
+        output_path.unlink(missing_ok=True)
         # Re-raise structured download errors
         raise
     except requests.exceptions.Timeout as e:
+        output_path.unlink(missing_ok=True)
         raise DownloadError("Download timed out after 5 minutes", status_code=504) from e
     except requests.exceptions.RequestException as e:
+        output_path.unlink(missing_ok=True)
         raise DownloadError(f"Download failed: {e}", status_code=502) from e
