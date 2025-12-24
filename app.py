@@ -46,7 +46,26 @@ app = Flask(__name__, template_folder='dashboard')
 MAX_CONTENT_LENGTH = 314572800  # 300 MB
 HARD_SYNC_LIMIT_MB = 300.0  # Absolute ceiling for sync endpoint
 HARD_ASYNC_LIMIT_MB = 600.0  # Absolute ceiling for async jobs
-UPLOAD_FOLDER = Path(__file__).parent / "uploads"  # Absolute path for Azure compatibility
+
+
+def resolve_upload_folder() -> Path:
+    """Resolve the upload folder, preferring persistent storage on Azure."""
+    env_override = os.environ.get("UPLOAD_FOLDER")
+    if env_override:
+        return Path(env_override)
+
+    # Azure App Service: /home is persistent and shared across instances.
+    if os.environ.get("WEBSITE_INSTANCE_ID") or os.environ.get("WEBSITE_SITE_NAME"):
+        home = Path(os.environ.get("HOME", "/home"))
+        site_root = home / "site" / "wwwroot"
+        if site_root.exists():
+            return site_root / "uploads"
+        return home / "uploads"
+
+    return Path(__file__).parent / "uploads"
+
+
+UPLOAD_FOLDER = resolve_upload_folder()
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
 SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 # Cap SYNC_MAX_MB at the hard ceiling even if env is higher
@@ -60,7 +79,8 @@ BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
 SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "540"))
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
-UPLOAD_FOLDER.mkdir(exist_ok=True)
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+logger.info(f"Upload folder resolved to: {UPLOAD_FOLDER.resolve()}")
 
 
 def require_auth(f):
@@ -248,8 +268,28 @@ def cleanup_daemon():
         time.sleep(60)
         cutoff = time.time() - FILE_RETENTION_SECONDS
         with file_lock:
-            expired = [p for p, t in tracked_files.items() if t < cutoff]
-        for path in expired:
+            tracked_snapshot = dict(tracked_files)
+        expired = {p for p, t in tracked_snapshot.items() if t < cutoff}
+
+        # Include untracked PDFs (e.g., after restart) based on mtime.
+        try:
+            for pdf_path in UPLOAD_FOLDER.glob("*.pdf"):
+                pdf_str = str(pdf_path)
+                if pdf_str in tracked_snapshot:
+                    continue
+                try:
+                    mtime = pdf_path.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime < cutoff:
+                    expired.add(pdf_str)
+                else:
+                    with file_lock:
+                        tracked_files[pdf_str] = mtime
+        except Exception as e:
+            logger.error(f"Cleanup scan error: {e}")
+
+        for path in sorted(expired):
             try:
                 Path(path).unlink(missing_ok=True)
                 with file_lock:
@@ -868,6 +908,7 @@ def download(filename):
 
         return jsonify({"success": False, "error": "File not found"}), 404
 
+    track_file(file_path)
     logger.info(f"[download] Serving file: {file_path.name} ({file_path.stat().st_size / (1024*1024):.1f}MB)")
     return send_file(file_path, as_attachment=True, download_name=safe_filename)
 

@@ -75,6 +75,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 | `SALESFORCE_CALLBACK_URL` | empty | Where to POST async results when `matterId` is present |
 | `SPLIT_THRESHOLD_MB` | 25 | Max size per output file after splitting |
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
+| `UPLOAD_FOLDER` | empty | Absolute path for storing PDFs; on Azure use a persistent path under `/home` |
 | `SYNC_TIMEOUT_SECONDS` | 540 | Timeout for `/compress-sync` work before 504 |
 | `ASYNC_MAX_MB` | 450 | Max PDF size allowed for async jobs (downloaded via signed URL) |
 | `DISABLE_ASYNC_WORKERS` | unset | Set to `1` to disable background workers |
@@ -82,5 +83,6 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 ## Deployment notes
 
 - Azure App Service: install Ghostscript, run gunicorn (see `startup.sh`).
-- Use a single instance (local file storage is not shared).
+- Use a persistent upload folder (`UPLOAD_FOLDER` under `/home`) or a shared store; `/tmp` is not persisted across restarts.
+- For multiple instances, store outputs in shared storage (Azure Files/Blob) or keep a single instance.
 - Ensure `BASE_URL` and `SALESFORCE_CALLBACK_URL` are set; restart after config changes.

@@ -78,7 +78,7 @@ def compress_pdf(
     page_count = None
     try:
         with open(input_path, 'rb') as f:
-            reader = PdfReader(f)
+            reader = PdfReader(f, strict=False)
             # Do not block on "encrypted" flag; attempt to read pages regardless.
             if reader.is_encrypted:
                 try:

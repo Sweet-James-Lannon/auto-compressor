@@ -588,7 +588,7 @@ def compress_parallel(
         from PyPDF2 import PdfReader
         try:
             with open(input_path, 'rb') as f:
-                page_count = len(PdfReader(f).pages)
+                page_count = len(PdfReader(f, strict=False).pages)
         except Exception:
             page_count = None
 
@@ -616,7 +616,7 @@ def compress_parallel(
     from PyPDF2 import PdfReader
     try:
         with open(input_path, 'rb') as f:
-            page_count = len(PdfReader(f).pages)
+            page_count = len(PdfReader(f, strict=False).pages)
     except Exception:
         page_count = None
 

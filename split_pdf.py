@@ -57,7 +57,7 @@ def split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    reader = PdfReader(pdf_path)
+    reader = PdfReader(pdf_path, strict=False)
     total_pages = len(reader.pages)
 
     if total_pages == 0:
@@ -201,7 +201,7 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
         logger.info(f"PDF {file_size_mb:.1f}MB already under {threshold_mb}MB, no split needed")
         return [pdf_path]
 
-    reader = PdfReader(pdf_path)
+    reader = PdfReader(pdf_path, strict=False)
     total_pages = len(reader.pages)
 
     if total_pages == 0:
@@ -378,7 +378,7 @@ def split_pdf(
 
     try:
         with open(pdf_path, 'rb') as f:
-            reader = PdfReader(f)
+            reader = PdfReader(f, strict=False)
 
             # Do not block on "encrypted" flag; attempt empty password and continue.
             if reader.is_encrypted:
