@@ -76,6 +76,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 | `SPLIT_THRESHOLD_MB` | 25 | Max size per output file after splitting |
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
 | `SYNC_TIMEOUT_SECONDS` | 540 | Timeout for `/compress-sync` work before 504 |
+| `ASYNC_MAX_MB` | 450 | Max PDF size allowed for async jobs (downloaded via signed URL) |
 | `DISABLE_ASYNC_WORKERS` | unset | Set to `1` to disable background workers |
 
 ## Deployment notes

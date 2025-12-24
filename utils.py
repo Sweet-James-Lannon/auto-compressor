@@ -103,7 +103,7 @@ def _is_safe_url(url: str) -> bool:
         raise DownloadError.invalid_url(str(url)) from e
 
 
-def download_pdf(url: str, output_path: Path) -> None:
+def download_pdf(url: str, output_path: Path, max_download_size_bytes: int = MAX_DOWNLOAD_SIZE) -> None:
     """Download a PDF from a URL.
 
     Used by /compress-sync to fetch PDFs from Salesforce/Docrio URLs.
@@ -111,9 +111,10 @@ def download_pdf(url: str, output_path: Path) -> None:
     Args:
         url: The URL to download from.
         output_path: Path to save the downloaded file.
+        max_download_size_bytes: Maximum allowed download size in bytes.
 
     Raises:
-        RuntimeError: If download fails, URL is blocked, or file is too large.
+        DownloadError: If download fails, URL is blocked, or file is too large.
     """
     # Security: Validate URL to prevent SSRF
     _is_safe_url(url)
@@ -163,9 +164,10 @@ def download_pdf(url: str, output_path: Path) -> None:
             except Exception:
                 expected_bytes = None
 
-        if expected_bytes and expected_bytes > MAX_DOWNLOAD_SIZE:
+        if expected_bytes and expected_bytes > max_download_size_bytes:
             size_mb = expected_bytes / (1024 * 1024)
-            raise DownloadError.too_large(size_mb)
+            limit_mb = max_download_size_bytes / (1024 * 1024)
+            raise DownloadError.too_large(size_mb, limit_mb=limit_mb)
 
         # If the server applies Content-Encoding, requests may transparently decompress the body,
         # making `downloaded` larger than the on-the-wire Content-Length. Only enforce strict
@@ -185,8 +187,9 @@ def download_pdf(url: str, output_path: Path) -> None:
                 if not chunk:
                     continue
                 downloaded += len(chunk)
-                if downloaded > MAX_DOWNLOAD_SIZE:
-                    raise DownloadError.too_large(downloaded / (1024 * 1024))
+                if downloaded > max_download_size_bytes:
+                    limit_mb = max_download_size_bytes / (1024 * 1024)
+                    raise DownloadError.too_large(downloaded / (1024 * 1024), limit_mb=limit_mb)
                 if strict_length and expected_bytes is not None and downloaded > expected_bytes:
                     raise DownloadError(
                         f"Download exceeded Content-Length ({downloaded:,} > {expected_bytes:,} bytes). "

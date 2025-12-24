@@ -139,5 +139,5 @@ class DownloadError(PDFCompressionError):
         return DownloadError(f"Download failed (404). File not found or link expired: '{url}'", status_code=404)
 
     @staticmethod
-    def too_large(mb: float) -> "DownloadError":
-        return DownloadError(f"File too large: {mb:.1f}MB (limit 300MB)", status_code=413)
+    def too_large(mb: float, limit_mb: float = 300.0) -> "DownloadError":
+        return DownloadError(f"File too large: {mb:.1f}MB (limit {limit_mb:.0f}MB)", status_code=413)

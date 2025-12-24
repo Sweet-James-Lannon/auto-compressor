@@ -45,11 +45,14 @@ app = Flask(__name__, template_folder='dashboard')
 # Constants
 MAX_CONTENT_LENGTH = 314572800  # 300 MB
 HARD_SYNC_LIMIT_MB = 300.0  # Absolute ceiling for sync endpoint
+HARD_ASYNC_LIMIT_MB = 600.0  # Absolute ceiling for async jobs
 UPLOAD_FOLDER = Path(__file__).parent / "uploads"  # Absolute path for Azure compatibility
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
 SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 # Cap SYNC_MAX_MB at the hard ceiling even if env is higher
 SYNC_MAX_MB = min(float(os.environ.get("SYNC_MAX_MB", str(HARD_SYNC_LIMIT_MB))), HARD_SYNC_LIMIT_MB)
+# Async jobs can be larger than sync, but still need a hard ceiling to protect the instance.
+ASYNC_MAX_MB = min(float(os.environ.get("ASYNC_MAX_MB", "450")), HARD_ASYNC_LIMIT_MB)
 API_TOKEN = os.environ.get('API_TOKEN')
 # Public base URL for download links (e.g., https://yourapp.azurewebsites.net)
 BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
@@ -287,7 +290,11 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             pdf_bytes = task_data['pdf_bytes']
             input_path.write_bytes(pdf_bytes)
         elif 'download_url' in task_data:
-            job_queue.download_pdf(task_data['download_url'], input_path)
+            job_queue.download_pdf(
+                task_data['download_url'],
+                input_path,
+                max_download_size_bytes=int(ASYNC_MAX_MB * 1024 * 1024),
+            )
         else:
             raise ValueError("No PDF data provided")
 
@@ -672,7 +679,11 @@ def compress_sync():
             host_hint = parsed.hostname or "unknown-host"
             path_hint = (parsed.path or "")[:50]
             logger.info(f"[sync:{file_id}] Downloading from host={host_hint} path={path_hint}...")
-            utils.download_pdf(file_url, input_path)
+            utils.download_pdf(
+                file_url,
+                input_path,
+                max_download_size_bytes=int(SYNC_MAX_MB * 1024 * 1024),
+            )
             # Validate downloaded file is actually a PDF
             with open(input_path, 'rb') as f:
                 header = f.read(5)
