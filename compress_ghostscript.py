@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 import shutil
 import subprocess
 import uuid
@@ -12,6 +13,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 from exceptions import SplitError
 
 logger = logging.getLogger(__name__)
+
+TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "40"))
+MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(TARGET_CHUNK_MB * 1.5)))
+MAX_PARALLEL_CHUNKS = int(os.environ.get("MAX_PARALLEL_CHUNKS", "16"))
 
 
 def optimize_split_part(input_path: Path, output_path: Path) -> Tuple[bool, str]:
@@ -29,6 +34,11 @@ def optimize_split_part(input_path: Path, output_path: Path) -> Tuple[bool, str]
     Returns:
         (success, message) tuple
     """
+    return _run_lossless_ghostscript(input_path, output_path, "Optimizing split part")
+
+
+def _run_lossless_ghostscript(input_path: Path, output_path: Path, label: str) -> Tuple[bool, str]:
+    """Run Ghostscript with lossless settings (no downsampling, pass-through images)."""
     gs_cmd = get_ghostscript_command()
     if not gs_cmd:
         return False, "Ghostscript not installed"
@@ -38,31 +48,34 @@ def optimize_split_part(input_path: Path, output_path: Path) -> Tuple[bool, str]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use /default - preserves quality, just de-duplicates resources
+    # Use /default - preserves quality, just de-duplicates resources.
     cmd = [
         gs_cmd,
         "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.4",
-        "-dPDFSETTINGS=/default",  # Preserve quality, don't re-encode
+        "-dPDFSETTINGS=/default",
         "-dNOPAUSE",
         "-dBATCH",
         "-dQUIET",
-        # Critical: Don't re-encode images, just pass them through
+        # Prevent any image downsampling or re-encoding.
+        "-dDownsampleColorImages=false",
+        "-dDownsampleGrayImages=false",
+        "-dDownsampleMonoImages=false",
         "-dPassThroughJPEGImages=true",
         "-dPassThroughJPXImages=true",
-        # Remove duplicates
+        # Remove duplicates and subset fonts.
         "-dDetectDuplicateImages=true",
         "-dCompressFonts=true",
         "-dSubsetFonts=true",
         f"-sOutputFile={output_path}",
-        str(input_path)
+        str(input_path),
     ]
 
     try:
         file_mb = input_path.stat().st_size / (1024 * 1024)
         timeout = max(300, int(file_mb * 5))
 
-        logger.info(f"Optimizing split part {input_path.name} ({file_mb:.1f}MB)")
+        logger.info(f"{label} {input_path.name} ({file_mb:.1f}MB)")
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
@@ -73,7 +86,7 @@ def optimize_split_part(input_path: Path, output_path: Path) -> Tuple[bool, str]
             return False, "Output file not created"
 
         out_mb = output_path.stat().st_size / (1024 * 1024)
-        reduction = ((file_mb - out_mb) / file_mb) * 100
+        reduction = ((file_mb - out_mb) / file_mb) * 100 if file_mb > 0 else 0.0
 
         logger.info(f"Optimized: {file_mb:.1f}MB -> {out_mb:.1f}MB ({reduction:.1f}% reduction)")
 
@@ -83,6 +96,11 @@ def optimize_split_part(input_path: Path, output_path: Path) -> Tuple[bool, str]
         return False, "Timeout exceeded"
     except Exception as e:
         return False, str(e)
+
+
+def compress_pdf_lossless(input_path: Path, output_path: Path) -> Tuple[bool, str]:
+    """Lossless PDF optimization using Ghostscript (no downsampling)."""
+    return _run_lossless_ghostscript(input_path, output_path, "Lossless optimize")
 
 
 def get_ghostscript_command() -> Optional[str]:
@@ -313,8 +331,10 @@ def compress_parallel(
     working_dir: Path,
     base_name: str,
     split_threshold_mb: float = 25.0,
+    split_trigger_mb: Optional[float] = None,
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
-    max_workers: int = 6
+    max_workers: int = 6,
+    compression_mode: str = "lossless"
 ) -> Dict:
     """
     Parallel compression strategy for large PDFs.
@@ -333,8 +353,10 @@ def compress_parallel(
         working_dir: Directory for temp and output files.
         base_name: Base filename for output.
         split_threshold_mb: Max size per final part (default 25MB).
+        split_trigger_mb: Size that triggers splitting (defaults to split_threshold_mb).
         progress_callback: Optional callback(percent, stage, message).
         max_workers: Max parallel compression workers (default 6).
+        compression_mode: "lossless" (no downsampling) or "aggressive" (/screen).
 
     Returns:
         Dict with output_path(s), sizes, reduction_percent, etc.
@@ -354,26 +376,94 @@ def compress_parallel(
     original_size_mb = get_file_size_mb(input_path)
     original_bytes = input_path.stat().st_size
 
-    logger.info(f"[PARALLEL] Starting parallel compression for {input_path.name} ({original_size_mb:.1f}MB)")
+    compression_mode = (compression_mode or "lossless").lower()
+    if compression_mode not in ("lossless", "aggressive"):
+        logger.warning(f"[PARALLEL] Unknown compression_mode '{compression_mode}', defaulting to lossless")
+        compression_mode = "lossless"
 
-    # Step 1: Calculate number of chunks targeting ~40MB each.
+    target_chunk_mb = max(5.0, TARGET_CHUNK_MB)
+    max_chunk_mb = max(target_chunk_mb, MAX_CHUNK_MB)
+    max_parallel_chunks = max(2, MAX_PARALLEL_CHUNKS)
+    effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
+
+    logger.info(
+        f"[PARALLEL] Starting parallel compression for {input_path.name} "
+        f"({original_size_mb:.1f}MB, mode={compression_mode})"
+    )
+    logger.info(
+        f"[PARALLEL] Chunking target {target_chunk_mb:.1f}MB (max {max_chunk_mb:.1f}MB, cap {max_parallel_chunks})"
+    )
+
+    # Step 1: Calculate number of chunks targeting the configured size.
     # Do NOT cap by max_workers; extra chunks are processed by the thread pool in batches.
     # This keeps each Ghostscript run shorter on very large files (300MB), reducing timeouts.
-    num_chunks = max(2, min(10, math.ceil(original_size_mb / 40)))
-    report_progress(5, "splitting", f"Splitting into {num_chunks} chunks (~40MB each) for parallel compression...")
+    num_chunks = max(2, min(max_parallel_chunks, math.ceil(original_size_mb / target_chunk_mb)))
+    report_progress(
+        5,
+        "splitting",
+        f"Splitting into {num_chunks} chunks (~{target_chunk_mb:.0f}MB target each) for parallel compression...",
+    )
 
     # Step 2: Split by page count (fast, no Ghostscript)
     chunk_paths = split_by_pages(input_path, working_dir, num_chunks, base_name)
-    logger.info(f"[PARALLEL] Split into {len(chunk_paths)} chunks")
+    def rebalance_chunks_by_size(chunks: List[Path]) -> List[Path]:
+        """Split oversized chunks again to avoid long-running Ghostscript jobs."""
+        from PyPDF2 import PdfReader
+
+        balanced: List[Path] = []
+        for chunk_path in chunks:
+            size_mb = get_file_size_mb(chunk_path)
+            if size_mb <= max_chunk_mb:
+                balanced.append(chunk_path)
+                continue
+
+            remaining_slots = max_parallel_chunks - len(balanced)
+            if remaining_slots <= 1:
+                balanced.append(chunk_path)
+                continue
+
+            split_count = max(2, math.ceil(size_mb / target_chunk_mb))
+            try:
+                with open(chunk_path, "rb") as f:
+                    total_pages = len(PdfReader(f, strict=False).pages)
+            except Exception:
+                total_pages = None
+
+            if not total_pages:
+                logger.warning(f"[PARALLEL] Could not read pages for {chunk_path.name}; keeping chunk as-is")
+                balanced.append(chunk_path)
+                continue
+
+            split_count = min(split_count, total_pages)
+            split_count = min(split_count, remaining_slots)
+
+            if split_count <= 1:
+                balanced.append(chunk_path)
+                continue
+
+            logger.info(
+                f"[PARALLEL] Chunk {chunk_path.name} is {size_mb:.1f}MB; re-splitting into {split_count} parts"
+            )
+            sub_chunks = split_by_pages(chunk_path, working_dir, split_count, chunk_path.stem)
+            chunk_path.unlink(missing_ok=True)
+            balanced.extend(sub_chunks)
+
+        return balanced
+
+    chunk_paths = rebalance_chunks_by_size(chunk_paths)
+    num_chunks = len(chunk_paths)
+    logger.info(f"[PARALLEL] Split into {num_chunks} chunk(s)")
 
     # Step 3: Compress each chunk in parallel
     report_progress(15, "compressing", f"Compressing {num_chunks} chunks in parallel...")
+
+    compress_fn = compress_pdf_lossless if compression_mode == "lossless" else compress_pdf_with_ghostscript
 
     def compress_single_chunk(chunk_path: Path) -> Tuple[Path, bool, str]:
         """Compress a single chunk and return result."""
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
-        success, message = compress_pdf_with_ghostscript(chunk_path, compressed_path)
+        success, message = compress_fn(chunk_path, compressed_path)
 
         # If Ghostscript "compression" makes this chunk larger, keep the original chunk.
         # This is common for vector/text-heavy PDFs where re-encoding can bloat output.
@@ -399,7 +489,8 @@ def compress_parallel(
     compressed_chunks = []
     failed_chunks = []
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    worker_count = min(max_workers, len(chunk_paths)) if chunk_paths else max_workers
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         # Submit all compression jobs
         futures = {
             executor.submit(compress_single_chunk, chunk): (i, chunk)
@@ -477,33 +568,52 @@ def compress_parallel(
         report_progress(40, "compressing", "Parallel failed, trying serial compression...")
 
         serial_output = working_dir / f"{base_name}_serial_compressed.pdf"
-        success, message = compress_pdf_with_ghostscript(input_path, serial_output)
+        success, message = compress_fn(input_path, serial_output)
 
         if success and serial_output.exists():
             serial_size_mb = get_file_size_mb(serial_output)
 
-            # If serial also made it bigger, just split the original
+            # If serial also made it bigger, use the original (split only if needed)
             if serial_size_mb >= original_size_mb:
                 logger.warning(f"[PARALLEL] Serial also increased size. Using original file.")
                 serial_output.unlink(missing_ok=True)
 
-                # Just split the original file without compression
-                from split_pdf import split_by_size
-                final_parts = split_by_size(input_path, working_dir, base_name, split_threshold_mb)
+                if effective_split_trigger and original_size_mb > effective_split_trigger:
+                    # Split the original file without compression
+                    from split_pdf import split_by_size
+                    final_parts = split_by_size(input_path, working_dir, base_name, split_threshold_mb)
+
+                    return {
+                        "output_path": str(final_parts[0]),
+                        "output_paths": [str(p) for p in final_parts],
+                        "original_size_mb": round(original_size_mb, 2),
+                        "compressed_size_mb": round(original_size_mb, 2),
+                        "reduction_percent": 0.0,
+                        "compression_method": "none",
+                        "compression_mode": compression_mode,
+                        "was_split": len(final_parts) > 1,
+                        "total_parts": len(final_parts),
+                        "success": True,
+                        "note": "File already optimized, split only",
+                        "page_count": None,
+                        "part_sizes": [p.stat().st_size for p in final_parts],
+                        "parallel_chunks": num_chunks
+                    }
 
                 return {
-                    "output_path": str(final_parts[0]),
-                    "output_paths": [str(p) for p in final_parts],
+                    "output_path": str(input_path),
+                    "output_paths": [str(input_path)],
                     "original_size_mb": round(original_size_mb, 2),
                     "compressed_size_mb": round(original_size_mb, 2),
                     "reduction_percent": 0.0,
                     "compression_method": "none",
-                    "was_split": len(final_parts) > 1,
-                    "total_parts": len(final_parts),
+                    "compression_mode": compression_mode,
+                    "was_split": False,
+                    "total_parts": 1,
                     "success": True,
-                    "note": "File already optimized, split only",
+                    "note": "File already optimized, no split needed",
                     "page_count": None,
-                    "part_sizes": [p.stat().st_size for p in final_parts],
+                    "part_sizes": [input_path.stat().st_size],
                     "parallel_chunks": num_chunks
                 }
 
@@ -527,31 +637,54 @@ def compress_parallel(
             compressed_bytes = merged_path.stat().st_size
             reduction_percent = ((original_size_mb - compressed_size_mb) / original_size_mb) * 100
         else:
-            # Serial failed too - just split original
+            # Serial failed too - use original (split only if needed)
             logger.error(f"[PARALLEL] Serial compression also failed: {message}")
 
-            from split_pdf import split_by_size
-            final_parts = split_by_size(input_path, working_dir, base_name, split_threshold_mb)
+            if effective_split_trigger and original_size_mb > effective_split_trigger:
+                from split_pdf import split_by_size
+                final_parts = split_by_size(input_path, working_dir, base_name, split_threshold_mb)
+
+                return {
+                    "output_path": str(final_parts[0]),
+                    "output_paths": [str(p) for p in final_parts],
+                    "original_size_mb": round(original_size_mb, 2),
+                    "compressed_size_mb": round(original_size_mb, 2),
+                    "reduction_percent": 0.0,
+                    "compression_method": "none",
+                    "compression_mode": compression_mode,
+                    "was_split": len(final_parts) > 1,
+                    "total_parts": len(final_parts),
+                    "success": True,
+                    "note": "Compression failed, split original",
+                    "page_count": None,
+                    "part_sizes": [p.stat().st_size for p in final_parts],
+                    "parallel_chunks": num_chunks
+                }
 
             return {
-                "output_path": str(final_parts[0]),
-                "output_paths": [str(p) for p in final_parts],
+                "output_path": str(input_path),
+                "output_paths": [str(input_path)],
                 "original_size_mb": round(original_size_mb, 2),
                 "compressed_size_mb": round(original_size_mb, 2),
                 "reduction_percent": 0.0,
                 "compression_method": "none",
-                "was_split": len(final_parts) > 1,
-                "total_parts": len(final_parts),
+                "compression_mode": compression_mode,
+                "was_split": False,
+                "total_parts": 1,
                 "success": True,
-                "note": "Compression failed, split original",
+                "note": "Compression failed, no split needed",
                 "page_count": None,
-                "part_sizes": [p.stat().st_size for p in final_parts],
+                "part_sizes": [input_path.stat().st_size],
                 "parallel_chunks": num_chunks
             }
 
     # Step 5: Final split by 25MB threshold if needed
-    if compressed_size_mb > split_threshold_mb:
-        report_progress(85, "splitting", f"Splitting into parts under {split_threshold_mb}MB...")
+    if effective_split_trigger and compressed_size_mb > effective_split_trigger:
+        report_progress(
+            85,
+            "splitting",
+            f"Splitting into parts under {split_threshold_mb}MB (trigger {effective_split_trigger}MB)...",
+        )
         final_parts = split_by_size(merged_path, working_dir, base_name, split_threshold_mb)
 
         # Only delete merged file if split actually created NEW files
@@ -601,6 +734,7 @@ def compress_parallel(
             "compressed_size_mb": round(compressed_size_mb, 2),
             "reduction_percent": round(reduction_percent, 1),
             "compression_method": "ghostscript_parallel",
+            "compression_mode": compression_mode,
             "was_split": len(final_parts) > 1,  # Only true if actually split into multiple parts
             "total_parts": len(final_parts),
             "success": True,
@@ -627,6 +761,7 @@ def compress_parallel(
         "compressed_size_mb": round(compressed_size_mb, 2),
         "reduction_percent": round(reduction_percent, 1),
         "compression_method": "ghostscript_parallel",
+        "compression_mode": compression_mode,
         "was_split": False,
         "total_parts": 1,
         "success": True,

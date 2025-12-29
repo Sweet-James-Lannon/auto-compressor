@@ -1,6 +1,6 @@
 # SJ PDF Compressor
 
-Compresses PDFs and auto-splits into ≤25MB parts for email/Salesforce. Parallel Ghostscript is used for large files; sync limit is 300MB.
+Compresses PDFs and auto-splits into ≤25MB parts for email/Salesforce when output exceeds the split trigger. Parallel Ghostscript is used for large files; sync limit is 300MB.
 
 ## Usage
 
@@ -32,7 +32,7 @@ Errors return `error_type`/`error_message` (e.g., `DownloadError`, `FileTooLarge
 - Compression pipeline:
   - Downloads the PDF (or accepts upload/base64), validates header, tracks files for cleanup.
   - Uses Ghostscript; small files compress serially, big files can use parallel chunks.
-  - If output is still large, auto-splits into ≤ `SPLIT_THRESHOLD_MB` parts and logs part sizes.
+  - If output exceeds `SPLIT_TRIGGER_MB`, auto-splits into ≤ `SPLIT_THRESHOLD_MB` parts and logs part sizes.
 - Outputs are served from `/download/{file}`; `BASE_URL` makes links absolute and HTTPS for callbacks.
 - Cleanup daemon deletes old files after `FILE_RETENTION_SECONDS`.
 
@@ -68,12 +68,24 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 ## Configuration (essentials)
 
+By default the service uses aggressive compression (downsampling) to minimize
+output size. Set `ALLOW_LOSSY_COMPRESSION=0` and `COMPRESSION_MODE=lossless` to
+preserve original image quality.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `API_TOKEN` | - | Bearer token for auth (set to lock down endpoints) |
 | `BASE_URL` | empty | Public HTTPS host used to build absolute download links |
 | `SALESFORCE_CALLBACK_URL` | empty | Where to POST async results when `matterId` is present |
 | `SPLIT_THRESHOLD_MB` | 25 | Max size per output file after splitting |
+| `SPLIT_TRIGGER_MB` | 30 | Split only when output exceeds this size (parts still use `SPLIT_THRESHOLD_MB`) |
+| `SPLIT_SAFETY_BUFFER_MB` | 0 | Buffer to keep split parts under the limit (email overhead) |
+| `COMPRESSION_MODE` | aggressive | `lossless`, `aggressive`, or `adaptive` (quality vs size tradeoff) |
+| `ALLOW_LOSSY_COMPRESSION` | 1 | Set to `1` to allow downsampling/quality-reducing compression |
+| `SCANNED_CONFIDENCE_FOR_AGGRESSIVE` | 70 | Min scanned-doc confidence for adaptive aggressive mode |
+| `TARGET_CHUNK_MB` | 40 | Target chunk size for parallel compression |
+| `MAX_CHUNK_MB` | 60 | Max chunk size before re-splitting (prevents long-running chunks) |
+| `MAX_PARALLEL_CHUNKS` | 16 | Upper bound on chunk count per file |
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
 | `MIN_FILE_RETENTION_SECONDS` | 3600 | Minimum retention enforced even if `FILE_RETENTION_SECONDS` is lower |
 | `UPLOAD_FOLDER` | empty | Absolute path for storing PDFs; on Azure use a persistent path under `/home` |

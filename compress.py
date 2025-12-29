@@ -1,8 +1,8 @@
 """PDF compression using Ghostscript with optional splitting."""
 
 import logging
-import shutil
 import os
+import shutil
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
@@ -31,12 +31,49 @@ _ENV_WORKERS = int(os.environ.get("PARALLEL_MAX_WORKERS", "4"))
 MAX_PARALLEL_WORKERS = min(_ENV_WORKERS, os.cpu_count() or 2)
 # Skip compression for very small files (already optimized)
 MIN_COMPRESSION_SIZE_MB = float(os.environ.get("MIN_COMPRESSION_SIZE_MB", "1.0"))
+COMPRESSION_MODE = os.environ.get("COMPRESSION_MODE", "aggressive").lower()
+ALLOW_LOSSY_COMPRESSION = os.environ.get("ALLOW_LOSSY_COMPRESSION", "1").lower() in ("1", "true", "yes")
+SCANNED_CONFIDENCE_FOR_AGGRESSIVE = float(os.environ.get("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", "70"))
+
+
+def resolve_compression_mode(input_path: Path) -> str:
+    """Choose compression mode based on config and PDF characteristics."""
+    mode = COMPRESSION_MODE
+    if mode not in ("lossless", "aggressive", "adaptive"):
+        logger.warning(f"[compress] Unknown COMPRESSION_MODE '{mode}', defaulting to lossless")
+        mode = "lossless"
+
+    if mode == "aggressive" and not ALLOW_LOSSY_COMPRESSION:
+        logger.info("[compress] Aggressive mode requested but lossy compression disabled; using lossless")
+        return "lossless"
+
+    if mode != "adaptive":
+        return mode
+
+    if not ALLOW_LOSSY_COMPRESSION:
+        return "lossless"
+
+    try:
+        from pdf_diagnostics import detect_already_compressed, detect_scanned_document
+
+        already_compressed, _ = detect_already_compressed(input_path)
+        if already_compressed:
+            return "lossless"
+
+        is_scanned, confidence = detect_scanned_document(input_path)
+        if is_scanned and confidence >= SCANNED_CONFIDENCE_FOR_AGGRESSIVE:
+            return "aggressive"
+    except Exception as e:
+        logger.warning(f"[compress] Adaptive mode analysis failed: {e}")
+
+    return "lossless"
 
 
 def compress_pdf(
     input_path: str,
     working_dir: Optional[Path] = None,
     split_threshold_mb: Optional[float] = None,
+    split_trigger_mb: Optional[float] = None,
     progress_callback: Optional[Callable[[int, str, str], None]] = None
 ) -> Dict:
     """
@@ -48,6 +85,7 @@ def compress_pdf(
         input_path: Path to input PDF.
         working_dir: Directory for output file (default: same as input).
         split_threshold_mb: If set, split output into parts under this size.
+        split_trigger_mb: If set, only split when output exceeds this size.
         progress_callback: Optional callback(percent, stage, message) for progress updates.
 
     Returns:
@@ -95,13 +133,16 @@ def compress_pdf(
     working_dir = working_dir or input_path.parent
     original_size = get_file_size_mb(input_path)
     original_bytes = input_path.stat().st_size
+    compression_mode = resolve_compression_mode(input_path)
+    logger.info(f"[compress] Compression mode: {compression_mode} (allow_lossy={ALLOW_LOSSY_COMPRESSION})")
+    effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
 
     # Skip compression for very small files - usually already optimized
     if original_size < MIN_COMPRESSION_SIZE_MB:
         logger.info(f"[compress] Skipping {input_path.name}: {original_size:.2f}MB < {MIN_COMPRESSION_SIZE_MB}MB threshold")
 
         # Still split if above threshold (rare for small files)
-        if split_threshold_mb and original_size > split_threshold_mb:
+        if split_threshold_mb and effective_split_trigger and original_size > effective_split_trigger:
             output_paths = split_pdf.split_pdf(
                 input_path, working_dir, input_path.stem,
                 threshold_mb=split_threshold_mb,
@@ -114,6 +155,7 @@ def compress_pdf(
                 "compressed_size_mb": round(original_size, 2),
                 "reduction_percent": 0.0,
                 "compression_method": "skipped",
+                "compression_mode": compression_mode,
                 "was_split": len(output_paths) > 1,
                 "total_parts": len(output_paths),
                 "success": True,
@@ -129,6 +171,7 @@ def compress_pdf(
             "compressed_size_mb": round(original_size, 2),
             "reduction_percent": 0.0,
             "compression_method": "skipped",
+            "compression_mode": compression_mode,
             "was_split": False,
             "total_parts": 1,
             "success": True,
@@ -149,8 +192,10 @@ def compress_pdf(
             working_dir=working_dir,
             base_name=input_path.stem,
             split_threshold_mb=split_threshold_mb or 25.0,
+            split_trigger_mb=effective_split_trigger,
             progress_callback=progress_callback,
-            max_workers=MAX_PARALLEL_WORKERS
+            max_workers=MAX_PARALLEL_WORKERS,
+            compression_mode=compression_mode
         )
 
     # =========================================================================
@@ -162,7 +207,12 @@ def compress_pdf(
     report_progress(15, "compressing", "Compressing PDF...")
 
     # Try Ghostscript compression
-    success, message = compress_ghostscript.compress_pdf_with_ghostscript(input_path, output_path)
+    compress_fn = (
+        compress_ghostscript.compress_pdf_lossless
+        if compression_mode == "lossless"
+        else compress_ghostscript.compress_pdf_with_ghostscript
+    )
+    success, message = compress_fn(input_path, output_path)
 
     if not success:
         # Map error message to specific exception type
@@ -195,7 +245,7 @@ def compress_pdf(
         compressed_size = original_size
 
         # Check if we still need to split the original
-        if split_threshold_mb and compressed_size > split_threshold_mb:
+        if split_threshold_mb and effective_split_trigger and compressed_size > effective_split_trigger:
             output_paths = split_pdf.split_pdf(
                 output_path, working_dir, input_path.stem,
                 threshold_mb=split_threshold_mb,
@@ -208,6 +258,7 @@ def compress_pdf(
                 "compressed_size_mb": round(original_size, 2),
                 "reduction_percent": 0.0,
                 "compression_method": "none",
+                "compression_mode": compression_mode,
                 "was_split": len(output_paths) > 1,
                 "total_parts": len(output_paths),
                 "success": True,
@@ -224,6 +275,7 @@ def compress_pdf(
             "compressed_size_mb": round(original_size, 2),
             "reduction_percent": 0.0,
             "compression_method": "none",
+            "compression_mode": compression_mode,
             "was_split": False,
             "total_parts": 1,
             "success": True,
@@ -237,7 +289,7 @@ def compress_pdf(
     logger.info(f"Done: {original_size:.1f}MB -> {compressed_size:.1f}MB ({reduction:.1f}%)")
 
     # Check if splitting is needed
-    if split_threshold_mb and compressed_size > split_threshold_mb:
+    if split_threshold_mb and effective_split_trigger and compressed_size > effective_split_trigger:
         logger.info(f"Compressed file still {compressed_size:.1f}MB, splitting...")
         report_progress(70, "splitting", "Splitting into parts...")
 
@@ -261,6 +313,7 @@ def compress_pdf(
             "compressed_size_mb": round(compressed_size, 2),
             "reduction_percent": round(reduction, 1),
             "compression_method": "ghostscript",
+            "compression_mode": compression_mode,
             "was_split": len(output_paths) > 1,
             "total_parts": len(output_paths),
             "success": True,
@@ -281,6 +334,7 @@ def compress_pdf(
         "compressed_size_mb": round(compressed_size, 2),
         "reduction_percent": round(reduction, 1),
         "compression_method": "ghostscript",
+        "compression_mode": compression_mode,
         "was_split": False,
         "total_parts": 1,
         "success": True,

@@ -83,6 +83,9 @@ FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400')) 
 MIN_FILE_RETENTION_SECONDS = int(os.environ.get('MIN_FILE_RETENTION_SECONDS', '3600'))  # 1 hour minimum
 EFFECTIVE_FILE_RETENTION_SECONDS = max(FILE_RETENTION_SECONDS, MIN_FILE_RETENTION_SECONDS)
 SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
+# Split only when output exceeds this size, but keep parts under SPLIT_THRESHOLD_MB.
+_split_trigger = float(os.environ.get("SPLIT_TRIGGER_MB", "30"))
+SPLIT_TRIGGER_MB = max(SPLIT_THRESHOLD_MB, _split_trigger)
 # Cap SYNC_MAX_MB at the hard ceiling even if env is higher
 SYNC_MAX_MB = min(float(os.environ.get("SYNC_MAX_MB", str(HARD_SYNC_LIMIT_MB))), HARD_SYNC_LIMIT_MB)
 # Async jobs can be larger than sync, but still need a hard ceiling to protect the instance.
@@ -380,6 +383,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             str(input_path),
             working_dir=UPLOAD_FOLDER,
             split_threshold_mb=SPLIT_THRESHOLD_MB,
+            split_trigger_mb=SPLIT_TRIGGER_MB,
             progress_callback=progress_callback
         )
 
@@ -440,6 +444,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             "compressed_mb": result['compressed_size_mb'],
             "reduction_percent": result['reduction_percent'],
             "compression_method": result['compression_method'],
+            "compression_mode": result.get("compression_mode"),
             "request_id": job_id,
             "page_count": result.get('page_count'),
             "part_sizes": result.get('part_sizes'),
@@ -802,7 +807,10 @@ def compress_sync():
                     "error_message": "Downloaded file is not a valid PDF"
                 }), 400
             downloaded_mb = input_path.stat().st_size / (1024 * 1024)
-            logger.info(f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB (will split if > {SPLIT_THRESHOLD_MB}MB)")
+            logger.info(
+                f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB "
+                f"(will split if > {SPLIT_TRIGGER_MB}MB into {SPLIT_THRESHOLD_MB}MB parts)"
+            )
 
         elif request.files and 'file' in request.files:
             # Dashboard flow - direct file upload
@@ -891,7 +899,8 @@ def compress_sync():
             return compress_pdf(
                 str(input_path),
                 working_dir=UPLOAD_FOLDER,
-                split_threshold_mb=SPLIT_THRESHOLD_MB
+                split_threshold_mb=SPLIT_THRESHOLD_MB,
+                split_trigger_mb=SPLIT_TRIGGER_MB
             )
 
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -958,7 +967,8 @@ def compress_sync():
             "compressed_mb": result['compressed_size_mb'],
             "was_split": result.get('was_split', False),
             "total_parts": result.get('total_parts', 1),
-            "part_sizes": part_sizes  # Individual file sizes in bytes for verification
+            "part_sizes": part_sizes,  # Individual file sizes in bytes for verification
+            "compression_mode": result.get("compression_mode"),
         })
 
     except DownloadError as e:

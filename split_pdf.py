@@ -6,6 +6,7 @@ the size threshold into smaller parts for email attachment limits.
 
 import logging
 import math
+import os
 import shutil
 import subprocess
 import uuid
@@ -28,7 +29,9 @@ from utils import get_file_size_mb
 # Outlook/Exchange has ~25MB limit but this includes email headers/body overhead
 # Target slightly under 25MB to leave room for email overhead
 DEFAULT_THRESHOLD_MB: float = 25.0
-SAFETY_BUFFER_MB: float = 1.5  # Buffer for email headers/body overhead (target ~23.5MB parts)
+_safety_buffer = float(os.environ.get("SPLIT_SAFETY_BUFFER_MB", "0"))
+SAFETY_BUFFER_MB: float = max(0.0, _safety_buffer)
+ALLOW_LOSSY_COMPRESSION: bool = os.environ.get("ALLOW_LOSSY_COMPRESSION", "1").lower() in ("1", "true", "yes")
 
 logger = logging.getLogger(__name__)
 
@@ -534,9 +537,12 @@ def split_pdf(
                             f"(over target {target_size:.1f}MB, under limit {threshold_mb:.1f}MB)."
                         )
                     else:
+                        hint = ""
+                        if not ALLOW_LOSSY_COMPRESSION:
+                            hint = " Lossy compression is disabled; enable ALLOW_LOSSY_COMPRESSION=1 to allow downsampling."
                         raise SplitError(
                             f"Cannot split {pdf_path.name}: page {start_page + 1} alone is "
-                            f"{single_page_size:.1f}MB, exceeding the {threshold_mb:.1f}MB limit."
+                            f"{single_page_size:.1f}MB, exceeding the {threshold_mb:.1f}MB limit.{hint}"
                         )
 
                 page_ranges.append((start_page, best_end))
@@ -612,14 +618,14 @@ def split_pdf(
                         candidate_path.unlink(missing_ok=True)
 
                 # If still over the hard limit, try progressively more aggressive compression.
-                if current_size_mb > threshold_mb:
+                if current_size_mb > threshold_mb and ALLOW_LOSSY_COMPRESSION:
                     logger.info(
                         f"Part {part_num} is {current_size_mb:.1f}MB (> {threshold_mb:.1f}MB), "
                         f"trying full compression..."
                     )
                     try_replace_with_smaller("Full compression", ".compressed.pdf", compress_pdf_with_ghostscript)
 
-                if current_size_mb > threshold_mb:
+                if current_size_mb > threshold_mb and ALLOW_LOSSY_COMPRESSION:
                     logger.warning(
                         f"Part {part_num} still {current_size_mb:.1f}MB (> {threshold_mb:.1f}MB), "
                         f"trying ultra compression (quality reduction)..."
@@ -629,6 +635,13 @@ def split_pdf(
                         return compress_ultra_aggressive(inp, out)
 
                     try_replace_with_smaller("Ultra compression", ".ultra.pdf", ultra_fn)
+                elif current_size_mb > threshold_mb and not ALLOW_LOSSY_COMPRESSION:
+                    logger.warning(
+                        "Part %s remains %.1fMB (> %.1fMB). Lossy compression disabled; keeping lossless output.",
+                        part_num,
+                        current_size_mb,
+                        threshold_mb,
+                    )
 
                 if not part_path.exists():
                     raise SplitError(f"Failed to create part {part_num}: file not written")
