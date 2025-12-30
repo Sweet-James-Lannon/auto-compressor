@@ -86,6 +86,9 @@ preserve original image quality.
 | `TARGET_CHUNK_MB` | 40 | Target chunk size for parallel compression |
 | `MAX_CHUNK_MB` | 60 | Max chunk size before re-splitting (prevents long-running chunks) |
 | `MAX_PARALLEL_CHUNKS` | 16 | Upper bound on chunk count per file |
+| `MAX_PAGES_PER_CHUNK` | 200 | Cap pages per chunk to avoid very large per-chunk workloads |
+| `GS_NUM_RENDERING_THREADS` | unset | Override Ghostscript rendering threads (serial/optimize passes) |
+| `SPLIT_OPTIMIZE_MAX_OVERAGE_MB` | 1.0 | Skip optimizing page-split parts that exceed the limit by more than this |
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
 | `MIN_FILE_RETENTION_SECONDS` | 3600 | Minimum retention enforced even if `FILE_RETENTION_SECONDS` is lower |
 | `UPLOAD_FOLDER` | empty | Absolute path for storing PDFs; on Azure use a persistent path under `/home` |
@@ -93,6 +96,24 @@ preserve original image quality.
 | `SYNC_AUTO_ASYNC_MB` | 120 | Auto-queue sync requests above this size and return `202` + job_id |
 | `ASYNC_MAX_MB` | 450 | Max PDF size allowed for async jobs (downloaded via signed URL) |
 | `DISABLE_ASYNC_WORKERS` | unset | Set to `1` to disable background workers |
+
+## Ghostscript CPU usage (notes)
+
+Based on the Ghostscript docs (https://www.ghostscript.com/doc/Use.html and
+https://www.ghostscript.com/doc/Language.html):
+
+- `-dNumRenderingThreads` can use multiple CPU cores when banding/clist rendering;
+  docs recommend setting it to the number of available cores for best throughput.
+- `BandHeight` controls band size, and `BandBufferSpace` limits band buffer memory.
+  The docs note that if you only want to allocate more memory for banding, use
+  `BufferSpace` instead of `BandBufferSpace`.
+- Some vector devices (including `pdfwrite`) only write output on exit; changing
+  `OutputFile` mid-run flushes the pages received so far and then starts a new file.
+
+In this service:
+- We run multiple Ghostscript processes in parallel for large PDFs, so per-process
+  rendering threads are scaled down to avoid oversubscribing CPU cores.
+- You can override per-process thread count with `GS_NUM_RENDERING_THREADS` if needed.
 
 ## Deployment notes
 

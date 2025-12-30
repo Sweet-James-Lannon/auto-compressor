@@ -32,6 +32,8 @@ DEFAULT_THRESHOLD_MB: float = 25.0
 _safety_buffer = float(os.environ.get("SPLIT_SAFETY_BUFFER_MB", "0"))
 SAFETY_BUFFER_MB: float = max(0.0, _safety_buffer)
 ALLOW_LOSSY_COMPRESSION: bool = os.environ.get("ALLOW_LOSSY_COMPRESSION", "1").lower() in ("1", "true", "yes")
+_opt_overage = float(os.environ.get("SPLIT_OPTIMIZE_MAX_OVERAGE_MB", "1.0"))
+SPLIT_OPTIMIZE_MAX_OVERAGE_MB: float = max(0.0, _opt_overage)
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +243,17 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
             writer.write(f)
 
         raw_size = get_file_size_mb(temp_part_path)
+        overage_mb = raw_size - threshold_mb
+
+        if overage_mb > SPLIT_OPTIMIZE_MAX_OVERAGE_MB:
+            logger.warning(
+                f"[split_by_size] Part {i+1} is {raw_size:.2f}MB (>{threshold_mb:.2f}MB by {overage_mb:.2f}MB); "
+                "skipping optimization and switching to size-based splitter..."
+            )
+            temp_part_path.unlink(missing_ok=True)
+            for p in output_paths:
+                p.unlink(missing_ok=True)
+            return split_pdf(pdf_path, output_dir, base_name, threshold_mb)
 
         # Optimize with Ghostscript to deduplicate resources (critical for size reduction)
         part_path = output_dir / f"{base_name}_part{i+1}.pdf"

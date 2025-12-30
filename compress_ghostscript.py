@@ -17,9 +17,32 @@ logger = logging.getLogger(__name__)
 TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "40"))
 MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(TARGET_CHUNK_MB * 1.5)))
 MAX_PARALLEL_CHUNKS = int(os.environ.get("MAX_PARALLEL_CHUNKS", "16"))
+MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
 
 
-def optimize_split_part(input_path: Path, output_path: Path) -> Tuple[bool, str]:
+def _resolve_gs_threads(num_threads: Optional[int]) -> int:
+    """Resolve Ghostscript rendering threads, honoring explicit and env overrides."""
+    if num_threads is not None:
+        try:
+            return max(1, int(num_threads))
+        except (TypeError, ValueError):
+            return 1
+
+    env_threads = os.environ.get("GS_NUM_RENDERING_THREADS")
+    if env_threads:
+        try:
+            return max(1, int(env_threads))
+        except ValueError:
+            return 1
+
+    return 4
+
+
+def optimize_split_part(
+    input_path: Path,
+    output_path: Path,
+    num_threads: Optional[int] = None,
+) -> Tuple[bool, str]:
     """
     Lightweight optimization for split PDF parts - removes duplicate resources
     without re-encoding images.
@@ -34,10 +57,20 @@ def optimize_split_part(input_path: Path, output_path: Path) -> Tuple[bool, str]
     Returns:
         (success, message) tuple
     """
-    return _run_lossless_ghostscript(input_path, output_path, "Optimizing split part")
+    return _run_lossless_ghostscript(
+        input_path,
+        output_path,
+        "Optimizing split part",
+        num_threads=num_threads,
+    )
 
 
-def _run_lossless_ghostscript(input_path: Path, output_path: Path, label: str) -> Tuple[bool, str]:
+def _run_lossless_ghostscript(
+    input_path: Path,
+    output_path: Path,
+    label: str,
+    num_threads: Optional[int] = None,
+) -> Tuple[bool, str]:
     """Run Ghostscript with lossless settings (no downsampling, pass-through images)."""
     gs_cmd = get_ghostscript_command()
     if not gs_cmd:
@@ -49,6 +82,7 @@ def _run_lossless_ghostscript(input_path: Path, output_path: Path, label: str) -
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Use /default - preserves quality, just de-duplicates resources.
+    threads = _resolve_gs_threads(num_threads)
     cmd = [
         gs_cmd,
         "-sDEVICE=pdfwrite",
@@ -57,6 +91,7 @@ def _run_lossless_ghostscript(input_path: Path, output_path: Path, label: str) -
         "-dNOPAUSE",
         "-dBATCH",
         "-dQUIET",
+        f"-dNumRenderingThreads={threads}",
         # Prevent any image downsampling or re-encoding.
         "-dDownsampleColorImages=false",
         "-dDownsampleGrayImages=false",
@@ -98,9 +133,18 @@ def _run_lossless_ghostscript(input_path: Path, output_path: Path, label: str) -
         return False, str(e)
 
 
-def compress_pdf_lossless(input_path: Path, output_path: Path) -> Tuple[bool, str]:
+def compress_pdf_lossless(
+    input_path: Path,
+    output_path: Path,
+    num_threads: Optional[int] = None,
+) -> Tuple[bool, str]:
     """Lossless PDF optimization using Ghostscript (no downsampling)."""
-    return _run_lossless_ghostscript(input_path, output_path, "Lossless optimize")
+    return _run_lossless_ghostscript(
+        input_path,
+        output_path,
+        "Lossless optimize",
+        num_threads=num_threads,
+    )
 
 
 def get_ghostscript_command() -> Optional[str]:
@@ -144,7 +188,11 @@ def translate_ghostscript_error(stderr: str, return_code: int) -> str:
     return f"PDF processing failed (Ghostscript exit code {return_code}). The file may be corrupted."
 
 
-def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[bool, str]:
+def compress_pdf_with_ghostscript(
+    input_path: Path,
+    output_path: Path,
+    num_threads: Optional[int] = None,
+) -> Tuple[bool, str]:
     """
     Compress scanned PDF using Ghostscript at 72 DPI with JPEG encoding.
 
@@ -170,6 +218,7 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
 
     # 72 DPI + DCTEncode: Best compression for scanned legal documents
     # Higher DPI (150, 200) often makes JPEG2000 files BIGGER
+    threads = _resolve_gs_threads(num_threads)
     cmd = [
         gs_cmd,
         "-sDEVICE=pdfwrite",
@@ -204,7 +253,7 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
         "-dFastWebView=true",
         "-dPrinted=false",
         # Speed optimizations (NO effect on compression ratio)
-        "-dNumRenderingThreads=4",
+        f"-dNumRenderingThreads={threads}",
         "-dBandHeight=100",
         "-dBandBufferSpace=500000000",
         f"-sOutputFile={output_path}",
@@ -238,7 +287,12 @@ def compress_pdf_with_ghostscript(input_path: Path, output_path: Path) -> Tuple[
         return False, str(e)
 
 
-def compress_ultra_aggressive(input_path: Path, output_path: Path, jpeg_quality: int = 50) -> Tuple[bool, str]:
+def compress_ultra_aggressive(
+    input_path: Path,
+    output_path: Path,
+    jpeg_quality: int = 50,
+    num_threads: Optional[int] = None,
+) -> Tuple[bool, str]:
     """
     Ultra-aggressive compression for oversized split parts.
 
@@ -256,6 +310,7 @@ def compress_ultra_aggressive(input_path: Path, output_path: Path, jpeg_quality:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # /screen preset + lower JPEG quality for maximum size reduction.
+    threads = _resolve_gs_threads(num_threads)
     cmd = [
         gs_cmd,
         "-sDEVICE=pdfwrite",
@@ -288,6 +343,7 @@ def compress_ultra_aggressive(input_path: Path, output_path: Path, jpeg_quality:
         "-dCompressFonts=true",
         "-dSubsetFonts=true",
         "-dFastWebView=true",
+        f"-dNumRenderingThreads={threads}",
         f"-sOutputFile={output_path}",
         str(input_path),
     ]
@@ -397,7 +453,26 @@ def compress_parallel(
     # Step 1: Calculate number of chunks targeting the configured size.
     # Do NOT cap by max_workers; extra chunks are processed by the thread pool in batches.
     # This keeps each Ghostscript run shorter on very large files (300MB), reducing timeouts.
-    num_chunks = max(2, min(max_parallel_chunks, math.ceil(original_size_mb / target_chunk_mb)))
+    num_chunks_by_size = math.ceil(original_size_mb / target_chunk_mb)
+
+    try:
+        from PyPDF2 import PdfReader
+
+        with open(input_path, "rb") as f:
+            total_pages = len(PdfReader(f, strict=False).pages)
+    except Exception:
+        total_pages = None
+
+    num_chunks_by_pages = 1
+    if total_pages and MAX_PAGES_PER_CHUNK > 0:
+        num_chunks_by_pages = math.ceil(total_pages / MAX_PAGES_PER_CHUNK)
+
+    num_chunks = max(2, min(max_parallel_chunks, max(num_chunks_by_size, num_chunks_by_pages)))
+    if total_pages:
+        logger.info(
+            f"[PARALLEL] Total pages: {total_pages}, max pages/chunk: {MAX_PAGES_PER_CHUNK}, "
+            f"page-based chunks: {num_chunks_by_pages}"
+        )
     report_progress(
         5,
         "splitting",
@@ -411,14 +486,17 @@ def compress_parallel(
         from PyPDF2 import PdfReader
 
         balanced: List[Path] = []
-        for chunk_path in chunks:
+        pending: List[Path] = list(chunks)
+
+        while pending:
+            chunk_path = pending.pop(0)
             size_mb = get_file_size_mb(chunk_path)
             if size_mb <= max_chunk_mb:
                 balanced.append(chunk_path)
                 continue
 
-            remaining_slots = max_parallel_chunks - len(balanced)
-            if remaining_slots <= 1:
+            remaining_slots = max_parallel_chunks - (len(balanced) + len(pending))
+            if remaining_slots <= 0:
                 balanced.append(chunk_path)
                 continue
 
@@ -435,7 +513,7 @@ def compress_parallel(
                 continue
 
             split_count = min(split_count, total_pages)
-            split_count = min(split_count, remaining_slots)
+            split_count = min(split_count, remaining_slots + 1)
 
             if split_count <= 1:
                 balanced.append(chunk_path)
@@ -446,7 +524,7 @@ def compress_parallel(
             )
             sub_chunks = split_by_pages(chunk_path, working_dir, split_count, chunk_path.stem)
             chunk_path.unlink(missing_ok=True)
-            balanced.extend(sub_chunks)
+            pending = sub_chunks + pending
 
         return balanced
 
@@ -463,7 +541,7 @@ def compress_parallel(
         """Compress a single chunk and return result."""
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
-        success, message = compress_fn(chunk_path, compressed_path)
+        success, message = compress_fn(chunk_path, compressed_path, num_threads=gs_threads)
 
         # If Ghostscript "compression" makes this chunk larger, keep the original chunk.
         # This is common for vector/text-heavy PDFs where re-encoding can bloat output.
@@ -490,6 +568,13 @@ def compress_parallel(
     failed_chunks = []
 
     worker_count = min(max_workers, len(chunk_paths)) if chunk_paths else max_workers
+    cpu_count = os.cpu_count() or 2
+    per_worker_threads = max(1, cpu_count // max(worker_count, 1))
+    gs_threads = max(1, min(4, per_worker_threads))
+    logger.info(
+        f"[PARALLEL] Ghostscript threads per worker: {gs_threads} "
+        f"(cpu={cpu_count}, workers={worker_count})"
+    )
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         # Submit all compression jobs
         futures = {
@@ -568,7 +653,8 @@ def compress_parallel(
         report_progress(40, "compressing", "Parallel failed, trying serial compression...")
 
         serial_output = working_dir / f"{base_name}_serial_compressed.pdf"
-        success, message = compress_fn(input_path, serial_output)
+        serial_threads = max(1, min(4, cpu_count))
+        success, message = compress_fn(input_path, serial_output, num_threads=serial_threads)
 
         if success and serial_output.exists():
             serial_size_mb = get_file_size_mb(serial_output)
@@ -717,13 +803,15 @@ def compress_parallel(
         if missing_parts:
             raise SplitError(f"Parallel split output incomplete: {', '.join(missing_parts)}")
 
-        # Get page count from original
-        from PyPDF2 import PdfReader
-        try:
-            with open(input_path, 'rb') as f:
-                page_count = len(PdfReader(f, strict=False).pages)
-        except Exception:
-            page_count = None
+        # Get page count from original (reuse cached value when available)
+        page_count = total_pages
+        if page_count is None:
+            from PyPDF2 import PdfReader
+            try:
+                with open(input_path, 'rb') as f:
+                    page_count = len(PdfReader(f, strict=False).pages)
+            except Exception:
+                page_count = None
 
         report_progress(100, "complete", f"Complete: {len(final_parts)} parts")
 
@@ -746,13 +834,15 @@ def compress_parallel(
     # No split needed - return single file
     report_progress(100, "complete", "Compression complete")
 
-    # Get page count
-    from PyPDF2 import PdfReader
-    try:
-        with open(input_path, 'rb') as f:
-            page_count = len(PdfReader(f, strict=False).pages)
-    except Exception:
-        page_count = None
+    # Get page count (reuse cached value when available)
+    page_count = total_pages
+    if page_count is None:
+        from PyPDF2 import PdfReader
+        try:
+            with open(input_path, 'rb') as f:
+                page_count = len(PdfReader(f, strict=False).pages)
+        except Exception:
+            page_count = None
 
     return {
         "output_path": str(merged_path),
