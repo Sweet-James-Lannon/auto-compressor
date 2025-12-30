@@ -97,6 +97,11 @@ BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
 SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "540"))
 # Auto-switch large sync requests to async to avoid HTTP timeouts.
 SYNC_AUTO_ASYNC_MB = float(os.environ.get("SYNC_AUTO_ASYNC_MB", "120"))
+_DEFAULT_ASYNC_WORKERS = max(1, min(2, utils.get_effective_cpu_count()))
+try:
+    ASYNC_WORKERS = max(1, int(os.environ.get("ASYNC_WORKERS", str(_DEFAULT_ASYNC_WORKERS))))
+except ValueError:
+    ASYNC_WORKERS = _DEFAULT_ASYNC_WORKERS
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -521,7 +526,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
 
 # Configure and start job queue worker
 job_queue.set_processor(process_compression_job)
-job_queue.start_workers(8)
+job_queue.start_workers(ASYNC_WORKERS)
 
 
 # Error handlers

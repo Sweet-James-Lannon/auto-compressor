@@ -7,6 +7,7 @@ Contains:
 
 import ipaddress
 import logging
+import os
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 
@@ -31,6 +32,81 @@ def get_file_size_mb(path: Path) -> float:
         File size in MB.
     """
     return path.stat().st_size / (1024 * 1024)
+
+
+def _parse_cpu_list(cpu_list: str) -> int:
+    """Parse cpuset list format like '0-3,5' into a CPU count."""
+    count = 0
+    for part in cpu_list.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            try:
+                count += int(end) - int(start) + 1
+            except ValueError:
+                return 0
+        else:
+            try:
+                int(part)
+            except ValueError:
+                return 0
+            count += 1
+    return count
+
+
+def get_effective_cpu_count(default: int = 1) -> int:
+    """Return effective CPU count, respecting cgroup quotas when present."""
+    host_count = os.cpu_count() or default
+    quota_count = None
+
+    # cgroup v2
+    cpu_max = Path("/sys/fs/cgroup/cpu.max")
+    if cpu_max.exists():
+        try:
+            quota_str, period_str = cpu_max.read_text().strip().split()[:2]
+            if quota_str != "max":
+                quota = int(quota_str)
+                period = int(period_str)
+                if quota > 0 and period > 0:
+                    quota_count = max(1, int(quota / period))
+        except Exception:
+            quota_count = None
+
+    # cgroup v1
+    if quota_count is None:
+        quota_path = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        period_path = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        if quota_path.exists() and period_path.exists():
+            try:
+                quota = int(quota_path.read_text().strip())
+                period = int(period_path.read_text().strip())
+                if quota > 0 and period > 0:
+                    quota_count = max(1, int(quota / period))
+            except Exception:
+                quota_count = None
+
+    cpuset_count = None
+    for cpuset_path in (
+        Path("/sys/fs/cgroup/cpuset.cpus.effective"),
+        Path("/sys/fs/cgroup/cpuset.cpus"),
+    ):
+        if cpuset_path.exists():
+            cpu_list = cpuset_path.read_text().strip()
+            if cpu_list:
+                count = _parse_cpu_list(cpu_list)
+                if count:
+                    cpuset_count = count
+                    break
+
+    effective = host_count
+    if quota_count:
+        effective = min(effective, quota_count)
+    if cpuset_count:
+        effective = min(effective, cpuset_count)
+
+    return max(default, effective)
 
 
 def _is_safe_url(url: str) -> bool:

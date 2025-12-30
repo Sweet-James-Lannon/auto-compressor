@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from exceptions import SplitError
+from utils import get_effective_cpu_count
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,8 @@ def _resolve_gs_threads(num_threads: Optional[int]) -> int:
         except ValueError:
             return 1
 
-    return 4
+    effective_cpu = get_effective_cpu_count()
+    return max(1, min(4, effective_cpu))
 
 
 def optimize_split_part(
@@ -568,12 +570,30 @@ def compress_parallel(
     failed_chunks = []
 
     worker_count = min(max_workers, len(chunk_paths)) if chunk_paths else max_workers
-    cpu_count = os.cpu_count() or 2
-    per_worker_threads = max(1, cpu_count // max(worker_count, 1))
-    gs_threads = max(1, min(4, per_worker_threads))
+    effective_cpu = get_effective_cpu_count()
+    per_worker_cap = max(1, effective_cpu // max(worker_count, 1))
+
+    env_threads = os.environ.get("GS_NUM_RENDERING_THREADS")
+    if env_threads:
+        try:
+            desired_threads = max(1, int(env_threads))
+        except ValueError:
+            desired_threads = per_worker_cap
+        if desired_threads > per_worker_cap:
+            logger.info(
+                "[PARALLEL] GS_NUM_RENDERING_THREADS=%s capped to %s based on cpu/workers",
+                desired_threads,
+                per_worker_cap,
+            )
+            gs_threads = per_worker_cap
+        else:
+            gs_threads = desired_threads
+    else:
+        gs_threads = max(1, min(4, per_worker_cap))
+
     logger.info(
         f"[PARALLEL] Ghostscript threads per worker: {gs_threads} "
-        f"(cpu={cpu_count}, workers={worker_count})"
+        f"(cpu={effective_cpu}, workers={worker_count})"
     )
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         # Submit all compression jobs
@@ -653,7 +673,7 @@ def compress_parallel(
         report_progress(40, "compressing", "Parallel failed, trying serial compression...")
 
         serial_output = working_dir / f"{base_name}_serial_compressed.pdf"
-        serial_threads = max(1, min(4, cpu_count))
+        serial_threads = _resolve_gs_threads(None)
         success, message = compress_fn(input_path, serial_output, num_threads=serial_threads)
 
         if success and serial_output.exists():

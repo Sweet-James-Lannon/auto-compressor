@@ -89,6 +89,7 @@ preserve original image quality.
 | `MAX_PAGES_PER_CHUNK` | 200 | Cap pages per chunk to avoid very large per-chunk workloads |
 | `GS_NUM_RENDERING_THREADS` | unset | Override Ghostscript rendering threads (serial/optimize passes) |
 | `SPLIT_OPTIMIZE_MAX_OVERAGE_MB` | 1.0 | Skip optimizing page-split parts that exceed the limit by more than this |
+| `ASYNC_WORKERS` | auto | Background job worker threads (defaults to `min(2, effective_cpu)`) |
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
 | `MIN_FILE_RETENTION_SECONDS` | 3600 | Minimum retention enforced even if `FILE_RETENTION_SECONDS` is lower |
 | `UPLOAD_FOLDER` | empty | Absolute path for storing PDFs; on Azure use a persistent path under `/home` |
@@ -111,8 +112,10 @@ https://www.ghostscript.com/doc/Language.html):
   `OutputFile` mid-run flushes the pages received so far and then starts a new file.
 
 In this service:
+- We detect effective CPU limits from cgroup quotas (not the host CPU count) to
+  avoid oversubscribing containers.
 - We run multiple Ghostscript processes in parallel for large PDFs, so per-process
-  rendering threads are scaled down to avoid oversubscribing CPU cores.
+  rendering threads are capped to the effective CPU share.
 - You can override per-process thread count with `GS_NUM_RENDERING_THREADS` if needed.
 
 ## Deployment notes
