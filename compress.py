@@ -4,14 +4,13 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 from PyPDF2 import PdfReader
 
 import compress_ghostscript
 import split_pdf
 from exceptions import (
-    PDFCompressionError,
     EncryptionError,
     StructureError,
     MetadataCorruptionError,
@@ -27,9 +26,23 @@ logger = logging.getLogger(__name__)
 # Set to 30MB - serial compression can timeout on files 40MB+ due to slow Ghostscript settings
 PARALLEL_THRESHOLD_MB = 30.0
 # Cap workers to env or available CPU to avoid thrash on small instances
-_EFFECTIVE_CPU = get_effective_cpu_count()
-_ENV_WORKERS = int(os.environ.get("PARALLEL_MAX_WORKERS", str(_EFFECTIVE_CPU or 2)))
-MAX_PARALLEL_WORKERS = max(1, min(_ENV_WORKERS, _EFFECTIVE_CPU or 2))
+def _resolve_parallel_workers(effective_cpu: Optional[int] = None) -> Tuple[int, Optional[int]]:
+    """Resolve max parallel worker count at call time to respect dynamic CPU limits."""
+    if effective_cpu is None:
+        effective_cpu = get_effective_cpu_count()
+
+    env_value = os.environ.get("PARALLEL_MAX_WORKERS")
+    env_workers = None
+    if env_value:
+        try:
+            env_workers = max(1, int(env_value))
+        except ValueError:
+            logger.warning("[compress] Invalid PARALLEL_MAX_WORKERS=%s; using effective CPU", env_value)
+            env_workers = None
+
+    max_workers = env_workers if env_workers is not None else effective_cpu
+    return max(1, min(max_workers, effective_cpu)), env_workers
+
 # Skip compression for very small files (already optimized)
 MIN_COMPRESSION_SIZE_MB = float(os.environ.get("MIN_COMPRESSION_SIZE_MB", "1.0"))
 COMPRESSION_MODE = os.environ.get("COMPRESSION_MODE", "aggressive").lower()
@@ -144,10 +157,11 @@ def compress_pdf(
 
         # Still split if above threshold (rare for small files)
         if split_threshold_mb and effective_split_trigger and original_size > effective_split_trigger:
-            output_paths = split_pdf.split_pdf(
+            output_paths = split_pdf.split_for_delivery(
                 input_path, working_dir, input_path.stem,
                 threshold_mb=split_threshold_mb,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                prefer_binary=True
             )
             return {
                 "output_path": str(output_paths[0]),
@@ -188,6 +202,15 @@ def compress_pdf(
     # =========================================================================
     if original_size > PARALLEL_THRESHOLD_MB:
         logger.info(f"[PARALLEL] File {original_size:.1f}MB > {PARALLEL_THRESHOLD_MB}MB threshold, using parallel compression")
+        effective_cpu = get_effective_cpu_count()
+        max_workers, env_workers = _resolve_parallel_workers(effective_cpu)
+        env_label = env_workers if env_workers is not None else "unset"
+        logger.info(
+            "[PARALLEL] Worker cap: max_workers=%s (cpu=%s, PARALLEL_MAX_WORKERS=%s)",
+            max_workers,
+            effective_cpu,
+            env_label,
+        )
         return compress_ghostscript.compress_parallel(
             input_path=input_path,
             working_dir=working_dir,
@@ -195,7 +218,7 @@ def compress_pdf(
             split_threshold_mb=split_threshold_mb or 25.0,
             split_trigger_mb=effective_split_trigger,
             progress_callback=progress_callback,
-            max_workers=MAX_PARALLEL_WORKERS,
+            max_workers=max_workers,
             compression_mode=compression_mode
         )
 
@@ -247,10 +270,11 @@ def compress_pdf(
 
         # Check if we still need to split the original
         if split_threshold_mb and effective_split_trigger and compressed_size > effective_split_trigger:
-            output_paths = split_pdf.split_pdf(
+            output_paths = split_pdf.split_for_delivery(
                 output_path, working_dir, input_path.stem,
                 threshold_mb=split_threshold_mb,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                prefer_binary=True
             )
             return {
                 "output_path": str(output_paths[0]),
@@ -294,10 +318,11 @@ def compress_pdf(
         logger.info(f"Compressed file still {compressed_size:.1f}MB, splitting...")
         report_progress(70, "splitting", "Splitting into parts...")
 
-        output_paths = split_pdf.split_pdf(
+        output_paths = split_pdf.split_for_delivery(
             output_path, working_dir, input_path.stem,
             threshold_mb=split_threshold_mb,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            prefer_binary=True
         )
 
         # Log size of each split part

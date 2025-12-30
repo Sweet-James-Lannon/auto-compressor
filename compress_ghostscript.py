@@ -420,7 +420,7 @@ def compress_parallel(
         Dict with output_path(s), sizes, reduction_percent, etc.
     """
     # Import here to avoid circular imports
-    from split_pdf import split_by_pages, merge_pdfs, split_by_size
+    from split_pdf import split_by_pages, merge_pdfs, split_for_delivery
     from utils import get_file_size_mb
 
     input_path = Path(input_path)
@@ -686,8 +686,12 @@ def compress_parallel(
 
                 if effective_split_trigger and original_size_mb > effective_split_trigger:
                     # Split the original file without compression
-                    from split_pdf import split_by_size
-                    final_parts = split_by_size(input_path, working_dir, base_name, split_threshold_mb)
+                    final_parts = split_for_delivery(
+                        input_path,
+                        working_dir,
+                        base_name,
+                        split_threshold_mb,
+                    )
 
                     return {
                         "output_path": str(final_parts[0]),
@@ -747,8 +751,12 @@ def compress_parallel(
             logger.error(f"[PARALLEL] Serial compression also failed: {message}")
 
             if effective_split_trigger and original_size_mb > effective_split_trigger:
-                from split_pdf import split_by_size
-                final_parts = split_by_size(input_path, working_dir, base_name, split_threshold_mb)
+                final_parts = split_for_delivery(
+                    input_path,
+                    working_dir,
+                    base_name,
+                    split_threshold_mb,
+                )
 
                 return {
                     "output_path": str(final_parts[0]),
@@ -791,7 +799,13 @@ def compress_parallel(
             "splitting",
             f"Splitting into parts under {split_threshold_mb}MB (trigger {effective_split_trigger}MB)...",
         )
-        final_parts = split_by_size(merged_path, working_dir, base_name, split_threshold_mb)
+        final_parts = split_for_delivery(
+            merged_path,
+            working_dir,
+            base_name,
+            split_threshold_mb,
+            progress_callback=progress_callback,
+        )
 
         # Only delete merged file if split actually created NEW files
         # (split_by_size returns [merged_path] if already under threshold)

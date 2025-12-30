@@ -8,6 +8,7 @@ Contains:
 import ipaddress
 import logging
 import os
+import socket
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 
@@ -32,6 +33,33 @@ def get_file_size_mb(path: Path) -> float:
         File size in MB.
     """
     return path.stat().st_size / (1024 * 1024)
+
+
+def redact_url_for_log(url: str, max_len: int = 200) -> str:
+    """Return a URL safe for logs (no query/fragment/userinfo)."""
+    if not url or not isinstance(url, str):
+        return "EMPTY/NONE"
+
+    trimmed = url.strip()
+    try:
+        parsed = urlparse(trimmed)
+        if not parsed.scheme or not parsed.netloc:
+            safe = trimmed
+        else:
+            host = parsed.hostname or ""
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            if parsed.port:
+                netloc = f"{host}:{parsed.port}"
+            else:
+                netloc = host
+            safe = parsed._replace(netloc=netloc, query="", fragment="", params="").geturl()
+    except Exception:
+        safe = trimmed
+
+    if len(safe) > max_len:
+        return safe[:max_len] + "..."
+    return safe
 
 
 def _parse_cpu_list(cpu_list: str) -> int:
@@ -109,6 +137,35 @@ def get_effective_cpu_count(default: int = 1) -> int:
     return max(default, effective)
 
 
+def _is_disallowed_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _resolve_hostname_ips(hostname: str) -> list:
+    try:
+        addrinfos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return []
+
+    ips = []
+    for info in addrinfos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip not in ips:
+            ips.append(ip)
+    return ips
+
+
 def _is_safe_url(url: str) -> bool:
     """Check if URL is safe to fetch (not internal/metadata endpoints).
 
@@ -124,7 +181,7 @@ def _is_safe_url(url: str) -> bool:
         True if URL appears safe, False otherwise.
     """
     try:
-        logger.info(f"[URL_CHECK] Validating: {url[:200] if url else 'EMPTY/NONE'}")
+        logger.info("[URL_CHECK] Validating: %s", redact_url_for_log(url))
 
         if not url or not isinstance(url, str):
             logger.error(f"[URL_CHECK] URL is empty or not a string: {type(url)}")
@@ -164,11 +221,15 @@ def _is_safe_url(url: str) -> bool:
         # Block private IP ranges
         try:
             ip = ipaddress.ip_address(hostname)
-            if ip.is_private or ip.is_loopback or ip.is_link_local:
+            if _is_disallowed_ip(ip):
                 raise DownloadError.blocked_url(trimmed)
         except ValueError:
-            # Hostname is not an IP - allow unless on blocked list
-            pass
+            resolved_ips = _resolve_hostname_ips(hostname)
+            if not resolved_ips:
+                raise DownloadError.invalid_url(trimmed)
+            for ip in resolved_ips:
+                if _is_disallowed_ip(ip):
+                    raise DownloadError.blocked_url(trimmed)
 
         return True
     except DownloadError:
@@ -195,7 +256,7 @@ def download_pdf(url: str, output_path: Path, max_download_size_bytes: int = MAX
     # Security: Validate URL to prevent SSRF
     _is_safe_url(url)
 
-    logger.info(f"Downloading PDF from {url[:100]}...")
+    logger.info("Downloading PDF from %s...", redact_url_for_log(url, max_len=120))
 
     def _perform_request(target_url: str) -> requests.Response:
         return requests.get(
@@ -216,7 +277,7 @@ def download_pdf(url: str, output_path: Path, max_download_size_bytes: int = MAX
                 raise DownloadError.invalid_url(url)
             redirect_url = urljoin(url, redirect_target)
             _is_safe_url(redirect_url)  # Re-validate redirect destination
-            logger.info(f"[URL_REDIRECT] Following redirect to {redirect_url[:200]}")
+            logger.info("[URL_REDIRECT] Following redirect to %s", redact_url_for_log(redirect_url))
             try:
                 response.close()
             except Exception:

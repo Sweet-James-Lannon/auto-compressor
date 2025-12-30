@@ -80,15 +80,22 @@ preserve original image quality.
 | `SPLIT_THRESHOLD_MB` | 25 | Max size per output file after splitting |
 | `SPLIT_TRIGGER_MB` | 30 | Split only when output exceeds this size (parts still use `SPLIT_THRESHOLD_MB`) |
 | `SPLIT_SAFETY_BUFFER_MB` | 0 | Buffer to keep split parts under the limit (email overhead) |
+| `ATTACHMENT_MAX_MB` | unset | If set, compute a safe split size for email limits (accounts for Base64/MIME overhead) |
+| `ATTACHMENT_OVERHEAD_PCT` | 0.35 | Overhead ratio for Base64/MIME when `ATTACHMENT_MAX_MB` is set |
+| `ATTACHMENT_OVERHEAD_MB` | 0.5 | Fixed MB overhead for headers/body when `ATTACHMENT_MAX_MB` is set |
 | `COMPRESSION_MODE` | aggressive | `lossless`, `aggressive`, or `adaptive` (quality vs size tradeoff) |
 | `ALLOW_LOSSY_COMPRESSION` | 1 | Set to `1` to allow downsampling/quality-reducing compression |
 | `SCANNED_CONFIDENCE_FOR_AGGRESSIVE` | 70 | Min scanned-doc confidence for adaptive aggressive mode |
 | `TARGET_CHUNK_MB` | 40 | Target chunk size for parallel compression |
 | `MAX_CHUNK_MB` | 60 | Max chunk size before re-splitting (prevents long-running chunks) |
 | `MAX_PARALLEL_CHUNKS` | 16 | Upper bound on chunk count per file |
+| `PARALLEL_MAX_WORKERS` | auto | Cap parallel Ghostscript workers (defaults to effective CPU count) |
 | `MAX_PAGES_PER_CHUNK` | 200 | Cap pages per chunk to avoid very large per-chunk workloads |
 | `GS_NUM_RENDERING_THREADS` | unset | Override Ghostscript rendering threads (serial/optimize passes) |
 | `SPLIT_OPTIMIZE_MAX_OVERAGE_MB` | 1.0 | Skip optimizing page-split parts that exceed the limit by more than this |
+| `SPLIT_MINIMIZE_PARTS` | 1 | Try an extra compression pass when it can reduce the number of split parts |
+| `SPLIT_ULTRA_JPEGQ` | 50 | JPEG quality for the extra split compression pass (lower = smaller, more loss) |
+| `SPLIT_ULTRA_GAP_PCT` | 0.12 | Only try extra compression when close to dropping a part (smaller = stricter) |
 | `ASYNC_WORKERS` | auto | Background job worker threads (defaults to `min(2, effective_cpu)`) |
 | `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
 | `MIN_FILE_RETENTION_SECONDS` | 3600 | Minimum retention enforced even if `FILE_RETENTION_SECONDS` is lower |

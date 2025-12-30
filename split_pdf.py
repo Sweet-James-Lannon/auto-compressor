@@ -34,6 +34,14 @@ SAFETY_BUFFER_MB: float = max(0.0, _safety_buffer)
 ALLOW_LOSSY_COMPRESSION: bool = os.environ.get("ALLOW_LOSSY_COMPRESSION", "1").lower() in ("1", "true", "yes")
 _opt_overage = float(os.environ.get("SPLIT_OPTIMIZE_MAX_OVERAGE_MB", "1.0"))
 SPLIT_OPTIMIZE_MAX_OVERAGE_MB: float = max(0.0, _opt_overage)
+SPLIT_MINIMIZE_PARTS: bool = os.environ.get("SPLIT_MINIMIZE_PARTS", "1").lower() in ("1", "true", "yes")
+_ultra_jpegq = os.environ.get("SPLIT_ULTRA_JPEGQ", "50")
+try:
+    SPLIT_ULTRA_JPEGQ = max(20, min(90, int(_ultra_jpegq)))
+except ValueError:
+    SPLIT_ULTRA_JPEGQ = 50
+_ultra_gap = float(os.environ.get("SPLIT_ULTRA_GAP_PCT", "0.12"))
+SPLIT_ULTRA_GAP_PCT: float = max(0.0, min(0.5, _ultra_gap))
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +49,33 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # NEW HELPER FUNCTIONS FOR PARALLEL COMPRESSION
 # =============================================================================
+
+def _cleanup_paths(paths: List[Path]) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
+def _rename_split_parts(parts: List[Path], base_name: str, output_dir: Path) -> List[Path]:
+    renamed: List[Path] = []
+    for idx, part in enumerate(parts, 1):
+        dest = output_dir / f"{base_name}_part{idx}.pdf"
+        if part.resolve() == dest.resolve():
+            renamed.append(dest)
+            continue
+        dest.unlink(missing_ok=True)
+        part.rename(dest)
+        renamed.append(dest)
+    return renamed
+
+
+def _should_try_ultra(file_size_mb: float, threshold_mb: float, part_count: int, gap_pct: float) -> bool:
+    if part_count <= 1:
+        return False
+    target_size = threshold_mb * (part_count - 1)
+    if target_size <= 0:
+        return False
+    gap = max(0.0, file_size_mb - target_size)
+    return (gap / max(file_size_mb, 0.1)) <= gap_pct
 
 def split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: str) -> List[Path]:
     """Split PDF into N parts by page count. Fast - no Ghostscript.
@@ -67,6 +102,8 @@ def split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: 
 
     if total_pages == 0:
         raise StructureError.for_file(pdf_path.name, "PDF has no pages")
+
+    num_parts = max(1, min(num_parts, total_pages))
 
     # Calculate pages per part (last part gets remainder)
     pages_per_part = total_pages // num_parts
@@ -339,6 +376,77 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
 
     logger.info(f"[split_by_size] ✓ SUCCESS: All {verified_count} parts verified under {threshold_mb}MB")
     return output_paths
+
+
+# =============================================================================
+# DELIVERY SPLIT WITH OPTIONAL ULTRA PASS
+# =============================================================================
+
+def split_for_delivery(
+    pdf_path: Path,
+    output_dir: Path,
+    base_name: str,
+    threshold_mb: float = DEFAULT_THRESHOLD_MB,
+    progress_callback: Optional[Callable[[int, str, str], None]] = None,
+    prefer_binary: bool = False,
+) -> List[Path]:
+    """Split with optional ultra compression to minimize part count when close to a lower split."""
+    if prefer_binary:
+        parts = split_pdf(
+            pdf_path,
+            output_dir,
+            base_name,
+            threshold_mb=threshold_mb,
+            progress_callback=progress_callback,
+        )
+    else:
+        parts = split_by_size(pdf_path, output_dir, base_name, threshold_mb)
+
+    if not SPLIT_MINIMIZE_PARTS or not ALLOW_LOSSY_COMPRESSION:
+        return parts
+
+    file_size_mb = get_file_size_mb(pdf_path)
+    min_parts = max(1, math.ceil(file_size_mb / threshold_mb))
+    should_try_ultra = len(parts) > min_parts or _should_try_ultra(
+        file_size_mb, threshold_mb, min_parts, SPLIT_ULTRA_GAP_PCT
+    )
+
+    if not should_try_ultra:
+        return parts
+
+    if progress_callback:
+        progress_callback(90, "splitting", "Trying extra compression to reduce part count...")
+
+    ultra_path = output_dir / f"{base_name}_ultra.pdf"
+    ok, msg = compress_ultra_aggressive(pdf_path, ultra_path, jpeg_quality=SPLIT_ULTRA_JPEGQ)
+    if not ok or not ultra_path.exists():
+        logger.warning("[split_for_delivery] Ultra compression skipped: %s", msg)
+        ultra_path.unlink(missing_ok=True)
+        return parts
+
+    ultra_base = f"{base_name}_ultra"
+    ultra_parts = split_by_size(ultra_path, output_dir, ultra_base, threshold_mb)
+
+    if len(ultra_parts) < len(parts):
+        logger.info(
+            "[split_for_delivery] Ultra reduced parts: %s -> %s",
+            len(parts),
+            len(ultra_parts),
+        )
+        _cleanup_paths(parts)
+        if len(ultra_parts) > 1:
+            renamed = _rename_split_parts(ultra_parts, base_name, output_dir)
+            ultra_path.unlink(missing_ok=True)
+            return renamed
+        return ultra_parts
+
+    logger.info(
+        "[split_for_delivery] Ultra did not reduce part count (%s parts); keeping original split",
+        len(parts),
+    )
+    _cleanup_paths(ultra_parts)
+    ultra_path.unlink(missing_ok=True)
+    return parts
 
 
 # =============================================================================

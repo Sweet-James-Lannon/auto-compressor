@@ -82,10 +82,40 @@ UPLOAD_FOLDER = resolve_upload_folder()
 FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400'))  # 24 hours
 MIN_FILE_RETENTION_SECONDS = int(os.environ.get('MIN_FILE_RETENTION_SECONDS', '3600'))  # 1 hour minimum
 EFFECTIVE_FILE_RETENTION_SECONDS = max(FILE_RETENTION_SECONDS, MIN_FILE_RETENTION_SECONDS)
-SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
+BASE_SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
+_attachment_limit = os.environ.get("ATTACHMENT_MAX_MB")
+ATTACHMENT_OVERHEAD_PCT = float(os.environ.get("ATTACHMENT_OVERHEAD_PCT", "0.35"))
+ATTACHMENT_OVERHEAD_MB = float(os.environ.get("ATTACHMENT_OVERHEAD_MB", "0.5"))
+EFFECTIVE_SPLIT_THRESHOLD_MB = BASE_SPLIT_THRESHOLD_MB
+
+if _attachment_limit:
+    try:
+        attachment_limit_mb = float(_attachment_limit)
+        safe_mb = (attachment_limit_mb - ATTACHMENT_OVERHEAD_MB) / (1 + ATTACHMENT_OVERHEAD_PCT)
+        if safe_mb > 0:
+            EFFECTIVE_SPLIT_THRESHOLD_MB = min(BASE_SPLIT_THRESHOLD_MB, safe_mb)
+            logger.info(
+                "Attachment limit %sMB with overhead yields split threshold %.2fMB (base %.2fMB)",
+                attachment_limit_mb,
+                EFFECTIVE_SPLIT_THRESHOLD_MB,
+                BASE_SPLIT_THRESHOLD_MB,
+            )
+        else:
+            logger.warning(
+                "ATTACHMENT_MAX_MB=%s too low after overhead; using SPLIT_THRESHOLD_MB=%s",
+                attachment_limit_mb,
+                BASE_SPLIT_THRESHOLD_MB,
+            )
+    except ValueError:
+        logger.warning("Invalid ATTACHMENT_MAX_MB=%s; using SPLIT_THRESHOLD_MB=%s", _attachment_limit, BASE_SPLIT_THRESHOLD_MB)
+
+SPLIT_THRESHOLD_MB = EFFECTIVE_SPLIT_THRESHOLD_MB
 # Split only when output exceeds this size, but keep parts under SPLIT_THRESHOLD_MB.
 _split_trigger = float(os.environ.get("SPLIT_TRIGGER_MB", "30"))
-SPLIT_TRIGGER_MB = max(SPLIT_THRESHOLD_MB, _split_trigger)
+if _attachment_limit:
+    SPLIT_TRIGGER_MB = SPLIT_THRESHOLD_MB
+else:
+    SPLIT_TRIGGER_MB = max(SPLIT_THRESHOLD_MB, _split_trigger)
 # Cap SYNC_MAX_MB at the hard ceiling even if env is higher
 SYNC_MAX_MB = min(float(os.environ.get("SYNC_MAX_MB", str(HARD_SYNC_LIMIT_MB))), HARD_SYNC_LIMIT_MB)
 # Async jobs can be larger than sync, but still need a hard ceiling to protect the instance.
@@ -596,7 +626,7 @@ def compress():
             if not download_url or not isinstance(download_url, str):
                 return jsonify({"success": False, "error": "Invalid file_download_link"}), 400
             task_data['download_url'] = download_url
-            logger.info(f"Compress request with URL: {download_url[:100]}...")
+            logger.info("Compress request with URL: %s", utils.redact_url_for_log(download_url, max_len=120))
 
         # Option 2: Base64-encoded PDF
         elif 'file_content_base64' in data:
@@ -745,7 +775,14 @@ def compress_sync():
         # Dual input handling - JSON (Salesforce) or form-data (Dashboard)
         if request.is_json:
             # Salesforce/API flow - download PDF from URL
-            data = request.get_json()
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({
+                    "success": False,
+                    "error": "Invalid JSON body",
+                    "error_type": "InvalidJSON",
+                    "error_message": "Invalid JSON body"
+                }), 400
             file_url = data.get('file_download_link') or data.get('file_url')
             matter_id = data.get('matterId')  # Salesforce sends camelCase
             if not file_url:
@@ -908,58 +945,101 @@ def compress_sync():
                 split_trigger_mb=SPLIT_TRIGGER_MB
             )
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_compress)
-            try:
-                result = future.result(timeout=SYNC_TIMEOUT_SECONDS)
-            except FuturesTimeoutError:
-                logger.error(f"[sync:{file_id}] Timed out after {SYNC_TIMEOUT_SECONDS}s")
-                future.cancel()
-                return jsonify({
-                    "success": False,
-                    "error": f"Processing timed out after {SYNC_TIMEOUT_SECONDS}s. Try a smaller file or retry later.",
-                    "error_type": "Timeout",
-                    "error_message": f"Processing timed out after {SYNC_TIMEOUT_SECONDS}s. Try a smaller file or retry later."
-                }), 504
+        def _verify_output_files(result_data: Dict[str, Any], label: str):
+            output = result_data.get('output_paths', [result_data['output_path']])
+            output = [Path(p) for p in output]
+            logger.info("[%s] Verifying %s output files...", label, len(output))
+
+            for path in output:
+                logger.info("[%s] Checking: %s (absolute: %s)", label, path, path.resolve())
+                if not path.exists():
+                    logger.error("[%s] Output file missing: %s", label, path)
+                    logger.error("[%s] UPLOAD_FOLDER is: %s", label, UPLOAD_FOLDER.resolve())
+                    raise FileNotFoundError("Compression failed - output file not created")
+                if path.stat().st_size == 0:
+                    logger.error("[%s] Output file is empty: %s", label, path)
+                    raise ValueError("Compression failed - output file is empty")
+                track_file(path)
+
+            sizes = result_data.get('part_sizes')
+            if not sizes:
+                sizes = [p.stat().st_size for p in output]
+            return output, sizes
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(run_compress)
+        timed_out = False
+        try:
+            result = future.result(timeout=SYNC_TIMEOUT_SECONDS)
+        except FuturesTimeoutError:
+            timed_out = True
+            job_id = job_queue.create_job()
+            logger.error(f"[sync:{file_id}] Timed out after {SYNC_TIMEOUT_SECONDS}s; continuing as async job {job_id}")
+
+            def _finalize_timeout_job(fut):
+                try:
+                    completed = fut.result()
+                    output_paths, part_sizes = _verify_output_files(completed, f"sync-timeout:{file_id}")
+                    download_links = [f"/download/{p.name}" for p in output_paths]
+                    files = [build_download_url(link) for link in download_links]
+
+                    job_queue.update_job(job_id, "completed", result={
+                        "was_split": completed.get('was_split', False),
+                        "total_parts": completed.get('total_parts', 1),
+                        "download_links": download_links,
+                        "files": files,
+                        "original_mb": completed.get('original_size_mb'),
+                        "compressed_mb": completed.get('compressed_size_mb'),
+                        "reduction_percent": completed.get('reduction_percent'),
+                        "compression_method": completed.get('compression_method'),
+                        "compression_mode": completed.get('compression_mode'),
+                        "request_id": job_id,
+                        "page_count": completed.get('page_count'),
+                        "part_sizes": part_sizes,
+                    })
+                    logger.info("[%s] Timeout job completed: %s file(s)", job_id, len(download_links))
+                except Exception as exc:
+                    logger.exception("[%s] Timeout job failed: %s", job_id, exc)
+                    job_queue.update_job(job_id, "failed", error=str(exc), result={
+                        "error_type": "UnknownError",
+                        "error_message": str(exc),
+                    })
+
+            future.add_done_callback(_finalize_timeout_job)
+            executor.shutdown(wait=False)
+            return jsonify({
+                "success": True,
+                "status": "processing",
+                "job_id": job_id,
+                "status_url": f"/status/{job_id}",
+                "message": "Processing exceeded sync timeout; poll status_url for results."
+            }), 202
+        finally:
+            if not timed_out:
+                executor.shutdown(wait=True)
 
         # =====================================================================
         # CRITICAL: Verify all output files exist before returning download URLs
         # This prevents 404 errors when files weren't created properly
         # =====================================================================
-        output_paths = result.get('output_paths', [result['output_path']])
-
-        logger.info(f"[sync:{file_id}] Verifying {len(output_paths)} output files...")
-
-        for path_str in output_paths:
-            p = Path(path_str)
-            logger.info(f"[sync:{file_id}] Checking: {p} (absolute: {p.resolve()})")
-
-            if not p.exists():
-                logger.error(f"[sync:{file_id}] Output file missing: {p}")
-                logger.error(f"[sync:{file_id}] UPLOAD_FOLDER is: {UPLOAD_FOLDER.resolve()}")
-                return jsonify({
-                    "success": False,
-                    "error": "Compression failed - output file not created",
-                    "error_type": "OutputMissing",
-                    "error_message": "Compression failed - output file not created"
-                }), 500
-            if p.stat().st_size == 0:
-                logger.error(f"[sync:{file_id}] Output file is empty: {p}")
-                return jsonify({
-                    "success": False,
-                    "error": "Compression failed - output file is empty",
-                    "error_type": "OutputMissing",
-                    "error_message": "Compression failed - output file is empty"
-                }), 500
-
-            logger.info(f"[sync:{file_id}] Verified: {p.name} ({p.stat().st_size / (1024*1024):.1f}MB)")
-            track_file(p)
+        try:
+            output_paths, part_sizes = _verify_output_files(result, f"sync:{file_id}")
+        except FileNotFoundError:
+            return jsonify({
+                "success": False,
+                "error": "Compression failed - output file not created",
+                "error_type": "OutputMissing",
+                "error_message": "Compression failed - output file not created"
+            }), 500
+        except ValueError:
+            return jsonify({
+                "success": False,
+                "error": "Compression failed - output file is empty",
+                "error_type": "OutputMissing",
+                "error_message": "Compression failed - output file is empty"
+            }), 500
 
         # Always return part sizes for Salesforce verification
-        part_sizes = result.get('part_sizes')
-        if not part_sizes:
-            part_sizes = [Path(p).stat().st_size for p in output_paths]
-
         files = [build_download_url(p) for p in output_paths]
 
         logger.info(f"[sync:{file_id}] Complete: {len(files)} file(s), {result['original_size_mb']:.1f}MB → {result['compressed_size_mb']:.1f}MB")
