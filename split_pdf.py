@@ -217,7 +217,13 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
             logger.info(f"[merge_pdfs] ✓ Merge efficient: {input_total_mb:.2f}MB -> {output_mb:.2f}MB (saved {saved_mb:.2f}MB)")
 
 
-def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb: float = DEFAULT_THRESHOLD_MB) -> List[Path]:
+def split_by_size(
+    pdf_path: Path,
+    output_dir: Path,
+    base_name: str,
+    threshold_mb: float = DEFAULT_THRESHOLD_MB,
+    skip_optimization_under_threshold: bool = False,
+) -> List[Path]:
     """Split PDF into parts under threshold_mb each.
 
     Simple approach: calculate number of parts needed, split evenly by pages.
@@ -228,6 +234,8 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
         output_dir: Directory for output parts.
         base_name: Base filename for parts.
         threshold_mb: Maximum size per part.
+        skip_optimization_under_threshold: Skip Ghostscript optimization when the raw part
+            is already under the threshold.
 
     Returns:
         List of paths to created part files.
@@ -290,45 +298,61 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
             temp_part_path.unlink(missing_ok=True)
             for p in output_paths:
                 p.unlink(missing_ok=True)
-            return split_pdf(pdf_path, output_dir, base_name, threshold_mb)
+            return split_pdf(
+                pdf_path,
+                output_dir,
+                base_name,
+                threshold_mb,
+                skip_optimization_under_threshold=skip_optimization_under_threshold,
+            )
 
-        # Optimize with Ghostscript to deduplicate resources (critical for size reduction)
         part_path = output_dir / f"{base_name}_part{i+1}.pdf"
-        success, opt_message = optimize_split_part(temp_part_path, part_path)
-
-        if success and part_path.exists():
-            part_size = get_file_size_mb(part_path)
-
-            # If optimization made it bigger, keep the raw part (email size limit matters most).
-            if part_size > raw_size:
-                logger.warning(
-                    f"[split_by_size] Optimization increased size for part {i+1}: "
-                    f"{raw_size:.2f}MB -> {part_size:.2f}MB. Keeping raw output."
-                )
-                part_path.unlink(missing_ok=True)
-                temp_part_path.rename(part_path)
-                part_size = raw_size
-            else:
-                temp_part_path.unlink(missing_ok=True)
-                reduction_pct = ((raw_size - part_size) / raw_size) * 100 if raw_size > 0 else 0
-                reduction_mb = raw_size - part_size
-
-                logger.info(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZED:")
-                logger.info(f"[split_by_size]   Pages: {start+1}-{end}")
-                logger.info(f"[split_by_size]   Before: {raw_size:.2f}MB (raw PyPDF2)")
-                logger.info(f"[split_by_size]   After:  {part_size:.2f}MB (Ghostscript optimized)")
-                logger.info(f"[split_by_size]   Saved:  {reduction_pct:.1f}% (-{reduction_mb:.2f}MB)")
-        else:
-            # Optimization failed - use raw PyPDF2 output (may be bloated!)
-            logger.warning(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZATION FAILED:")
-            logger.warning(f"[split_by_size]   Pages: {start+1}-{end}")
-            logger.warning(f"[split_by_size]   Error: {opt_message}")
-            logger.warning(f"[split_by_size]   Using raw PyPDF2 output: {raw_size:.2f}MB")
-            logger.warning(f"[split_by_size]   ⚠️  This part may contain duplicated resources!")
-
+        if skip_optimization_under_threshold and raw_size <= threshold_mb:
             part_path.unlink(missing_ok=True)
             temp_part_path.rename(part_path)
             part_size = raw_size
+            logger.info(
+                "[split_by_size] Part %s under threshold (%.2fMB); skipping optimization",
+                i + 1,
+                raw_size,
+            )
+        else:
+            # Optimize with Ghostscript to deduplicate resources (critical for size reduction)
+            success, opt_message = optimize_split_part(temp_part_path, part_path)
+
+            if success and part_path.exists():
+                part_size = get_file_size_mb(part_path)
+
+                # If optimization made it bigger, keep the raw part (email size limit matters most).
+                if part_size > raw_size:
+                    logger.warning(
+                        f"[split_by_size] Optimization increased size for part {i+1}: "
+                        f"{raw_size:.2f}MB -> {part_size:.2f}MB. Keeping raw output."
+                    )
+                    part_path.unlink(missing_ok=True)
+                    temp_part_path.rename(part_path)
+                    part_size = raw_size
+                else:
+                    temp_part_path.unlink(missing_ok=True)
+                    reduction_pct = ((raw_size - part_size) / raw_size) * 100 if raw_size > 0 else 0
+                    reduction_mb = raw_size - part_size
+
+                    logger.info(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZED:")
+                    logger.info(f"[split_by_size]   Pages: {start+1}-{end}")
+                    logger.info(f"[split_by_size]   Before: {raw_size:.2f}MB (raw PyPDF2)")
+                    logger.info(f"[split_by_size]   After:  {part_size:.2f}MB (Ghostscript optimized)")
+                    logger.info(f"[split_by_size]   Saved:  {reduction_pct:.1f}% (-{reduction_mb:.2f}MB)")
+            else:
+                # Optimization failed - use raw PyPDF2 output (may be bloated!)
+                logger.warning(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZATION FAILED:")
+                logger.warning(f"[split_by_size]   Pages: {start+1}-{end}")
+                logger.warning(f"[split_by_size]   Error: {opt_message}")
+                logger.warning(f"[split_by_size]   Using raw PyPDF2 output: {raw_size:.2f}MB")
+                logger.warning(f"[split_by_size]   ⚠️  This part may contain duplicated resources!")
+
+                part_path.unlink(missing_ok=True)
+                temp_part_path.rename(part_path)
+                part_size = raw_size
 
         output_paths.append(part_path)
 
@@ -343,7 +367,13 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
             )
             for p in output_paths:
                 p.unlink(missing_ok=True)
-            return split_pdf(pdf_path, output_dir, base_name, threshold_mb)
+            return split_pdf(
+                pdf_path,
+                output_dir,
+                base_name,
+                threshold_mb,
+                skip_optimization_under_threshold=skip_optimization_under_threshold,
+            )
 
     # CRITICAL: Verify ALL parts are under threshold with detailed logging
     oversize_parts = []
@@ -372,7 +402,13 @@ def split_by_size(pdf_path: Path, output_dir: Path, base_name: str, threshold_mb
             p.unlink(missing_ok=True)
 
         # Fallback to size-based splitter
-        return split_pdf(pdf_path, output_dir, base_name, threshold_mb)
+        return split_pdf(
+            pdf_path,
+            output_dir,
+            base_name,
+            threshold_mb,
+            skip_optimization_under_threshold=skip_optimization_under_threshold,
+        )
 
     logger.info(f"[split_by_size] ✓ SUCCESS: All {verified_count} parts verified under {threshold_mb}MB")
     return output_paths
@@ -389,6 +425,7 @@ def split_for_delivery(
     threshold_mb: float = DEFAULT_THRESHOLD_MB,
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     prefer_binary: bool = False,
+    skip_optimization_under_threshold: bool = False,
 ) -> List[Path]:
     """Split with optional ultra compression to minimize part count when close to a lower split."""
     if prefer_binary:
@@ -398,9 +435,16 @@ def split_for_delivery(
             base_name,
             threshold_mb=threshold_mb,
             progress_callback=progress_callback,
+            skip_optimization_under_threshold=skip_optimization_under_threshold,
         )
     else:
-        parts = split_by_size(pdf_path, output_dir, base_name, threshold_mb)
+        parts = split_by_size(
+            pdf_path,
+            output_dir,
+            base_name,
+            threshold_mb,
+            skip_optimization_under_threshold=skip_optimization_under_threshold,
+        )
 
     if not SPLIT_MINIMIZE_PARTS or not ALLOW_LOSSY_COMPRESSION:
         return parts
@@ -425,7 +469,13 @@ def split_for_delivery(
         return parts
 
     ultra_base = f"{base_name}_ultra"
-    ultra_parts = split_by_size(ultra_path, output_dir, ultra_base, threshold_mb)
+    ultra_parts = split_by_size(
+        ultra_path,
+        output_dir,
+        ultra_base,
+        threshold_mb,
+        skip_optimization_under_threshold=skip_optimization_under_threshold,
+    )
 
     if len(ultra_parts) < len(parts):
         logger.info(
@@ -458,7 +508,8 @@ def split_pdf(
     output_dir: Path,
     base_name: str,
     threshold_mb: float = DEFAULT_THRESHOLD_MB,
-    progress_callback: Optional[Callable[[int, str, str], None]] = None
+    progress_callback: Optional[Callable[[int, str, str], None]] = None,
+    skip_optimization_under_threshold: bool = False,
 ) -> List[Path]:
     """Split a PDF into multiple parts under a size threshold.
 
@@ -471,6 +522,8 @@ def split_pdf(
         output_dir: Directory to write output files.
         base_name: Base filename for output parts (e.g., "doc" -> "doc_part1.pdf").
         threshold_mb: Maximum size per part in MB. Defaults to SPLIT_THRESHOLD_MB.
+        skip_optimization_under_threshold: Skip Ghostscript optimization when the raw part
+            is already under the threshold.
 
     Returns:
         List of paths to the created PDF parts, all verified under threshold_mb.
@@ -694,30 +747,40 @@ def split_pdf(
 
                 part_path = output_dir / f"{base_name}_part{part_num}.pdf"
 
-                # ALWAYS optimize - this matches what we measured during binary search
-                success, message = optimize_split_part(temp_part_path, part_path)
-                if success and part_path.exists():
-                    optimized_size_mb = get_file_size_mb(part_path)
-                    logger.info(f"Optimized {part_path.name}: {raw_size_mb:.1f}MB -> {optimized_size_mb:.1f}MB")
-
-                    # If optimization made it bigger, keep the raw output instead.
-                    if optimized_size_mb > raw_size_mb:
-                        logger.warning(
-                            f"Optimization increased size for {part_path.name}: "
-                            f"{raw_size_mb:.1f}MB -> {optimized_size_mb:.1f}MB. Keeping raw output."
-                        )
-                        part_path.unlink(missing_ok=True)
-                        temp_part_path.rename(part_path)
-                        current_size_mb = raw_size_mb
-                    else:
-                        temp_part_path.unlink(missing_ok=True)
-                        current_size_mb = optimized_size_mb
-                else:
-                    # Optimization failed - just rename
-                    logger.warning(f"Optimization failed: {message}")
+                if skip_optimization_under_threshold and raw_size_mb <= threshold_mb:
                     part_path.unlink(missing_ok=True)
                     temp_part_path.rename(part_path)
                     current_size_mb = raw_size_mb
+                    logger.info(
+                        "Part %s under threshold (%.1fMB); skipping optimization",
+                        part_num,
+                        raw_size_mb,
+                    )
+                else:
+                    # Optimize to match what we measured during binary search.
+                    success, message = optimize_split_part(temp_part_path, part_path)
+                    if success and part_path.exists():
+                        optimized_size_mb = get_file_size_mb(part_path)
+                        logger.info(f"Optimized {part_path.name}: {raw_size_mb:.1f}MB -> {optimized_size_mb:.1f}MB")
+
+                        # If optimization made it bigger, keep the raw output instead.
+                        if optimized_size_mb > raw_size_mb:
+                            logger.warning(
+                                f"Optimization increased size for {part_path.name}: "
+                                f"{raw_size_mb:.1f}MB -> {optimized_size_mb:.1f}MB. Keeping raw output."
+                            )
+                            part_path.unlink(missing_ok=True)
+                            temp_part_path.rename(part_path)
+                            current_size_mb = raw_size_mb
+                        else:
+                            temp_part_path.unlink(missing_ok=True)
+                            current_size_mb = optimized_size_mb
+                    else:
+                        # Optimization failed - just rename
+                        logger.warning(f"Optimization failed: {message}")
+                        part_path.unlink(missing_ok=True)
+                        temp_part_path.rename(part_path)
+                        current_size_mb = raw_size_mb
 
                 def try_replace_with_smaller(label: str, suffix: str, compress_fn) -> None:
                     nonlocal current_size_mb

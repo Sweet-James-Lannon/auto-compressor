@@ -92,6 +92,12 @@ preserve original image quality.
 | `PARALLEL_MAX_WORKERS` | auto | Cap parallel Ghostscript workers (defaults to effective CPU count) |
 | `MAX_PAGES_PER_CHUNK` | 200 | Cap pages per chunk to avoid very large per-chunk workloads |
 | `GS_NUM_RENDERING_THREADS` | unset | Override Ghostscript rendering threads (serial/optimize passes) |
+| `PARALLEL_SERIAL_FALLBACK` | 1 | Set to `0` to skip serial fallback when parallel output bloats |
+| `GS_FAST_WEB_VIEW` | 1 | Set to `0` to disable PDF linearization (faster, larger files) |
+| `GS_BAND_HEIGHT` | 100 | Ghostscript banding height (set `0` to omit) |
+| `GS_BAND_BUFFER_SPACE_MB` | 500 | Ghostscript band buffer in MB (set `0` to omit) |
+| `GS_COLOR_DOWNSAMPLE_TYPE` | /Bicubic | `/Subsample`, `/Average`, or `/Bicubic` for color images |
+| `GS_GRAY_DOWNSAMPLE_TYPE` | /Bicubic | `/Subsample`, `/Average`, or `/Bicubic` for gray images |
 | `SPLIT_OPTIMIZE_MAX_OVERAGE_MB` | 1.0 | Skip optimizing page-split parts that exceed the limit by more than this |
 | `SPLIT_MINIMIZE_PARTS` | 1 | Try an extra compression pass when it can reduce the number of split parts |
 | `SPLIT_ULTRA_JPEGQ` | 50 | JPEG quality for the extra split compression pass (lower = smaller, more loss) |

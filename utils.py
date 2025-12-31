@@ -87,6 +87,12 @@ def _parse_cpu_list(cpu_list: str) -> int:
 def get_effective_cpu_count(default: int = 1) -> int:
     """Return effective CPU count, respecting cgroup quotas when present."""
     host_count = os.cpu_count() or default
+    try:
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            host_count = min(host_count, len(affinity))
+    except (AttributeError, OSError):
+        pass
     quota_count = None
 
     # cgroup v2

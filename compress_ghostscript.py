@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -19,6 +20,44 @@ TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "40"))
 MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(TARGET_CHUNK_MB * 1.5)))
 MAX_PARALLEL_CHUNKS = int(os.environ.get("MAX_PARALLEL_CHUNKS", "16"))
 MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    raw = (os.environ.get(name) or "").strip()
+    return raw if raw in allowed else default
+
+
+GS_FAST_WEB_VIEW = _env_bool("GS_FAST_WEB_VIEW", True)
+GS_COLOR_DOWNSAMPLE_TYPE = _env_choice(
+    "GS_COLOR_DOWNSAMPLE_TYPE",
+    "/Bicubic",
+    ("/Subsample", "/Average", "/Bicubic"),
+)
+GS_GRAY_DOWNSAMPLE_TYPE = _env_choice(
+    "GS_GRAY_DOWNSAMPLE_TYPE",
+    "/Bicubic",
+    ("/Subsample", "/Average", "/Bicubic"),
+)
+GS_BAND_HEIGHT = _env_int("GS_BAND_HEIGHT", 100)
+GS_BAND_BUFFER_SPACE_MB = _env_int("GS_BAND_BUFFER_SPACE_MB", 500)
+PARALLEL_SERIAL_FALLBACK = _env_bool("PARALLEL_SERIAL_FALLBACK", True)
 
 
 def _resolve_gs_threads(num_threads: Optional[int]) -> int:
@@ -236,11 +275,11 @@ def compress_pdf_with_ghostscript(
         "-dGrayImageFilter=/DCTEncode",
         # Downsample all images to 72 DPI for maximum compression
         "-dDownsampleColorImages=true",
-        "-dColorImageDownsampleType=/Bicubic",
+        f"-dColorImageDownsampleType={GS_COLOR_DOWNSAMPLE_TYPE}",
         "-dColorImageResolution=72",
         "-dColorImageDownsampleThreshold=1.0",
         "-dDownsampleGrayImages=true",
-        "-dGrayImageDownsampleType=/Bicubic",
+        f"-dGrayImageDownsampleType={GS_GRAY_DOWNSAMPLE_TYPE}",
         "-dGrayImageResolution=72",
         "-dGrayImageDownsampleThreshold=1.0",
         "-dDownsampleMonoImages=true",
@@ -252,15 +291,22 @@ def compress_pdf_with_ghostscript(
         "-dCompressFonts=true",
         "-dSubsetFonts=true",
         # Strip metadata that might confuse email clients
-        "-dFastWebView=true",
         "-dPrinted=false",
         # Speed optimizations (NO effect on compression ratio)
         f"-dNumRenderingThreads={threads}",
-        "-dBandHeight=100",
-        "-dBandBufferSpace=500000000",
-        f"-sOutputFile={output_path}",
-        str(input_path)
     ]
+    if GS_FAST_WEB_VIEW:
+        cmd.append("-dFastWebView=true")
+    if GS_BAND_HEIGHT > 0:
+        cmd.append(f"-dBandHeight={GS_BAND_HEIGHT}")
+    if GS_BAND_BUFFER_SPACE_MB > 0:
+        cmd.append(f"-dBandBufferSpace={GS_BAND_BUFFER_SPACE_MB * 1024 * 1024}")
+    cmd.extend(
+        [
+            f"-sOutputFile={output_path}",
+            str(input_path),
+        ]
+    )
 
     try:
         file_mb = input_path.stat().st_size / (1024 * 1024)
@@ -329,11 +375,11 @@ def compress_ultra_aggressive(
         "-dGrayImageFilter=/DCTEncode",
         # Downsample images (72 DPI baseline)
         "-dDownsampleColorImages=true",
-        "-dColorImageDownsampleType=/Bicubic",
+        f"-dColorImageDownsampleType={GS_COLOR_DOWNSAMPLE_TYPE}",
         "-dColorImageResolution=72",
         "-dColorImageDownsampleThreshold=1.0",
         "-dDownsampleGrayImages=true",
-        "-dGrayImageDownsampleType=/Bicubic",
+        f"-dGrayImageDownsampleType={GS_GRAY_DOWNSAMPLE_TYPE}",
         "-dGrayImageResolution=72",
         "-dGrayImageDownsampleThreshold=1.0",
         "-dDownsampleMonoImages=true",
@@ -344,11 +390,20 @@ def compress_ultra_aggressive(
         "-dDetectDuplicateImages=true",
         "-dCompressFonts=true",
         "-dSubsetFonts=true",
-        "-dFastWebView=true",
         f"-dNumRenderingThreads={threads}",
-        f"-sOutputFile={output_path}",
-        str(input_path),
     ]
+    if GS_FAST_WEB_VIEW:
+        cmd.append("-dFastWebView=true")
+    if GS_BAND_HEIGHT > 0:
+        cmd.append(f"-dBandHeight={GS_BAND_HEIGHT}")
+    if GS_BAND_BUFFER_SPACE_MB > 0:
+        cmd.append(f"-dBandBufferSpace={GS_BAND_BUFFER_SPACE_MB * 1024 * 1024}")
+    cmd.extend(
+        [
+            f"-sOutputFile={output_path}",
+            str(input_path),
+        ]
+    )
 
     try:
         file_mb = input_path.stat().st_size / (1024 * 1024)
@@ -392,7 +447,9 @@ def compress_parallel(
     split_trigger_mb: Optional[float] = None,
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     max_workers: int = 6,
-    compression_mode: str = "lossless"
+    compression_mode: str = "lossless",
+    target_chunk_mb: Optional[float] = None,
+    max_chunk_mb: Optional[float] = None,
 ) -> Dict:
     """
     Parallel compression strategy for large PDFs.
@@ -415,6 +472,8 @@ def compress_parallel(
         progress_callback: Optional callback(percent, stage, message).
         max_workers: Max parallel compression workers (default 6).
         compression_mode: "lossless" (no downsampling) or "aggressive" (/screen).
+        target_chunk_mb: Override target chunk size in MB (defaults to env TARGET_CHUNK_MB).
+        max_chunk_mb: Override max chunk size in MB (defaults to env MAX_CHUNK_MB).
 
     Returns:
         Dict with output_path(s), sizes, reduction_percent, etc.
@@ -426,6 +485,7 @@ def compress_parallel(
     input_path = Path(input_path)
     working_dir = Path(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
+    start_ts = time.time()
 
     def report_progress(percent: int, stage: str, message: str):
         if progress_callback:
@@ -439,8 +499,10 @@ def compress_parallel(
         logger.warning(f"[PARALLEL] Unknown compression_mode '{compression_mode}', defaulting to lossless")
         compression_mode = "lossless"
 
-    target_chunk_mb = max(5.0, TARGET_CHUNK_MB)
-    max_chunk_mb = max(target_chunk_mb, MAX_CHUNK_MB)
+    effective_target_chunk_mb = TARGET_CHUNK_MB if target_chunk_mb is None else float(target_chunk_mb)
+    effective_max_chunk_mb = MAX_CHUNK_MB if max_chunk_mb is None else float(max_chunk_mb)
+    target_chunk_mb = max(5.0, effective_target_chunk_mb)
+    max_chunk_mb = max(target_chunk_mb, effective_max_chunk_mb)
     max_parallel_chunks = max(2, MAX_PARALLEL_CHUNKS)
     effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
 
@@ -533,6 +595,8 @@ def compress_parallel(
     chunk_paths = rebalance_chunks_by_size(chunk_paths)
     num_chunks = len(chunk_paths)
     logger.info(f"[PARALLEL] Split into {num_chunks} chunk(s)")
+    split_time = time.time() - start_ts
+    logger.info("[PERF] Split: %.1fs", split_time)
 
     # Step 3: Compress each chunk in parallel
     report_progress(15, "compressing", f"Compressing {num_chunks} chunks in parallel...")
@@ -629,6 +693,8 @@ def compress_parallel(
     ordered_paths = [p for _, p in all_chunks]
 
     logger.info(f"[PARALLEL] Compression complete: {len(compressed_chunks)} succeeded, {len(failed_chunks)} used original")
+    compress_time = time.time() - start_ts - split_time
+    logger.info("[PERF] Compress: %.1fs", compress_time)
 
     # Step 4: Merge compressed chunks back together
     report_progress(75, "merging", "Merging compressed chunks...")
@@ -640,6 +706,16 @@ def compress_parallel(
     reduction_percent = ((original_size_mb - compressed_size_mb) / original_size_mb) * 100
 
     logger.info(f"[PARALLEL] Merged: {original_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB ({reduction_percent:.1f}% reduction)")
+    merge_time = time.time() - start_ts - split_time - compress_time
+    total_time = time.time() - start_ts
+    logger.info("[PERF] Merge: %.1fs", merge_time)
+    logger.info(
+        "[PERF] Total: %.1fs (split=%.1fs, compress=%.1fs, merge=%.1fs)",
+        total_time,
+        split_time,
+        compress_time,
+        merge_time,
+    )
 
     # Cleanup chunk files
     for chunk in chunk_paths:
@@ -666,6 +742,53 @@ def compress_parallel(
         logger.warning(f"[PARALLEL]   Action: Falling back to serial compression (single Ghostscript pass)...")
         logger.warning(f"[PARALLEL] " + "="*50)
 
+        if not PARALLEL_SERIAL_FALLBACK:
+            logger.warning("[PARALLEL] Serial fallback disabled; returning original or split output")
+            merged_path.unlink(missing_ok=True)
+
+            if effective_split_trigger and original_size_mb > effective_split_trigger:
+                final_parts = split_for_delivery(
+                    input_path,
+                    working_dir,
+                    base_name,
+                    split_threshold_mb,
+                    skip_optimization_under_threshold=True,
+                )
+
+                return {
+                    "output_path": str(final_parts[0]),
+                    "output_paths": [str(p) for p in final_parts],
+                    "original_size_mb": round(original_size_mb, 2),
+                    "compressed_size_mb": round(original_size_mb, 2),
+                    "reduction_percent": 0.0,
+                    "compression_method": "none",
+                    "compression_mode": compression_mode,
+                    "was_split": len(final_parts) > 1,
+                    "total_parts": len(final_parts),
+                    "success": True,
+                    "note": "Parallel bloat; serial fallback disabled",
+                    "page_count": None,
+                    "part_sizes": [p.stat().st_size for p in final_parts],
+                    "parallel_chunks": num_chunks
+                }
+
+            return {
+                "output_path": str(input_path),
+                "output_paths": [str(input_path)],
+                "original_size_mb": round(original_size_mb, 2),
+                "compressed_size_mb": round(original_size_mb, 2),
+                "reduction_percent": 0.0,
+                "compression_method": "none",
+                "compression_mode": compression_mode,
+                "was_split": False,
+                "total_parts": 1,
+                "success": True,
+                "note": "Parallel bloat; serial fallback disabled",
+                "page_count": None,
+                "part_sizes": [input_path.stat().st_size],
+                "parallel_chunks": num_chunks
+            }
+
         # Delete the inflated merged file
         merged_path.unlink(missing_ok=True)
 
@@ -691,6 +814,7 @@ def compress_parallel(
                         working_dir,
                         base_name,
                         split_threshold_mb,
+                        skip_optimization_under_threshold=True,
                     )
 
                     return {
@@ -756,6 +880,7 @@ def compress_parallel(
                     working_dir,
                     base_name,
                     split_threshold_mb,
+                    skip_optimization_under_threshold=True,
                 )
 
                 return {
@@ -805,6 +930,7 @@ def compress_parallel(
             base_name,
             split_threshold_mb,
             progress_callback=progress_callback,
+            skip_optimization_under_threshold=True,
         )
 
         # Only delete merged file if split actually created NEW files

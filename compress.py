@@ -48,6 +48,8 @@ MIN_COMPRESSION_SIZE_MB = float(os.environ.get("MIN_COMPRESSION_SIZE_MB", "1.0")
 COMPRESSION_MODE = os.environ.get("COMPRESSION_MODE", "aggressive").lower()
 ALLOW_LOSSY_COMPRESSION = os.environ.get("ALLOW_LOSSY_COMPRESSION", "1").lower() in ("1", "true", "yes")
 SCANNED_CONFIDENCE_FOR_AGGRESSIVE = float(os.environ.get("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", "70"))
+DEFAULT_TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "40"))
+DEFAULT_MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(DEFAULT_TARGET_CHUNK_MB * 1.5)))
 
 
 def resolve_compression_mode(input_path: Path) -> str:
@@ -161,7 +163,8 @@ def compress_pdf(
                 input_path, working_dir, input_path.stem,
                 threshold_mb=split_threshold_mb,
                 progress_callback=progress_callback,
-                prefer_binary=True
+                prefer_binary=True,
+                skip_optimization_under_threshold=True,
             )
             return {
                 "output_path": str(output_paths[0]),
@@ -211,6 +214,22 @@ def compress_pdf(
             effective_cpu,
             env_label,
         )
+        target_chunk_mb = DEFAULT_TARGET_CHUNK_MB
+        max_chunk_mb = DEFAULT_MAX_CHUNK_MB
+        if compression_mode == "lossless":
+            target_chunk_mb = max(DEFAULT_TARGET_CHUNK_MB, 60.0)
+            max_chunk_mb = max(DEFAULT_MAX_CHUNK_MB, target_chunk_mb * 1.5)
+            logger.info(
+                "[compress] Lossless mode: larger chunks (target %.1fMB, max %.1fMB)",
+                target_chunk_mb,
+                max_chunk_mb,
+            )
+        else:
+            logger.info(
+                "[compress] Aggressive mode: standard chunks (target %.1fMB, max %.1fMB)",
+                target_chunk_mb,
+                max_chunk_mb,
+            )
         return compress_ghostscript.compress_parallel(
             input_path=input_path,
             working_dir=working_dir,
@@ -219,7 +238,9 @@ def compress_pdf(
             split_trigger_mb=effective_split_trigger,
             progress_callback=progress_callback,
             max_workers=max_workers,
-            compression_mode=compression_mode
+            compression_mode=compression_mode,
+            target_chunk_mb=target_chunk_mb,
+            max_chunk_mb=max_chunk_mb,
         )
 
     # =========================================================================
@@ -274,7 +295,8 @@ def compress_pdf(
                 output_path, working_dir, input_path.stem,
                 threshold_mb=split_threshold_mb,
                 progress_callback=progress_callback,
-                prefer_binary=True
+                prefer_binary=True,
+                skip_optimization_under_threshold=True,
             )
             return {
                 "output_path": str(output_paths[0]),
@@ -322,7 +344,8 @@ def compress_pdf(
             output_path, working_dir, input_path.stem,
             threshold_mb=split_threshold_mb,
             progress_callback=progress_callback,
-            prefer_binary=True
+            prefer_binary=True,
+            skip_optimization_under_threshold=True,
         )
 
         # Log size of each split part
