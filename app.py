@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import requests
 
 from flask import Flask, jsonify, request, render_template, send_file, has_request_context
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import RequestEntityTooLarge, HTTPException, NotFound
 from werkzeug.utils import secure_filename
 
 from compress import compress_pdf
@@ -222,6 +222,101 @@ def spawn_callback(callback_url: str, payload: dict, job_id: str) -> None:
         name=f"callback-{job_id}"
     )
     thread.start()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def build_health_snapshot() -> Dict[str, Any]:
+    """Build a lightweight snapshot for health endpoints and the debug dashboard."""
+    gs_cmd = get_ghostscript_command()
+    try:
+        pdf_count = len(list(UPLOAD_FOLDER.glob("*.pdf")))
+    except Exception:
+        pdf_count = -1
+
+    queue_stats = job_queue.get_stats()
+    effective_cpu = utils.get_effective_cpu_count()
+
+    return {
+        "status": "healthy" if gs_cmd else "degraded",
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "ghostscript": {
+            "available": gs_cmd is not None,
+            "command": gs_cmd or "missing",
+        },
+        "instance_id": os.environ.get("WEBSITE_INSTANCE_ID", "local"),
+        "cpu_effective": effective_cpu,
+        "storage": {
+            "upload_folder": str(UPLOAD_FOLDER.resolve()),
+            "pdf_count": pdf_count,
+            "retention_seconds": FILE_RETENTION_SECONDS,
+            "min_retention_seconds": MIN_FILE_RETENTION_SECONDS,
+            "effective_retention_seconds": EFFECTIVE_FILE_RETENTION_SECONDS,
+        },
+        "queue": queue_stats,
+        "limits": {
+            "sync_max_mb": SYNC_MAX_MB,
+            "async_max_mb": ASYNC_MAX_MB,
+            "sync_auto_async_mb": SYNC_AUTO_ASYNC_MB,
+            "sync_timeout_seconds": SYNC_TIMEOUT_SECONDS,
+        },
+        "compression": {
+            "mode": os.environ.get("COMPRESSION_MODE", "aggressive"),
+            "allow_lossy": _env_bool("ALLOW_LOSSY_COMPRESSION", True),
+            "scanned_confidence_for_aggressive": _env_float("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", 70.0),
+            "serial_fallback": _env_bool("PARALLEL_SERIAL_FALLBACK", True),
+            "gs_fast_web_view": _env_bool("GS_FAST_WEB_VIEW", True),
+            "gs_band_height": _env_int("GS_BAND_HEIGHT", 100),
+            "gs_band_buffer_space_mb": _env_int("GS_BAND_BUFFER_SPACE_MB", 500),
+            "gs_color_downsample_type": os.environ.get("GS_COLOR_DOWNSAMPLE_TYPE", "/Bicubic"),
+            "gs_gray_downsample_type": os.environ.get("GS_GRAY_DOWNSAMPLE_TYPE", "/Bicubic"),
+        },
+        "split": {
+            "threshold_mb": SPLIT_THRESHOLD_MB,
+            "trigger_mb": SPLIT_TRIGGER_MB,
+            "base_threshold_mb": BASE_SPLIT_THRESHOLD_MB,
+            "attachment_max_mb": os.environ.get("ATTACHMENT_MAX_MB", "unset"),
+            "safety_buffer_mb": _env_float("SPLIT_SAFETY_BUFFER_MB", 0.0),
+            "minimize_parts": _env_bool("SPLIT_MINIMIZE_PARTS", True),
+            "ultra_jpegq": _env_int("SPLIT_ULTRA_JPEGQ", 50),
+            "ultra_gap_pct": _env_float("SPLIT_ULTRA_GAP_PCT", 0.12),
+        },
+        "parallel": {
+            "threshold_mb": PARALLEL_THRESHOLD_MB,
+            "parallel_max_workers": os.environ.get("PARALLEL_MAX_WORKERS", "auto"),
+            "async_workers": ASYNC_WORKERS,
+            "max_parallel_chunks": _env_int("MAX_PARALLEL_CHUNKS", 16),
+            "target_chunk_mb": _env_float("TARGET_CHUNK_MB", 40.0),
+            "max_chunk_mb": _env_float("MAX_CHUNK_MB", 60.0),
+            "max_pages_per_chunk": _env_int("MAX_PAGES_PER_CHUNK", 200),
+            "gs_num_rendering_threads": os.environ.get("GS_NUM_RENDERING_THREADS", "auto"),
+        },
+    }
 
 
 def create_error_response(error: Exception, status_code: int = 500):
@@ -565,6 +660,15 @@ def handle_large_file(e):
     return jsonify({"success": False, "error": "File too large (max 300MB)"}), 413
 
 
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    if isinstance(e, NotFound):
+        logger.info("404 %s %s", request.method, request.path)
+    else:
+        logger.warning("HTTP %s on %s %s: %s", e.code, request.method, request.path, e.description)
+    return create_error_response(e, e.code or 400)
+
+
 @app.errorhandler(Exception)
 def handle_error(e):
     logger.exception("Unhandled error")
@@ -574,29 +678,16 @@ def handle_error(e):
 # Routes
 @app.route('/')
 def dashboard():
-    """Serve the web UI."""
-    return render_template('dashboard.html')
+    """Serve the debug dashboard."""
+    snapshot = build_health_snapshot()
+    return render_template('dashboard.html', snapshot=snapshot)
 
 
 @app.route('/health')
 def health():
     """Health check endpoint with instance info for debugging."""
-    gs = get_ghostscript_command()
-
-    # Count files in upload folder for debugging
-    try:
-        pdf_count = len(list(UPLOAD_FOLDER.glob("*.pdf")))
-    except Exception:
-        pdf_count = -1
-
-    return jsonify({
-        "status": "healthy" if gs else "degraded",
-        "ghostscript": gs is not None,
-        "timestamp": datetime.utcnow().isoformat(),
-        "upload_folder": str(UPLOAD_FOLDER.resolve()),
-        "pdf_count": pdf_count,
-        "instance_id": os.environ.get("WEBSITE_INSTANCE_ID", "local"),  # Azure instance ID
-    })
+    snapshot = build_health_snapshot()
+    return jsonify(snapshot)
 
 
 @app.route('/compress', methods=['POST'])

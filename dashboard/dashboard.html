@@ -3,1473 +3,387 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SJ PDF Compressor - Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+    <title>PDF Compressor Debug Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg-1: #f6f4ef;
+            --bg-2: #e6efff;
+            --ink: #1c1f24;
+            --muted: #5a616d;
+            --card: #ffffff;
+            --border: #1c1f24;
+            --accent: #1f4db8;
+            --accent-2: #0a2a73;
+            --ok: #0c8a5a;
+            --warn: #c45500;
+        }
+
         * {
+            box-sizing: border-box;
             margin: 0;
             padding: 0;
-            box-sizing: border-box;
         }
 
         body {
-            font-family: 'Press Start 2P', cursive;
-            background: linear-gradient(180deg, #f0f0f0 0%, #e0e0e0 100%);
+            font-family: "Space Grotesk", sans-serif;
+            color: var(--ink);
             min-height: 100vh;
-            padding: 20px;
-            font-size: 12px;
-            line-height: 1.6;
+            background:
+                radial-gradient(800px 400px at 20% -10%, #fff6cc 0%, transparent 60%),
+                radial-gradient(900px 500px at 110% 10%, #d6f0ff 0%, transparent 55%),
+                linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%);
+            padding: 28px;
         }
 
-        .container {
-            max-width: 800px;
+        .wrap {
+            max-width: 1100px;
             margin: 0 auto;
-            background: white;
-            border: 4px solid #000000;
-            box-shadow: 4px 4px 0px 0px rgba(0,0,0,1);
-            padding: 40px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        header {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: flex-end;
+            justify-content: space-between;
         }
 
         h1 {
-            color: #4169E1;
-            margin-bottom: 10px;
-            font-size: 1.8em;
-            text-transform: uppercase;
-            text-align: center;
+            font-size: clamp(1.8rem, 3vw, 2.6rem);
+            letter-spacing: -0.02em;
         }
 
         .subtitle {
-            color: #333;
-            margin-bottom: 30px;
-            font-size: 0.6em;
-            text-align: center;
-            text-transform: uppercase;
+            color: var(--muted);
+            font-size: 0.95rem;
+            margin-top: 6px;
         }
 
-        .upload-zone {
-            border: 4px dashed #4169E1;
-            padding: 40px;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.1s;
-            margin-bottom: 20px;
-            background: white;
+        .timestamp {
+            text-align: right;
+            font-size: 0.9rem;
+            color: var(--muted);
         }
 
-        .upload-zone:hover {
-            background: #f0f0f0;
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
         }
 
-        .upload-zone.dragover {
-            background: #e8f0ff;
-            border-color: #000000;
+        .card {
+            background: var(--card);
+            border: 2px solid var(--border);
+            border-radius: 14px;
+            padding: 16px 18px;
+            box-shadow: 6px 6px 0 rgba(28, 31, 36, 0.08);
+            animation: fadeUp 0.5s ease both;
         }
 
-        input[type="file"] {
-            display: none;
+        .card:nth-child(2) { animation-delay: 0.05s; }
+        .card:nth-child(3) { animation-delay: 0.1s; }
+        .card:nth-child(4) { animation-delay: 0.15s; }
+        .card:nth-child(5) { animation-delay: 0.2s; }
+        .card:nth-child(6) { animation-delay: 0.25s; }
+        .card:nth-child(7) { animation-delay: 0.3s; }
+        .card:nth-child(8) { animation-delay: 0.35s; }
+
+        .card h2 {
+            font-size: 1.05rem;
+            margin-bottom: 12px;
+            color: var(--accent-2);
+            letter-spacing: 0.02em;
         }
 
-        .btn {
-            background: #4169E1;
-            color: white;
-            border: 4px solid #000000;
-            padding: 15px 40px;
-            font-size: 0.9em;
-            cursor: pointer;
-            font-weight: normal;
-            font-family: 'Press Start 2P', cursive;
-            text-transform: uppercase;
-            box-shadow: 4px 4px 0px 0px rgba(0,0,0,1);
-            transition: all 0.1s;
-        }
-
-        .btn:hover:not(:disabled) {
-            transform: translate(2px, 2px);
-            box-shadow: 2px 2px 0px 0px rgba(0,0,0,1);
-        }
-
-        .btn:active:not(:disabled) {
-            transform: translate(4px, 4px);
-            box-shadow: 0px 0px 0px 0px rgba(0,0,0,1);
-        }
-
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .auth-section {
-            background: #fff3cd;
-            padding: 20px;
-            border: 4px solid #ffc107;
-            margin-bottom: 30px;
-            box-shadow: 4px 4px 0px 0px rgba(255,193,7,0.5);
-        }
-
-        .auth-section label {
-            display: block;
-            margin-bottom: 10px;
-            font-weight: normal;
-            color: #856404;
-            text-transform: uppercase;
-            font-size: 0.8em;
-        }
-
-        .auth-section input {
-            width: 100%;
-            padding: 12px;
-            border: 4px solid #000000;
-            font-size: 1em;
-            font-family: 'Press Start 2P', cursive;
-            background: white;
-        }
-
-        .auth-section small {
-            color: #856404;
-            display: block;
-            margin-top: 10px;
-            font-size: 0.6em;
-            line-height: 1.4;
-        }
-
-        .info-section {
-            background: #e0f2fe;
-            padding: 16px;
-            border: 4px solid #0284c7;
-            margin-bottom: 25px;
-            box-shadow: 4px 4px 0px 0px rgba(2,132,199,0.4);
-            font-size: 0.7em;
-            line-height: 1.6;
-        }
-
-        .info-section h4 {
-            color: #0369a1;
-            margin-bottom: 10px;
-            text-transform: uppercase;
-            font-size: 0.8em;
-        }
-
-        .info-section p {
-            color: #0c4a6e;
-            margin-bottom: 8px;
-        }
-
-        .status {
-            margin-top: 20px;
-            padding: 15px;
-            display: none;
-            border: 4px solid #000000;
-            font-size: 0.7em;
-            line-height: 1.5;
-        }
-
-        .status.success {
-            background: #10B981;
-            color: white;
-            box-shadow: 4px 4px 0px 0px rgba(16,185,129,0.5);
-        }
-
-        .status.error {
-            background: #EF4444;
-            color: white;
-            box-shadow: 4px 4px 0px 0px rgba(239,68,68,0.5);
-        }
-
-        .status.info {
-            background: #4169E1;
-            color: white;
-            box-shadow: 4px 4px 0px 0px rgba(65,105,225,0.5);
-        }
-
-        .progress {
-            width: 100%;
-            height: 40px;
-            background: #f0f0f0;
-            border: 4px solid #000000;
-            overflow: hidden;
-            margin: 20px 0;
-            display: none;
-            box-shadow: inset 2px 2px 0px 0px rgba(0,0,0,0.3);
-            position: relative;
-        }
-
-        .progress-bar {
-            height: 100%;
-            background: #4169E1;
-            transition: width 0.5s ease-in-out;
-            border-right: 4px solid #000000;
-            position: relative;
-            animation: progressPulse 2s ease-in-out infinite;
-        }
-
-        .progress-text {
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 0.65em;
-            font-weight: normal;
-            white-space: nowrap;
-            color: #000;
-            text-shadow: 1px 1px 0 #fff, -1px -1px 0 #fff, 1px -1px 0 #fff, -1px 1px 0 #fff;
-            z-index: 10;
-        }
-
-        @keyframes progressPulse {
-            0%, 100% {
-                opacity: 1;
-            }
-            50% {
-                opacity: 0.85;
-            }
-        }
-
-        .progress-bar::after {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: linear-gradient(
-                90deg,
-                transparent,
-                rgba(255, 255, 255, 0.3) 50%,
-                transparent
-            );
-            animation: shimmer 2s infinite;
-        }
-
-        @keyframes shimmer {
-            0% {
-                transform: translateX(-100%);
-            }
-            100% {
-                transform: translateX(100%);
-            }
-        }
-
-        .results {
-            display: none;
-            margin-top: 30px;
-            padding: 20px;
-            background: white;
-            border: 4px solid #4169E1;
-            box-shadow: 4px 4px 0px 0px rgba(65,105,225,1);
-        }
-
-        .results h3 {
-            color: #4169E1;
-            margin-bottom: 20px;
-            text-transform: uppercase;
-            font-size: 1em;
-        }
-
-        .stat {
+        .row {
             display: flex;
             justify-content: space-between;
-            padding: 12px 0;
-            border-bottom: 4px solid #000000;
-            font-size: 0.7em;
+            gap: 12px;
+            padding: 6px 0;
+            border-bottom: 1px dashed rgba(28, 31, 36, 0.15);
         }
 
-        .stat:last-child {
+        .row:last-child {
             border-bottom: none;
         }
 
-        .stat label {
-            font-weight: normal;
-            color: #333;
+        .label {
+            color: var(--muted);
+            font-size: 0.85rem;
+        }
+
+        .value {
+            font-size: 0.92rem;
+            text-align: right;
+        }
+
+        .mono {
+            font-family: "JetBrains Mono", monospace;
+            font-size: 0.85rem;
+        }
+
+        .badge {
+            padding: 3px 10px;
+            border-radius: 999px;
+            border: 1px solid currentColor;
             text-transform: uppercase;
+            font-size: 0.72rem;
+            letter-spacing: 0.08em;
         }
 
-        .stat value {
-            color: #4169E1;
-            font-weight: normal;
+        .badge.ok {
+            color: var(--ok);
+            background: rgba(12, 138, 90, 0.08);
         }
 
-        .health-indicator {
-            display: inline-block;
-            width: 16px;
-            height: 16px;
-            margin-left: 10px;
-            border: 4px solid #000000;
+        .badge.warn {
+            color: var(--warn);
+            background: rgba(196, 85, 0, 0.08);
         }
 
-        .health-indicator.healthy {
-            background: #10B981;
-            box-shadow: 0 0 0px #10B981;
+        .notes {
+            background: #fff7ed;
+            border: 2px solid #f2b36d;
+            border-radius: 14px;
+            padding: 16px 18px;
+            font-size: 0.9rem;
+            color: #7a4a12;
         }
 
-        .health-indicator.unhealthy {
-            background: #EF4444;
-            box-shadow: 0 0 0px #EF4444;
+        .notes h2 {
+            font-size: 1rem;
+            margin-bottom: 8px;
         }
 
-        .upload-icon {
-            font-size: 3em;
-            margin-bottom: 15px;
-        }
-
-        .upload-zone h3 {
-            margin-top: 20px;
-            color: #4169E1;
-            font-size: 0.8em;
-            text-transform: uppercase;
+        .notes p {
             line-height: 1.5;
         }
 
-        .upload-zone p {
-            color: #666;
-            margin-top: 15px;
-            font-size: 0.6em;
-            text-transform: uppercase;
+        @keyframes fadeUp {
+            from {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
 
-        .compression-status {
-            padding: 15px 20px;
-            margin-bottom: 20px;
-            border: 4px solid #000000;
-            font-size: 0.8em;
-            text-align: center;
-            font-weight: normal;
-            text-transform: uppercase;
-        }
+        @media (max-width: 640px) {
+            body {
+                padding: 20px;
+            }
 
-        .compression-status.success {
-            background: #10B981;
-            color: white;
-            box-shadow: 4px 4px 0px 0px rgba(16,185,129,0.5);
-        }
+            .timestamp {
+                text-align: left;
+            }
 
-        .compression-status.failed {
-            background: #EF4444;
-            color: white;
-            box-shadow: 4px 4px 0px 0px rgba(239,68,68,0.5);
-        }
+            .row {
+                flex-direction: column;
+                align-items: flex-start;
+            }
 
-        .quality-warnings {
-            margin-bottom: 20px;
-            padding: 12px 15px;
-            background: #FEF3C7;
-            border: 2px solid #F59E0B;
-            border-radius: 4px;
-        }
-
-        .quality-warnings .warning-item {
-            padding: 6px 0;
-            font-size: 0.85em;
-            color: #92400E;
-        }
-
-        .quality-warnings .warning-item.info {
-            color: #1E40AF;
-        }
-
-        .performance-notes {
-            margin-bottom: 20px;
-            padding: 12px 15px;
-            background: #E0F2FE;
-            border: 2px solid #0284C7;
-            border-radius: 4px;
-        }
-
-        .performance-notes h4 {
-            color: #0369A1;
-            margin-bottom: 10px;
-            font-size: 0.7em;
-            text-transform: uppercase;
-        }
-
-        .performance-notes .note-item {
-            padding: 6px 0;
-            font-size: 0.65em;
-            color: #0C4A6E;
-            line-height: 1.6;
-        }
-
-        .performance-notes .note-item .stage {
-            font-weight: bold;
-            text-transform: uppercase;
-        }
-
-        .performance-notes .note-item .time {
-            color: #0369A1;
-        }
-
-        .stats-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-
-        .stat-card {
-            background: #f0f0f0;
-            padding: 15px;
-            border: 4px solid #000000;
-            box-shadow: 2px 2px 0px 0px rgba(0,0,0,0.3);
-        }
-
-        .stat-card label {
-            display: block;
-            color: #666;
-            font-size: 0.55em;
-            margin-bottom: 8px;
-            text-transform: uppercase;
-        }
-
-        .stat-card value {
-            display: block;
-            color: #4169E1;
-            font-size: 0.75em;
-            font-weight: normal;
-        }
-
-        .parts-verification {
-            background: #f0f0f0;
-            padding: 15px;
-            border: 4px solid #000000;
-            margin-bottom: 20px;
-            box-shadow: 2px 2px 0px 0px rgba(0,0,0,0.3);
-        }
-
-        .parts-verification h4 {
-            color: #4169E1;
-            margin-bottom: 15px;
-            font-size: 0.7em;
-            text-transform: uppercase;
-        }
-
-        .part-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 10px;
-            background: white;
-            border: 3px solid #000000;
-            margin-bottom: 8px;
-            font-size: 0.6em;
-        }
-
-        .part-item:last-child {
-            margin-bottom: 0;
-        }
-
-        .part-status {
-            font-weight: normal;
-            padding: 5px 10px;
-            border: 3px solid #000000;
-        }
-
-        .part-status.ok {
-            background: #10B981;
-            color: white;
-        }
-
-        .part-status.warning {
-            background: #ffc107;
-            color: #000000;
-        }
-
-        .debug-section {
-            margin-top: 20px;
-            border: 4px solid #666;
-            background: #f5f5f5;
-        }
-
-        .debug-header {
-            background: #666;
-            color: white;
-            padding: 12px 15px;
-            cursor: pointer;
-            font-size: 0.7em;
-            text-transform: uppercase;
-            user-select: none;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .debug-header:hover {
-            background: #555;
-        }
-
-        .debug-content {
-            padding: 15px;
-            display: none;
-            font-size: 0.55em;
-            line-height: 1.6;
-            overflow-x: auto;
-        }
-
-        .debug-content.expanded {
-            display: block;
-        }
-
-        .debug-content pre {
-            background: white;
-            padding: 10px;
-            border: 3px solid #000000;
-            overflow-x: auto;
-            margin: 10px 0;
-        }
-
-        .debug-item {
-            margin-bottom: 12px;
-        }
-
-        .debug-item label {
-            color: #666;
-            display: block;
-            margin-bottom: 5px;
-            text-transform: uppercase;
-        }
-
-        .debug-item value {
-            color: #333;
-            font-family: monospace;
-            background: white;
-            padding: 8px;
-            border: 3px solid #000000;
-            display: block;
-            word-break: break-all;
-        }
-
-        .verify-section {
-            margin-top: 20px;
-            text-align: center;
-            padding-top: 20px;
-            border-top: 4px solid #e0e0e0;
-        }
-
-        .btn-secondary {
-            background: #666;
-            color: white;
-            border: 4px solid #000000;
-            padding: 12px 30px;
-            font-size: 0.7em;
-            cursor: pointer;
-            font-weight: normal;
-            font-family: 'Press Start 2P', cursive;
-            text-transform: uppercase;
-            box-shadow: 4px 4px 0px 0px rgba(0,0,0,1);
-            transition: all 0.1s;
-        }
-
-        .btn-secondary:hover:not(:disabled) {
-            transform: translate(2px, 2px);
-            box-shadow: 2px 2px 0px 0px rgba(0,0,0,1);
-        }
-
-        .btn-secondary:active:not(:disabled) {
-            transform: translate(4px, 4px);
-            box-shadow: 0px 0px 0px 0px rgba(0,0,0,1);
-        }
-
-        .btn-secondary:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .verification-results {
-            margin-top: 15px;
-            font-size: 0.6em;
-            text-align: left;
-        }
-
-        .verification-item {
-            padding: 10px;
-            background: white;
-            border: 3px solid #000000;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .verification-status {
-            padding: 5px 10px;
-            border: 3px solid #000000;
-            font-weight: normal;
-        }
-
-        .verification-status.pass {
-            background: #10B981;
-            color: white;
-        }
-
-        .verification-status.fail {
-            background: #EF4444;
-            color: white;
-        }
-
-        .outlook-disclaimer {
-            background: #fff3cd;
-            padding: 20px;
-            border: 4px solid #ffc107;
-            margin: 20px 0;
-            box-shadow: 4px 4px 0px 0px rgba(255,193,7,0.5);
-        }
-
-        .outlook-disclaimer h4 {
-            color: #856404;
-            margin-bottom: 15px;
-            font-size: 0.75em;
-            text-transform: uppercase;
-        }
-
-        .outlook-disclaimer p {
-            color: #856404;
-            font-size: 0.6em;
-            line-height: 1.8;
-            margin-bottom: 12px;
-        }
-
-        .outlook-disclaimer p:last-child {
-            margin-bottom: 0;
-        }
-
-        .outlook-disclaimer strong {
-            color: #000000;
-            font-weight: normal;
+            .value {
+                text-align: left;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>SJ PDF Compressor <span id="health-indicator"></span></h1>
-        <p class="subtitle">Lossless PDF compression with cryptographic verification</p>
-
-        <div class="info-section">
-            <h4>Salesforce / DocuRIO flow</h4>
-            <p>Salesforce calls <code>/compress-sync</code> with a time-limited <code>file_download_link</code>. This dashboard is only for manual smoke tests.</p>
-            <p>Use the API token field below to mirror the Salesforce call, and expect structured errors like <code>DownloadError</code> or <code>FileTooLarge</code> if the presigned URL is expired or invalid.</p>
-            <p>This UI uses the synchronous <code>/compress-sync</code> flow (no polling). Keep tests under 300MB per the sync limit.</p>
-        </div>
-
-        <div class="info-section" style="background:#f8fafc; border-color:#0ea5e9;">
-            <h4>Salesforce Async Callback Smoke Test</h4>
-            <p>Use this to trigger the new async flow (returns 202 immediately, then posts to Salesforce callback).</p>
-            <div style="margin-top:10px;">
-                <label style="display:block; font-size:0.65em; margin-bottom:6px;">Download URL</label>
-                <input id="async-url" type="text" style="width:100%; padding:10px; border:3px solid #000;" placeholder="https://...pdf">
+    <main class="wrap">
+        <header>
+            <div>
+                <h1>PDF Compressor Status</h1>
+                <div class="subtitle">Live snapshot for debugging, QA, and capacity checks.</div>
             </div>
-            <div style="margin-top:10px;">
-                <label style="display:block; font-size:0.65em; margin-bottom:6px;">matterId</label>
-                <input id="async-matter" type="text" style="width:100%; padding:10px; border:3px solid #000;" placeholder="a0L...">
+            <div class="timestamp mono">
+                Last update: {{ snapshot.timestamp }}
             </div>
-            <div style="margin-top:12px; text-align:center;">
-                <button class="btn" id="async-btn" style="padding:10px 20px; font-size:0.7em;">Send Async Test</button>
-            </div>
-            <div id="async-status" style="margin-top:10px; font-size:0.65em; color:#0c4a6e;"></div>
-        </div>
+        </header>
 
-        <div class="auth-section">
-            <label for="api-token">API Token</label>
-            <input type="password" id="api-token" placeholder="Enter your API token">
-            <small>Required for compression. Leave empty if API_TOKEN env var is not set on server.</small>
-        </div>
-
-        <div class="upload-zone" id="upload-zone">
-            <div class="upload-icon">📄</div>
-            <h3>Drop PDF here or click to browse</h3>
-            <p>Maximum file size: 300MB</p>
-            <input type="file" id="file-input" accept=".pdf">
-        </div>
-
-        <div style="text-align: center;">
-            <button class="btn" id="compress-btn" disabled>Compress PDF</button>
-        </div>
-
-        <div class="progress" id="progress">
-            <div class="progress-bar" id="progress-bar"></div>
-            <div class="progress-text" id="progress-text">0%</div>
-        </div>
-
-        <div class="status" id="status"></div>
-
-        <div class="results" id="results">
-            <h3>Compression Results</h3>
-
-            <!-- Compression Status Indicator -->
-            <div class="compression-status success" id="compression-status">
-                Compression: SUCCESS
-            </div>
-
-            <!-- Quality Warnings (hidden by default) -->
-            <div class="quality-warnings" id="quality-warnings" style="display: none;"></div>
-
-            <!-- Performance Notes (hidden by default) - explains why processing took time -->
-            <div class="performance-notes" id="performance-notes" style="display: none;">
-                <h4>Why did this take time?</h4>
-                <div id="performance-notes-list"></div>
-            </div>
-
-            <!-- Detailed Stats Panel -->
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <label>Compression Method</label>
-                    <value id="compression-method">-</value>
+        <section class="grid">
+            <article class="card">
+                <h2>Service</h2>
+                <div class="row">
+                    <span class="label">Status</span>
+                    <span class="badge {{ 'ok' if snapshot.status == 'healthy' else 'warn' }}">{{ snapshot.status }}</span>
                 </div>
-                <div class="stat-card">
-                    <label>Reduction</label>
-                    <value id="reduction">-</value>
+                <div class="row">
+                    <span class="label">Ghostscript</span>
+                    <span class="value mono">{{ 'available' if snapshot.ghostscript.available else 'missing' }}</span>
                 </div>
-                <div class="stat-card">
-                    <label>Original Size</label>
-                    <value id="original-size">-</value>
+                <div class="row">
+                    <span class="label">GS command</span>
+                    <span class="value mono">{{ snapshot.ghostscript.command }}</span>
                 </div>
-                <div class="stat-card">
-                    <label>Compressed Size</label>
-                    <value id="compressed-size">-</value>
+                <div class="row">
+                    <span class="label">Instance</span>
+                    <span class="value mono">{{ snapshot.instance_id }}</span>
                 </div>
-                <div class="stat-card" id="page-count-card" style="display: none;">
-                    <label>Page Count</label>
-                    <value id="page-count">-</value>
+                <div class="row">
+                    <span class="label">CPU (effective)</span>
+                    <span class="value mono">{{ snapshot.cpu_effective }}</span>
                 </div>
-                <div class="stat-card" id="processing-time-card" style="display: none;">
-                    <label>Processing Time</label>
-                    <value id="processing-time">-</value>
+            </article>
+
+            <article class="card">
+                <h2>Queue</h2>
+                <div class="row">
+                    <span class="label">Queue size</span>
+                    <span class="value mono">{{ snapshot.queue.queue_size }}</span>
                 </div>
-            </div>
-
-            <!-- Part Size Verification (shown when split) -->
-            <div class="parts-verification" id="parts-verification" style="display: none;">
-                <h4>Part Size Verification</h4>
-                <div id="parts-list"></div>
-                <div class="stat" style="margin-top: 15px; padding-top: 15px; border-top: 3px solid #000;">
-                    <label>Total Parts Size:</label>
-                    <value id="total-parts-size">-</value>
+                <div class="row">
+                    <span class="label">Queue max</span>
+                    <span class="value mono">{{ snapshot.queue.queue_max }}</span>
                 </div>
-            </div>
-
-            <!-- Download Links -->
-            <div id="download-links" style="margin-top: 20px; text-align: center;"></div>
-
-            <!-- Outlook Disclaimer -->
-            <div class="outlook-disclaimer">
-                <h4>Important: Email Client Settings</h4>
-                <p>
-                    <strong>If Outlook shows "Upload and share as OneDrive link?" when attaching files,
-                    this is an Outlook setting, not a file size issue.</strong>
-                </p>
-                <p>
-                    To disable: Outlook → File → Options → General → Attachment options →
-                    "Always attach them as copies"
-                </p>
-                <p>
-                    Your IT administrator can also configure this via Group Policy.
-                </p>
-            </div>
-
-            <!-- Verification Section -->
-            <div class="verify-section">
-                <button class="btn-secondary" id="verify-btn">Run Verification Test</button>
-                <div class="verification-results" id="verification-results"></div>
-            </div>
-
-            <!-- Debug Console -->
-            <div class="debug-section">
-                <div class="debug-header" id="debug-header">
-                    <span>Debug Info</span>
-                    <span id="debug-toggle">▼</span>
+                <div class="row">
+                    <span class="label">Processing</span>
+                    <span class="value mono">{{ snapshot.queue.processing }}</span>
                 </div>
-                <div class="debug-content" id="debug-content">
-                    <div class="debug-item">
-                        <label>Job ID:</label>
-                        <value id="debug-job-id">-</value>
-                        <button class="btn-secondary" id="copy-job-id-btn" style="margin-top: 8px; padding: 8px 15px; font-size: 0.6em;">Copy Job ID</button>
-                    </div>
-                    <div class="debug-item">
-                        <label>Timestamp:</label>
-                        <value id="debug-timestamp">-</value>
-                    </div>
-                    <div class="debug-item">
-                        <label>Diagnostics:</label>
-                        <button class="btn-secondary" id="run-diagnostics-btn" style="margin-top: 8px; padding: 8px 15px; font-size: 0.6em;">Run Diagnostics</button>
-                        <pre id="debug-diagnostics" style="margin-top: 10px; display: none;">-</pre>
-                    </div>
-                    <div class="debug-item">
-                        <label>Raw JSON Response:</label>
-                        <pre id="debug-json">-</pre>
-                    </div>
+                <div class="row">
+                    <span class="label">Completed</span>
+                    <span class="value mono">{{ snapshot.queue.completed }}</span>
                 </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        let selectedFile = null;
-        let downloadLinks = [];
-        let pollInterval = null;
-        let currentResult = null; // Store full result for verification
-
-        const uploadZone = document.getElementById('upload-zone');
-        const fileInput = document.getElementById('file-input');
-        const compressBtn = document.getElementById('compress-btn');
-        const apiTokenInput = document.getElementById('api-token');
-        const statusDiv = document.getElementById('status');
-        const progressDiv = document.getElementById('progress');
-        const progressBar = document.getElementById('progress-bar');
-        const progressText = document.getElementById('progress-text');
-        const resultsDiv = document.getElementById('results');
-        const healthIndicator = document.getElementById('health-indicator');
-        const asyncBtn = document.getElementById('async-btn');
-        const asyncUrlInput = document.getElementById('async-url');
-        const asyncMatterInput = document.getElementById('async-matter');
-        const asyncStatus = document.getElementById('async-status');
-
-        // Debug toggle functionality
-        document.getElementById('debug-header').addEventListener('click', () => {
-            const content = document.getElementById('debug-content');
-            const toggle = document.getElementById('debug-toggle');
-            content.classList.toggle('expanded');
-            toggle.textContent = content.classList.contains('expanded') ? '▲' : '▼';
-        });
-
-        /**
-         * Safely parse JSON response, handling HTML error pages from server.
-         * @param {Response} response - Fetch Response object
-         * @returns {Promise<{data: object|null, error: string|null}>}
-         */
-        async function safeParseJson(response) {
-            const contentType = response.headers.get('content-type') || '';
-            const responseText = await response.text();
-
-            // Check if we got HTML instead of JSON (server error page)
-            if (contentType.includes('text/html') || responseText.trim().startsWith('<')) {
-                let errorMessage = 'Server returned an unexpected response';
-
-                if (response.status === 502) {
-                    errorMessage = 'Service temporarily unavailable (Bad Gateway). Please try again.';
-                } else if (response.status === 503) {
-                    errorMessage = 'Service is currently unavailable. Please try again later.';
-                } else if (response.status === 504) {
-                    errorMessage = 'Request timed out. Try a smaller file or try again later.';
-                } else if (response.status >= 500) {
-                    errorMessage = `Server error (${response.status}). Please try again later.`;
-                } else if (response.status >= 400) {
-                    errorMessage = `Request error (${response.status}). Please check your input.`;
-                }
-
-                return { data: null, error: errorMessage };
-            }
-
-            // Try to parse as JSON
-            try {
-                const data = JSON.parse(responseText);
-                return { data, error: null };
-            } catch (parseError) {
-                console.error('JSON parse error:', parseError);
-                console.error('Response text:', responseText.substring(0, 500));
-                return {
-                    data: null,
-                    error: `Failed to parse server response. Status: ${response.status}`
-                };
-            }
-        }
-
-        // Check API health on load
-        fetch('/health')
-            .then(async (res) => {
-                const { data, error } = await safeParseJson(res);
-                if (data && data.status === 'healthy') {
-                    healthIndicator.innerHTML = '<span class="health-indicator healthy"></span>';
-                } else {
-                    console.warn('Health check failed:', error || 'Unknown error');
-                    healthIndicator.innerHTML = '<span class="health-indicator unhealthy"></span>';
-                }
-            })
-            .catch((err) => {
-                console.error('Health check error:', err);
-                healthIndicator.innerHTML = '<span class="health-indicator unhealthy"></span>';
-            });
-
-        // Upload zone click
-        uploadZone.addEventListener('click', () => fileInput.click());
-
-        // Drag and drop
-        uploadZone.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadZone.classList.add('dragover');
-        });
-
-        uploadZone.addEventListener('dragleave', () => {
-            uploadZone.classList.remove('dragover');
-        });
-
-        uploadZone.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadZone.classList.remove('dragover');
-            const files = e.dataTransfer.files;
-            if (files.length > 0) {
-                handleFileSelect(files[0]);
-            }
-        });
-
-        // File input change
-        fileInput.addEventListener('change', (e) => {
-            if (e.target.files.length > 0) {
-                handleFileSelect(e.target.files[0]);
-            }
-        });
-
-        // API token input - re-enable button when token entered
-        apiTokenInput.addEventListener('input', updateCompressButton);
-
-        function handleFileSelect(file) {
-            if (!file.name.toLowerCase().endsWith('.pdf')) {
-                showStatus('Please select a PDF file', 'error');
-                return;
-            }
-
-            if (file.size > 300 * 1024 * 1024) {
-                showStatus('File size exceeds 300MB limit', 'error');
-                return;
-            }
-
-            selectedFile = file;
-            const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
-            const isLargeFile = fileSizeMB > 30;
-            const statusColor = isLargeFile ? '#EF4444' : '#10B981';
-
-            uploadZone.innerHTML = `
-                <div class="upload-icon">✓</div>
-                <h3 style="color: ${statusColor};">File selected: ${file.name}</h3>
-                <p style="color: ${statusColor};">Size: ${fileSizeMB} MB</p>
-            `;
-            updateCompressButton();
-            hideStatus();
-        }
-
-        function updateCompressButton() {
-            // Only require file - token is optional (server may not have API_TOKEN set)
-            compressBtn.disabled = !selectedFile;
-        }
-
-        // Compress button
-        compressBtn.addEventListener('click', compressPDF);
-
-        // Async Salesforce-style test (returns 202 and triggers callback)
-        asyncBtn.addEventListener('click', async () => {
-            const url = asyncUrlInput.value.trim();
-            const matter = asyncMatterInput.value.trim();
-            asyncStatus.style.color = '#0c4a6e';
-            asyncStatus.textContent = '';
-
-            if (!url || !matter) {
-                asyncStatus.style.color = '#b91c1c';
-                asyncStatus.textContent = 'Provide both download URL and matterId.';
-                return;
-            }
-
-            const headers = { 'Content-Type': 'application/json' };
-            const token = apiTokenInput.value.trim();
-            if (token) headers['Authorization'] = `Bearer ${token}`;
-
-            asyncStatus.textContent = 'Sending async request...';
-
-            try {
-                const resp = await fetch('/compress-sync', {
-                    method: 'POST',
-                    headers,
-                    body: JSON.stringify({
-                        file_download_link: url,
-                        matterId: matter
-                    })
-                });
-                const { data, error } = await safeParseJson(resp);
-                if (error) throw new Error(error);
-                if (!resp.ok || !data.success) {
-                    const msg = data?.error || `HTTP ${resp.status}`;
-                    throw new Error(msg);
-                }
-                asyncStatus.style.color = '#065f46';
-                asyncStatus.textContent = `Accepted (job ${data.job_id || 'n/a'}). Callback will post to Salesforce.`;
-            } catch (err) {
-                asyncStatus.style.color = '#b91c1c';
-                asyncStatus.textContent = `Error: ${err.message}`;
-            }
-        });
-
-        async function compressPDF() {
-            if (!selectedFile) return;
-
-            const formData = new FormData();
-            formData.append('file', selectedFile);  // Field name matches /compress-sync
-
-            // Reset UI
-            resultsDiv.style.display = 'none';
-            progressDiv.style.display = 'block';
-            progressBar.style.width = '20%';
-            progressText.textContent = 'Uploading & compressing...';
-            compressBtn.disabled = true;
-            downloadLinks = [];
-
-            showStatus('Compressing PDF (sync)...', 'info');
-
-            // Build headers - include auth token if provided
-            const headers = {};
-            const token = apiTokenInput.value.trim();
-            if (token) {
-                headers['Authorization'] = `Bearer ${token}`;
-            }
-
-            try {
-                // Single request - sync endpoint returns result directly
-                const response = await fetch('/compress-sync', {
-                    method: 'POST',
-                    headers: headers,
-                    body: formData
-                });
-
-                const { data: result, error: parseError } = await safeParseJson(response);
-
-                if (parseError) {
-                    throw new Error(parseError);
-                }
-
-                if (!response.ok || !result.success) {
-                    const serverMessage = result?.error_message || result?.error || `Compression failed (HTTP ${response.status})`;
-                    const combined = result?.error_type ? `${result.error_type}: ${serverMessage}` : serverMessage;
-                    throw new Error(combined);
-                }
-
-                // Auto-async path: poll until completion if server queued the job.
-                if (response.status === 202 || result.status === 'processing' || result.job_id) {
-                    const jobId = result.job_id;
-                    if (!jobId) {
-                        throw new Error('Async job started but no job_id returned');
-                    }
-
-                    progressBar.style.width = '25%';
-                    progressText.textContent = 'Queued for processing...';
-                    showStatus(`Queued job ${jobId}. Processing...`, 'info');
-
-                    const finalResult = await pollForCompletion(jobId, headers);
-
-                    if (finalResult.original_mb && finalResult.compressed_mb && !finalResult.reduction_percent) {
-                        finalResult.reduction_percent = ((finalResult.original_mb - finalResult.compressed_mb) / finalResult.original_mb) * 100;
-                    }
-
-                    progressBar.style.width = '100%';
-                    progressText.textContent = 'Done!';
-
-                    displayResults(finalResult);
-                    showStatus('Compression successful!', 'success');
-                    return;
-                }
-
-                // Calculate reduction percent for display (sync response doesn't include it)
-                if (result.original_mb && result.compressed_mb && !result.reduction_percent) {
-                    result.reduction_percent = ((result.original_mb - result.compressed_mb) / result.original_mb) * 100;
-                }
-
-                progressBar.style.width = '100%';
-                progressText.textContent = 'Done!';
-
-                displayResults(result);
-                showStatus('Compression successful!', 'success');
-
-            } catch (error) {
-                let displayMessage = error.message;
-                if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
-                    displayMessage = 'Network error. Please check your connection and try again.';
-                }
-                showStatus(`Error: ${displayMessage}`, 'error');
-                console.error('Compression error:', error);
-            } finally {
-                setTimeout(() => {
-                    progressDiv.style.display = 'none';
-                    compressBtn.disabled = false;
-                }, 1000);
-            }
-        }
-
-        async function pollForCompletion(jobId, headers) {
-            return new Promise((resolve, reject) => {
-                pollInterval = setInterval(async () => {
-                    try {
-                        const response = await fetch(`/status/${jobId}`, { headers });
-                        const { data, error } = await safeParseJson(response);
-
-                        if (error) {
-                            clearInterval(pollInterval);
-                            reject(new Error(error));
-                            return;
-                        }
-
-                        // Update progress bar with real-time data from backend
-                        if (data.status === 'processing' && data.progress) {
-                            const { percent, stage, message } = data.progress;
-                            progressBar.style.width = percent + '%';
-                            progressText.textContent = `${percent}% - ${message}`;
-                            showStatus(`${stage.toUpperCase()}: ${message}`, 'info');
-                        } else if (data.status === 'processing') {
-                            // Fallback if no progress data
-                            progressText.textContent = 'Processing...';
-                        }
-
-                        if (data.status === 'completed') {
-                            clearInterval(pollInterval);
-                            resolve(data);
-                        } else if (data.status === 'failed') {
-                            clearInterval(pollInterval);
-                            reject(new Error(data.error || 'Compression failed'));
-                        }
-                        // else still processing, continue polling
-                    } catch (err) {
-                        clearInterval(pollInterval);
-                        reject(err);
-                    }
-                }, 1000); // Poll every 1 second for smoother progress updates
-            });
-        }
-
-        function displayResults(result) {
-            // Store result for verification
-            currentResult = result;
-
-            // 1. COMPRESSION STATUS INDICATOR
-            const statusEl = document.getElementById('compression-status');
-            const method = result.compression_method || 'ghostscript';
-            const reduction = result.reduction_percent || 0;
-
-            if (method === 'ghostscript' && reduction > 0) {
-                statusEl.className = 'compression-status success';
-                statusEl.textContent = 'Compression: SUCCESS';
-            } else if (method === 'none' || reduction === 0) {
-                statusEl.className = 'compression-status failed';
-                statusEl.textContent = 'Compression: FAILED (no reduction)';
-            } else {
-                statusEl.className = 'compression-status success';
-                statusEl.textContent = 'Compression: SUCCESS';
-            }
-
-            // Show quality warnings if any
-            const warningsEl = document.getElementById('quality-warnings');
-            if (result.quality_warnings && result.quality_warnings.length > 0) {
-                warningsEl.style.display = 'block';
-                warningsEl.innerHTML = result.quality_warnings
-                    .map(w => `<div class="warning-item ${w.severity || ''}">${w.message}</div>`)
-                    .join('');
-            } else {
-                warningsEl.style.display = 'none';
-            }
-
-            // Show performance notes if any (explains why processing took time)
-            const perfNotesEl = document.getElementById('performance-notes');
-            const perfNotesListEl = document.getElementById('performance-notes-list');
-            if (result.performance_notes && result.performance_notes.length > 0) {
-                perfNotesEl.style.display = 'block';
-                perfNotesListEl.innerHTML = result.performance_notes
-                    .map(n => `<div class="note-item"><span class="stage">${n.stage}</span> (<span class="time">${n.seconds}s</span>): ${n.reason}</div>`)
-                    .join('');
-            } else {
-                perfNotesEl.style.display = 'none';
-            }
-
-            // 2. DETAILED STATS PANEL
-            const originalBytes = result.original_size || (result.original_mb * 1024 * 1024);
-            const compressedBytes = result.compressed_size || (result.compressed_mb * 1024 * 1024);
-
-            document.getElementById('compression-method').textContent = method.toUpperCase();
-            document.getElementById('reduction').textContent = reduction.toFixed(1) + '%';
-            document.getElementById('original-size').innerHTML =
-                `${result.original_mb.toFixed(2)} MB<br><small style="font-size: 0.8em; color: #666;">(${originalBytes.toLocaleString()} bytes)</small>`;
-            document.getElementById('compressed-size').innerHTML =
-                `${result.compressed_mb.toFixed(2)} MB<br><small style="font-size: 0.8em; color: #666;">(${compressedBytes.toLocaleString()} bytes)</small>`;
-
-            // Show page count if available
-            const pageCountCard = document.getElementById('page-count-card');
-            if (result.page_count || result.pages) {
-                pageCountCard.style.display = 'block';
-                document.getElementById('page-count').textContent = result.page_count || result.pages;
-            } else {
-                pageCountCard.style.display = 'none';
-            }
-
-            // Show processing time if available
-            const processingTimeCard = document.getElementById('processing-time-card');
-            if (result.processing_time) {
-                processingTimeCard.style.display = 'block';
-                const time = typeof result.processing_time === 'object'
-                    ? result.processing_time.total_seconds
-                    : result.processing_time;
-                document.getElementById('processing-time').textContent = time + 's';
-            } else {
-                processingTimeCard.style.display = 'none';
-            }
-
-            // 3. PART SIZE VERIFICATION
-            const partsVerification = document.getElementById('parts-verification');
-            // Get the download links - sync endpoint uses 'files', async uses 'download_links'
-            const currentDownloadLinks = result.download_links || result.files || [];
-
-            if (result.was_split && result.total_parts > 1) {
-                partsVerification.style.display = 'block';
-
-                const partsList = document.getElementById('parts-list');
-                partsList.innerHTML = '';
-
-                const partSizes = result.part_sizes || [];
-                let totalPartsSize = 0;
-
-                currentDownloadLinks.forEach((link, index) => {
-                    const partSize = partSizes[index] || 0;
-                    const partSizeMB = partSize / (1024 * 1024);
-                    totalPartsSize += partSize;
-
-                    const partItem = document.createElement('div');
-                    partItem.className = 'part-item';
-
-                    const sizeLimit = 25 * 1024 * 1024; // 25MB
-                    const isUnderLimit = partSize <= sizeLimit;
-
-                    partItem.innerHTML = `
-                        <span>Part ${index + 1}: ${partSizeMB.toFixed(2)} MB (${partSize.toLocaleString()} bytes)</span>
-                        <span class="part-status ${isUnderLimit ? 'ok' : 'warning'}">
-                            ${isUnderLimit ? '✓ Under 25MB' : '⚠ Over 25MB'}
-                        </span>
-                    `;
-                    partsList.appendChild(partItem);
-                });
-
-                const totalPartsSizeMB = totalPartsSize / (1024 * 1024);
-                const comparisonMatch = Math.abs(totalPartsSize - compressedBytes) < 1024; // Within 1KB tolerance
-
-                document.getElementById('total-parts-size').innerHTML =
-                    `${totalPartsSizeMB.toFixed(2)} MB (${totalPartsSize.toLocaleString()} bytes)<br>` +
-                    `<small style="font-size: 0.8em; color: ${comparisonMatch ? '#10B981' : '#EF4444'};">` +
-                    `${comparisonMatch ? '✓' : '✗'} Matches compressed size</small>`;
-            } else {
-                partsVerification.style.display = 'none';
-            }
-
-            // Store download links and create buttons (sync uses 'files', async uses 'download_links')
-            downloadLinks = result.download_links || result.files || [];
-            const linksContainer = document.getElementById('download-links');
-            linksContainer.innerHTML = '';
-
-            downloadLinks.forEach((link, index) => {
-                const btn = document.createElement('button');
-                btn.className = 'btn';
-                btn.style.margin = '5px';
-                btn.textContent = downloadLinks.length > 1
-                    ? `Download Part ${index + 1}`
-                    : 'Download Compressed PDF';
-                btn.onclick = () => window.location.href = link;
-                linksContainer.appendChild(btn);
-            });
-
-            // 4. DEBUG CONSOLE
-            document.getElementById('debug-job-id').textContent = result.request_id || result.job_id || 'N/A';
-            document.getElementById('debug-timestamp').textContent = new Date().toISOString();
-            document.getElementById('debug-json').textContent = JSON.stringify(result, null, 2);
-            // Reset diagnostics display
-            document.getElementById('debug-diagnostics').style.display = 'none';
-
-            resultsDiv.style.display = 'block';
-        }
-
-        function showStatus(message, type) {
-            statusDiv.textContent = message;
-            statusDiv.className = 'status ' + type;
-            statusDiv.style.display = 'block';
-        }
-
-        function hideStatus() {
-            statusDiv.style.display = 'none';
-        }
-
-        // 5. QUICK VERIFICATION TEST
-        document.getElementById('verify-btn').addEventListener('click', async () => {
-            if (!currentResult || !downloadLinks.length) {
-                showStatus('No compression results to verify', 'error');
-                return;
-            }
-
-            const verifyBtn = document.getElementById('verify-btn');
-            const resultsContainer = document.getElementById('verification-results');
-
-            verifyBtn.disabled = true;
-            verifyBtn.textContent = 'Verifying...';
-            resultsContainer.innerHTML = '<p style="text-align: center; color: #666;">Running verification tests...</p>';
-
-            try {
-                const verifications = [];
-
-                // Test each download link
-                for (let i = 0; i < downloadLinks.length; i++) {
-                    const link = downloadLinks[i];
-                    const partNumber = i + 1;
-
-                    try {
-                        // Use HEAD request to get file size without downloading
-                        const response = await fetch(link, { method: 'HEAD' });
-
-                        if (!response.ok) {
-                            verifications.push({
-                                part: partNumber,
-                                status: 'fail',
-                                message: `HTTP ${response.status}: Failed to fetch`,
-                                expected: null,
-                                actual: null
-                            });
-                            continue;
-                        }
-
-                        const contentLength = response.headers.get('content-length');
-                        const actualSize = contentLength ? parseInt(contentLength) : null;
-
-                        // Get expected size from result
-                        let expectedSize = null;
-                        if (currentResult.part_sizes && currentResult.part_sizes[i]) {
-                            expectedSize = currentResult.part_sizes[i];
-                        } else if (downloadLinks.length === 1) {
-                            expectedSize = currentResult.compressed_size || (currentResult.compressed_mb * 1024 * 1024);
-                        }
-
-                        if (!actualSize) {
-                            verifications.push({
-                                part: partNumber,
-                                status: 'fail',
-                                message: 'Could not determine file size',
-                                expected: expectedSize,
-                                actual: null
-                            });
-                            continue;
-                        }
-
-                        // Check if sizes match (within 1KB tolerance)
-                        const matches = expectedSize ? Math.abs(actualSize - expectedSize) < 1024 : true;
-
-                        verifications.push({
-                            part: partNumber,
-                            status: matches ? 'pass' : 'fail',
-                            message: matches ? 'Size matches' : 'Size mismatch',
-                            expected: expectedSize,
-                            actual: actualSize
-                        });
-
-                    } catch (error) {
-                        verifications.push({
-                            part: partNumber,
-                            status: 'fail',
-                            message: `Error: ${error.message}`,
-                            expected: null,
-                            actual: null
-                        });
-                    }
-                }
-
-                // Display results
-                resultsContainer.innerHTML = '';
-                verifications.forEach(v => {
-                    const item = document.createElement('div');
-                    item.className = 'verification-item';
-
-                    const partLabel = downloadLinks.length > 1 ? `Part ${v.part}` : 'Compressed PDF';
-
-                    let details = v.message;
-                    if (v.expected && v.actual) {
-                        const expectedMB = (v.expected / (1024 * 1024)).toFixed(2);
-                        const actualMB = (v.actual / (1024 * 1024)).toFixed(2);
-                        details += ` (Expected: ${expectedMB}MB, Actual: ${actualMB}MB)`;
-                    }
-
-                    item.innerHTML = `
-                        <span>${partLabel}: ${details}</span>
-                        <span class="verification-status ${v.status}">${v.status.toUpperCase()}</span>
-                    `;
-                    resultsContainer.appendChild(item);
-                });
-
-                // Show summary
-                const passCount = verifications.filter(v => v.status === 'pass').length;
-                const totalCount = verifications.length;
-                const allPassed = passCount === totalCount;
-
-                showStatus(
-                    `Verification complete: ${passCount}/${totalCount} tests passed`,
-                    allPassed ? 'success' : 'error'
-                );
-
-            } catch (error) {
-                showStatus(`Verification error: ${error.message}`, 'error');
-                resultsContainer.innerHTML = '<p style="text-align: center; color: #EF4444;">Verification failed</p>';
-            } finally {
-                verifyBtn.disabled = false;
-                verifyBtn.textContent = 'Run Verification Test';
-            }
-        });
-
-        // Copy Job ID button
-        document.getElementById('copy-job-id-btn').addEventListener('click', () => {
-            const jobId = document.getElementById('debug-job-id').textContent;
-            if (jobId && jobId !== '-' && jobId !== 'N/A') {
-                navigator.clipboard.writeText(jobId).then(() => {
-                    showStatus('Job ID copied to clipboard!', 'success');
-                }).catch(() => {
-                    showStatus('Failed to copy Job ID', 'error');
-                });
-            }
-        });
-
-        // Run Diagnostics button
-        document.getElementById('run-diagnostics-btn').addEventListener('click', async () => {
-            const jobId = document.getElementById('debug-job-id').textContent;
-            if (!jobId || jobId === '-' || jobId === 'N/A') {
-                showStatus('No job ID available for diagnostics', 'error');
-                return;
-            }
-
-            const diagBtn = document.getElementById('run-diagnostics-btn');
-            const diagPre = document.getElementById('debug-diagnostics');
-
-            diagBtn.disabled = true;
-            diagBtn.textContent = 'Running...';
-            diagPre.style.display = 'block';
-            diagPre.textContent = 'Fetching diagnostics...';
-
-            try {
-                const headers = {};
-                const token = apiTokenInput.value.trim();
-                if (token) {
-                    headers['Authorization'] = `Bearer ${token}`;
-                }
-
-                const response = await fetch(`/diagnose/${jobId}`, { headers });
-                const { data, error } = await safeParseJson(response);
-
-                if (error) {
-                    diagPre.textContent = `Error: ${error}`;
-                    showStatus('Diagnostics failed', 'error');
-                } else {
-                    diagPre.textContent = JSON.stringify(data, null, 2);
-                    showStatus('Diagnostics loaded!', 'success');
-
-                    // Highlight any size discrepancies
-                    if (data.diagnostics && data.diagnostics.size_verification) {
-                        const sv = data.diagnostics.size_verification;
-                        if (Math.abs(sv.discrepancy_percent) > 1) {
-                            showStatus(`WARNING: Size discrepancy of ${sv.discrepancy_percent}%!`, 'error');
-                        }
-                    }
-                }
-            } catch (err) {
-                diagPre.textContent = `Error: ${err.message}`;
-                showStatus('Diagnostics failed', 'error');
-            } finally {
-                diagBtn.disabled = false;
-                diagBtn.textContent = 'Run Diagnostics';
-            }
-        });
-    </script>
+                <div class="row">
+                    <span class="label">Failed</span>
+                    <span class="value mono">{{ snapshot.queue.failed }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Workers</span>
+                    <span class="value mono">{{ snapshot.queue.worker_count }}</span>
+                </div>
+            </article>
+
+            <article class="card">
+                <h2>Storage</h2>
+                <div class="row">
+                    <span class="label">Upload folder</span>
+                    <span class="value mono">{{ snapshot.storage.upload_folder }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">PDFs on disk</span>
+                    <span class="value mono">{{ snapshot.storage.pdf_count }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Retention (sec)</span>
+                    <span class="value mono">{{ snapshot.storage.effective_retention_seconds }}</span>
+                </div>
+            </article>
+
+            <article class="card">
+                <h2>Compression</h2>
+                <div class="row">
+                    <span class="label">Mode</span>
+                    <span class="value mono">{{ snapshot.compression.mode }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Lossy allowed</span>
+                    <span class="value mono">{{ 'yes' if snapshot.compression.allow_lossy else 'no' }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Serial fallback</span>
+                    <span class="value mono">{{ 'on' if snapshot.compression.serial_fallback else 'off' }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Scanned confidence</span>
+                    <span class="value mono">{{ snapshot.compression.scanned_confidence_for_aggressive }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Fast web view</span>
+                    <span class="value mono">{{ 'on' if snapshot.compression.gs_fast_web_view else 'off' }}</span>
+                </div>
+            </article>
+
+            <article class="card">
+                <h2>Split & Parts</h2>
+                <div class="row">
+                    <span class="label">Threshold (MB)</span>
+                    <span class="value mono">{{ snapshot.split.threshold_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Trigger (MB)</span>
+                    <span class="value mono">{{ snapshot.split.trigger_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Minimize parts</span>
+                    <span class="value mono">{{ 'on' if snapshot.split.minimize_parts else 'off' }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Ultra JPEGQ</span>
+                    <span class="value mono">{{ snapshot.split.ultra_jpegq }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Ultra gap pct</span>
+                    <span class="value mono">{{ snapshot.split.ultra_gap_pct }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Attachment max</span>
+                    <span class="value mono">{{ snapshot.split.attachment_max_mb }}</span>
+                </div>
+            </article>
+
+            <article class="card">
+                <h2>Parallel</h2>
+                <div class="row">
+                    <span class="label">Threshold (MB)</span>
+                    <span class="value mono">{{ snapshot.parallel.threshold_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Max workers</span>
+                    <span class="value mono">{{ snapshot.parallel.parallel_max_workers }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Async workers</span>
+                    <span class="value mono">{{ snapshot.parallel.async_workers }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Max chunks</span>
+                    <span class="value mono">{{ snapshot.parallel.max_parallel_chunks }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Target chunk (MB)</span>
+                    <span class="value mono">{{ snapshot.parallel.target_chunk_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Max chunk (MB)</span>
+                    <span class="value mono">{{ snapshot.parallel.max_chunk_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Max pages/chunk</span>
+                    <span class="value mono">{{ snapshot.parallel.max_pages_per_chunk }}</span>
+                </div>
+            </article>
+
+            <article class="card">
+                <h2>Limits</h2>
+                <div class="row">
+                    <span class="label">Sync max (MB)</span>
+                    <span class="value mono">{{ snapshot.limits.sync_max_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Async max (MB)</span>
+                    <span class="value mono">{{ snapshot.limits.async_max_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Auto-async (MB)</span>
+                    <span class="value mono">{{ snapshot.limits.sync_auto_async_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Sync timeout (sec)</span>
+                    <span class="value mono">{{ snapshot.limits.sync_timeout_seconds }}</span>
+                </div>
+            </article>
+        </section>
+
+        <section class="notes">
+            <h2>Part Count Rule</h2>
+            <p>Parts are roughly: ceil(output_mb / split_threshold_mb). With a 25MB cap, fewer parts require more lossy compression.</p>
+        </section>
+    </main>
 </body>
 </html>

@@ -41,6 +41,7 @@ _job_lock = threading.Lock()
 _work_queue: queue.Queue = queue.Queue()
 _processor: Optional[Callable] = None
 _workers_started = False
+_worker_count = 0
 
 
 def create_job() -> str:
@@ -127,6 +128,26 @@ def set_processor(processor_func: Callable[[str, Dict[str, Any]], None]) -> None
     _processor = processor_func
 
 
+def get_stats() -> Dict[str, Any]:
+    """Return lightweight queue and job stats for health/debug endpoints."""
+    with _job_lock:
+        total_jobs = len(_jobs)
+        status_counts = {"processing": 0, "completed": 0, "failed": 0}
+        for job in _jobs.values():
+            status_counts[job.status] = status_counts.get(job.status, 0) + 1
+
+    return {
+        "queue_size": _work_queue.qsize(),
+        "queue_max": MAX_QUEUE_SIZE,
+        "total_jobs": total_jobs,
+        "processing": status_counts.get("processing", 0),
+        "completed": status_counts.get("completed", 0),
+        "failed": status_counts.get("failed", 0),
+        "workers_started": _workers_started,
+        "worker_count": _worker_count,
+    }
+
+
 def _worker() -> None:
     """Background worker that processes jobs from the queue."""
     logger.info("Job queue worker started")
@@ -169,7 +190,7 @@ def _cleanup_expired_jobs() -> None:
 
 def start_workers(num_workers: int = 8) -> None:
     """Start multiple background worker threads."""
-    global _workers_started
+    global _workers_started, _worker_count
     if os.environ.get("DISABLE_ASYNC_WORKERS", "").lower() in ("1", "true", "yes"):
         logger.info("Async workers disabled by DISABLE_ASYNC_WORKERS")
         return
@@ -184,5 +205,6 @@ def start_workers(num_workers: int = 8) -> None:
     cleanup_thread = threading.Thread(target=_cleanup_expired_jobs, daemon=True)
     cleanup_thread.start()
     
+    _worker_count = num_workers
     logger.info(f"Started {num_workers} compression workers and cleanup thread")
     _workers_started = True
