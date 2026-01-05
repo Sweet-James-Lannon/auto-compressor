@@ -211,8 +211,8 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
             logger.warning(f"[merge_pdfs]    Output size:  {output_mb:.2f}MB ({output_bytes:,} bytes)")
             logger.warning(f"[merge_pdfs]    Bloat: +{bloat_mb:.2f}MB (+{bloat_pct:.1f}%)")
             logger.warning(f"[merge_pdfs]    Likely cause: PyPDF2 fallback duplicated shared resources")
-            # Attempt a lossless Ghostscript pass to deduplicate if available.
-            if gs_cmd:
+            # Attempt a lossless Ghostscript pass only if bloat is meaningful (>1%).
+            if gs_cmd and bloat_pct > 1.0:
                 dedup_path = output_path.with_name(f"{output_path.stem}_dedup.pdf")
                 success, _ = optimize_split_part(output_path, dedup_path)
                 if success and dedup_path.exists() and dedup_path.stat().st_size < output_bytes:
@@ -323,7 +323,7 @@ def split_by_size(
             )
 
         part_path = output_dir / f"{base_name}_part{i+1}.pdf"
-        if skip_optimization_under_threshold and raw_size <= threshold_mb:
+        if raw_size <= threshold_mb:
             part_path.unlink(missing_ok=True)
             temp_part_path.rename(part_path)
             part_size = raw_size
@@ -467,9 +467,7 @@ def split_for_delivery(
 
     file_size_mb = get_file_size_mb(pdf_path)
     min_parts = max(1, math.ceil(file_size_mb / threshold_mb))
-    should_try_ultra = len(parts) > min_parts or _should_try_ultra(
-        file_size_mb, threshold_mb, min_parts, SPLIT_ULTRA_GAP_PCT
-    )
+    should_try_ultra = len(parts) > min_parts
 
     if not should_try_ultra:
         return parts

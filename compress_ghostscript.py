@@ -20,6 +20,8 @@ TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "40"))
 MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(TARGET_CHUNK_MB * 1.5)))
 MAX_PARALLEL_CHUNKS = int(os.environ.get("MAX_PARALLEL_CHUNKS", "16"))
 MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
+# Minimum chunk size to avoid spawning tiny Ghostscript jobs that add overhead.
+MIN_CHUNK_MB = 20.0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -499,11 +501,25 @@ def compress_parallel(
         logger.warning(f"[PARALLEL] Unknown compression_mode '{compression_mode}', defaulting to lossless")
         compression_mode = "lossless"
 
+    # Tune chunk sizes for large files to reduce chunk count and merge overhead.
     effective_target_chunk_mb = TARGET_CHUNK_MB if target_chunk_mb is None else float(target_chunk_mb)
     effective_max_chunk_mb = MAX_CHUNK_MB if max_chunk_mb is None else float(max_chunk_mb)
-    target_chunk_mb = max(5.0, effective_target_chunk_mb)
-    max_chunk_mb = max(target_chunk_mb, effective_max_chunk_mb)
-    max_parallel_chunks = max(2, MAX_PARALLEL_CHUNKS)
+
+    tuned_target = effective_target_chunk_mb
+    tuned_max_chunk = effective_max_chunk_mb
+    tuned_max_chunks = max(2, MAX_PARALLEL_CHUNKS)
+    tuned_max_pages = MAX_PAGES_PER_CHUNK
+
+    if original_size_mb >= 200 and compression_mode == "aggressive":
+        tuned_target = max(tuned_target, 60.0)
+        tuned_max_chunk = max(tuned_max_chunk, tuned_target * 1.5)
+        tuned_max_chunks = min(tuned_max_chunks, 10)
+        tuned_max_pages = max(tuned_max_pages, 400)
+
+    target_chunk_mb = max(MIN_CHUNK_MB, tuned_target)
+    max_chunk_mb = max(target_chunk_mb, tuned_max_chunk)
+    max_parallel_chunks = max(2, tuned_max_chunks)
+    max_pages_per_chunk = max(1, tuned_max_pages)
     effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
 
     logger.info(
@@ -511,7 +527,7 @@ def compress_parallel(
         f"({original_size_mb:.1f}MB, mode={compression_mode})"
     )
     logger.info(
-        f"[PARALLEL] Chunking target {target_chunk_mb:.1f}MB (max {max_chunk_mb:.1f}MB, cap {max_parallel_chunks})"
+        f"[PARALLEL] Chunking target {target_chunk_mb:.1f}MB (max {max_chunk_mb:.1f}MB, cap {max_parallel_chunks}, max pages/chunk {max_pages_per_chunk})"
     )
 
     # Step 1: Calculate number of chunks targeting the configured size.
@@ -528,13 +544,13 @@ def compress_parallel(
         total_pages = None
 
     num_chunks_by_pages = 1
-    if total_pages and MAX_PAGES_PER_CHUNK > 0:
-        num_chunks_by_pages = math.ceil(total_pages / MAX_PAGES_PER_CHUNK)
+    if total_pages and max_pages_per_chunk > 0:
+        num_chunks_by_pages = math.ceil(total_pages / max_pages_per_chunk)
 
     num_chunks = max(2, min(max_parallel_chunks, max(num_chunks_by_size, num_chunks_by_pages)))
     if total_pages:
         logger.info(
-            f"[PARALLEL] Total pages: {total_pages}, max pages/chunk: {MAX_PAGES_PER_CHUNK}, "
+            f"[PARALLEL] Total pages: {total_pages}, max pages/chunk: {max_pages_per_chunk}, "
             f"page-based chunks: {num_chunks_by_pages}"
         )
     report_progress(
@@ -555,7 +571,7 @@ def compress_parallel(
         while pending:
             chunk_path = pending.pop(0)
             size_mb = get_file_size_mb(chunk_path)
-            if size_mb <= max_chunk_mb:
+            if size_mb <= max_chunk_mb or size_mb <= MIN_CHUNK_MB:
                 balanced.append(chunk_path)
                 continue
 
@@ -578,6 +594,9 @@ def compress_parallel(
 
             split_count = min(split_count, total_pages)
             split_count = min(split_count, remaining_slots + 1)
+            # Avoid creating sub-chunks below our minimum size target.
+            max_splits_by_size = max(2, math.floor(size_mb / MIN_CHUNK_MB))
+            split_count = min(split_count, max_splits_by_size)
 
             if split_count <= 1:
                 balanced.append(chunk_path)
@@ -597,6 +616,19 @@ def compress_parallel(
     logger.info(f"[PARALLEL] Split into {num_chunks} chunk(s)")
     split_time = time.time() - start_ts
     logger.info("[PERF] Split: %.1fs", split_time)
+    try:
+        chunk_sizes = [get_file_size_mb(p) for p in chunk_paths]
+        logger.info(
+            "[PARALLEL] Chunk stats: count=%s min=%.1fMB max=%.1fMB avg=%.1fMB target=%.1fMB max=%.1fMB",
+            num_chunks,
+            min(chunk_sizes) if chunk_sizes else 0,
+            max(chunk_sizes) if chunk_sizes else 0,
+            sum(chunk_sizes) / len(chunk_sizes) if chunk_sizes else 0,
+            target_chunk_mb,
+            max_chunk_mb,
+        )
+    except Exception:
+        pass
 
     # Step 3: Compress each chunk in parallel
     report_progress(15, "compressing", f"Compressing {num_chunks} chunks in parallel...")
@@ -607,6 +639,14 @@ def compress_parallel(
         """Compress a single chunk and return result."""
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
+
+        # Skip GS if chunk is below minimum size; likely not worth recompressing.
+        try:
+            if get_file_size_mb(chunk_path) <= MIN_CHUNK_MB:
+                return chunk_path, True, "Skipped compression (below min size)"
+        except Exception:
+            pass
+
         success, message = compress_fn(chunk_path, compressed_path, num_threads=gs_threads)
 
         # If Ghostscript "compression" makes this chunk larger, keep the original chunk.
@@ -656,8 +696,11 @@ def compress_parallel(
         gs_threads = max(1, min(4, per_worker_cap))
 
     logger.info(
-        f"[PARALLEL] Ghostscript threads per worker: {gs_threads} "
-        f"(cpu={effective_cpu}, workers={worker_count})"
+        f"[PARALLEL] Workers=%s GS threads/worker=%s (cpu=%s, max_workers=%s)",
+        worker_count,
+        gs_threads,
+        effective_cpu,
+        max_workers,
     )
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         # Submit all compression jobs
@@ -992,7 +1035,7 @@ def compress_parallel(
         }
 
     # No split needed - return single file
-    report_progress(100, "complete", "Compression complete")
+    report_progress(100, "complete", "Compression complete (no split)")
 
     # Get page count (reuse cached value when available)
     page_count = total_pages
