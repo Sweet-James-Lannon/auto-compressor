@@ -749,7 +749,12 @@ def compress_parallel(
 
     split_start = time.time()
     if all_under_threshold:
-        final_parts = ordered_paths
+        final_parts = []
+        for idx, chunk_path in enumerate(ordered_paths, start=1):
+            dest = working_dir / f"{chunk_path.stem}_part{idx}.pdf"
+            dest.unlink(missing_ok=True)
+            chunk_path.rename(dest)
+            final_parts.append(dest)
         logger.info(f"[PARALLEL] All chunks <= {split_threshold_mb}MB; skipping merge and returning chunks")
     else:
         report_progress(75, "splitting", f"Splitting compressed chunks into parts <= {split_threshold_mb}MB")
@@ -757,7 +762,10 @@ def compress_parallel(
         for idx, chunk_path in enumerate(ordered_paths):
             chunk_size = get_file_size_mb(chunk_path)
             if chunk_size <= split_threshold_mb:
-                final_parts.append(chunk_path)
+                dest = working_dir / f"{chunk_path.stem}_part1.pdf"
+                dest.unlink(missing_ok=True)
+                chunk_path.rename(dest)
+                final_parts.append(dest)
                 continue
 
             # Split oversized chunk by size
