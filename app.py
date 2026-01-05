@@ -19,7 +19,7 @@ from flask import Flask, jsonify, request, render_template, send_file, has_reque
 from werkzeug.exceptions import RequestEntityTooLarge, HTTPException, NotFound
 from werkzeug.utils import secure_filename
 
-from compress import compress_pdf
+from compress import compress_pdf, PARALLEL_THRESHOLD_MB
 from compress_ghostscript import get_ghostscript_command
 from pdf_diagnostics import diagnose_for_job, get_quality_warnings
 from exceptions import (
@@ -500,6 +500,75 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
                 raise ValueError("No PDF data provided")
 
         track_file(input_path)
+
+        # Optional: subset pages and/or decrypt using provided password
+        page_spec = task_data.get("pages")
+        password = task_data.get("password")
+        if page_spec or password:
+            from PyPDF2 import PdfReader, PdfWriter
+            logger.info(f"[{job_id}] Applying page/password options (pages={bool(page_spec)}, password={'yes' if password else 'no'})")
+
+            def _parse_pages(spec: str, total: int) -> list[int]:
+                pages: list[int] = []
+                for part in spec.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if "-" in part:
+                        start_s, end_s = part.split("-", 1)
+                        try:
+                            start = int(start_s)
+                            end = int(end_s)
+                        except ValueError:
+                            continue
+                        if start <= 0:
+                            start = 1
+                        if end <= 0:
+                            continue
+                        for p in range(start, end + 1):
+                            if 1 <= p <= total:
+                                pages.append(p)
+                    else:
+                        try:
+                            p = int(part)
+                            if 1 <= p <= total:
+                                pages.append(p)
+                        except ValueError:
+                            continue
+                # Deduplicate while preserving order
+                seen = set()
+                ordered = []
+                for p in pages:
+                    if p not in seen:
+                        seen.add(p)
+                        ordered.append(p)
+                return ordered
+
+            subset_path = UPLOAD_FOLDER / f"{job_id}_subset.pdf"
+            with open(input_path, "rb") as f:
+                reader = PdfReader(f, strict=False)
+                if reader.is_encrypted:
+                    try:
+                        reader.decrypt(password or "")
+                    except Exception:
+                        # Keep behavior consistent with legacy: let GS try later
+                        pass
+                total_pages = len(reader.pages)
+                selected = _parse_pages(page_spec, total_pages) if page_spec else list(range(1, total_pages + 1))
+                if not selected:
+                    selected = list(range(1, total_pages + 1))
+                writer = PdfWriter()
+                for p in selected:
+                    # p is 1-based
+                    try:
+                        writer.add_page(reader.pages[p - 1])
+                    except Exception:
+                        continue
+                with open(subset_path, "wb") as out_f:
+                    writer.write(out_f)
+            input_path = subset_path
+            track_file(input_path)
+
         download_time = round(time.time() - start_time, 2)
 
         # Get quality warnings before compression
@@ -561,9 +630,26 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             warnings
         )
 
+        # Debug summary for performance/part count investigations
+        logger.info(
+            "[%s] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s (threshold=%.1fMB trigger=%.1fMB), "
+            "timings: download=%.2fs compress=%.2fs total=%.2fs",
+            job_id,
+            result['original_size_mb'],
+            result['compressed_size_mb'],
+            result['reduction_percent'],
+            result.get('total_parts') or len(output_paths),
+            SPLIT_THRESHOLD_MB,
+            SPLIT_TRIGGER_MB,
+            timings.get("download_seconds", 0.0),
+            timings.get("compression_seconds", 0.0),
+            timings.get("total_seconds", 0.0),
+        )
+
         matter_id = task_data.get("matter_id")
-        callback_url = task_data.get("callback_url")
+        callback_url = task_data.get("callback_url") or task_data.get("callbackUrl")
         base_url_hint = (task_data.get("base_url") or BASE_URL or "").rstrip("/")
+        name_hint = task_data.get("name")
 
         job_queue.update_job(job_id, "completed", result={
             "was_split": result.get('was_split', False),
@@ -582,12 +668,14 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             "processing_time": timings,
             "performance_notes": perf_notes,
             "matter_id": matter_id,
+            "expiresAt": (datetime.utcnow().timestamp() + EFFECTIVE_FILE_RETENTION_SECONDS),
+            "name": name_hint or None,
         })
 
         logger.info(f"[{job_id}] Job completed: {len(download_links)} file(s)")
 
         # Send callback to Salesforce if requested
-        if matter_id and callback_url:
+        if callback_url:
             def to_absolute(link: str) -> str:
                 if link.startswith("http://") or link.startswith("https://"):
                     return link
@@ -611,6 +699,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
                 "totalParts": len(absolute_links),
                 "wasSplit": len(absolute_links) > 1,
                 "partSizes": result.get("part_sizes"),
+                "expiresAt": (datetime.utcnow().timestamp() + EFFECTIVE_FILE_RETENTION_SECONDS),
             }
             spawn_callback(callback_url, payload, job_id)
 
@@ -712,8 +801,8 @@ def compress():
             return jsonify({"success": False, "error": "Empty request body"}), 400
 
         # Option 1: URL to download PDF
-        if 'file_download_link' in data:
-            download_url = data['file_download_link']
+        download_url = data.get('file_download_link') or data.get('url')
+        if download_url:
             if not download_url or not isinstance(download_url, str):
                 return jsonify({"success": False, "error": "Invalid file_download_link"}), 400
             task_data['download_url'] = download_url
@@ -737,6 +826,18 @@ def compress():
                 "success": False,
                 "error": "Missing file_download_link or file_content_base64"
             }), 400
+
+        # Optional PDF.co-style fields (no-ops when absent)
+        if isinstance(data.get("pages"), str):
+            task_data["pages"] = data["pages"]
+        if isinstance(data.get("password"), str):
+            task_data["password"] = data["password"]
+        if isinstance(data.get("name"), str):
+            task_data["name"] = data["name"]
+        if isinstance(data.get("callbackUrl"), str):
+            task_data["callbackUrl"] = data["callbackUrl"]
+        if data.get("async") is True:
+            task_data["force_async"] = True  # retained for compatibility; processing is async already
 
     # Option 3: Multipart form upload
     else:
@@ -842,6 +943,53 @@ def get_status(job_id: str):
         "status": "completed",
         **result
     })
+
+
+@app.route('/job/check', methods=['POST'])
+@require_auth
+def job_check_pdfco():
+    """
+    Lightweight PDF.co-style job status check.
+
+    Accepts JSON: {"jobid": "...", "force": true/false}
+    - force is accepted for compatibility and ignored (no re-run to avoid duplicates).
+    - Returns a minimal status map: working/success/failed/unknown plus optional links.
+    """
+    data = request.get_json(silent=True) or {}
+    job_id = data.get("jobid") or data.get("jobId")
+    if not job_id:
+        return jsonify({"error": "Missing jobid"}), 400
+
+    job = job_queue.get_job(job_id)
+    force_flag = data.get("force")
+    if force_flag:
+        logger.info(f"[{job_id}] job/check force flag accepted (no-op for compatibility)")
+
+    if not job:
+        return jsonify({"jobId": job_id, "status": "unknown"}), 200
+
+    status_map = {
+        "processing": "working",
+        "completed": "success",
+        "failed": "failed",
+    }
+    status = status_map.get(job.status, "unknown")
+
+    payload = {"jobId": job_id, "status": status}
+
+    if job.status == "failed":
+        payload["error"] = job.error or "Job failed"
+    if job.status == "completed" and job.result:
+        # Return download links when available for parity.
+        links = job.result.get("download_links") or job.result.get("files") or []
+        if isinstance(links, str):
+            links = [links]
+        payload["downloadLinks"] = links
+
+    # Simple duration hint; job.created_at is set at creation time.
+    payload["jobDuration"] = round(time.time() - job.created_at, 2)
+
+    return jsonify(payload), 200
 
 
 @app.route('/compress-sync', methods=['POST'])

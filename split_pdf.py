@@ -211,6 +211,22 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
             logger.warning(f"[merge_pdfs]    Output size:  {output_mb:.2f}MB ({output_bytes:,} bytes)")
             logger.warning(f"[merge_pdfs]    Bloat: +{bloat_mb:.2f}MB (+{bloat_pct:.1f}%)")
             logger.warning(f"[merge_pdfs]    Likely cause: PyPDF2 fallback duplicated shared resources")
+            # Attempt a lossless Ghostscript pass to deduplicate if available.
+            if gs_cmd:
+                dedup_path = output_path.with_name(f"{output_path.stem}_dedup.pdf")
+                success, _ = optimize_split_part(output_path, dedup_path)
+                if success and dedup_path.exists() and dedup_path.stat().st_size < output_bytes:
+                    output_path.unlink(missing_ok=True)
+                    dedup_path.rename(output_path)
+                    new_bytes = output_path.stat().st_size
+                    new_mb = new_bytes / (1024 * 1024)
+                    saved_mb = (output_bytes - new_bytes) / (1024 * 1024)
+                    logger.info(
+                        f"[merge_pdfs] ✅ Deduplicated merged PDF: {output_mb:.2f}MB -> {new_mb:.2f}MB "
+                        f"(saved {saved_mb:.2f}MB)"
+                    )
+                else:
+                    dedup_path.unlink(missing_ok=True)
         else:
             saved_bytes = input_total_bytes - output_bytes
             saved_mb = saved_bytes / (1024 * 1024)
