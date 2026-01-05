@@ -3,6 +3,7 @@
 import logging
 import os
 import shutil
+import math
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 # Files below this use serial, above use parallel (faster for large files)
 # Set to 30MB - serial compression can timeout on files 40MB+ due to slow Ghostscript settings
 PARALLEL_THRESHOLD_MB = 30.0
+
+# Files at or below this size stay on the serial path to avoid over-splitting (keeps mid-size PDFs to fewer parts).
+PARALLEL_SERIAL_CUTOFF_MB = 100.0
+
 # Cap workers to env or available CPU to avoid thrash on small instances
 def _resolve_parallel_workers(effective_cpu: Optional[int] = None) -> Tuple[int, Optional[int]]:
     """Resolve max parallel worker count at call time to respect dynamic CPU limits."""
@@ -201,10 +206,21 @@ def compress_pdf(
     logger.info(f"[SIZE_CHECK] Input: {input_path.name} = {original_bytes} bytes ({original_size:.2f}MB)")
 
     # =========================================================================
-    # ROUTE: Large files use parallel compression for 3-4x speedup
+    # ROUTE: Large files use parallel compression for speed
+    # Mid-size files (<~100MB or only 1–2 chunks) stay serial to avoid extra parts
     # =========================================================================
-    if original_size > PARALLEL_THRESHOLD_MB:
-        logger.info(f"[PARALLEL] File {original_size:.1f}MB > {PARALLEL_THRESHOLD_MB}MB threshold, using parallel compression")
+    est_chunks = math.ceil(original_size / DEFAULT_TARGET_CHUNK_MB) if DEFAULT_TARGET_CHUNK_MB > 0 else 3
+    use_parallel = (
+        original_size > PARALLEL_THRESHOLD_MB
+        and original_size > PARALLEL_SERIAL_CUTOFF_MB
+        and est_chunks > 2
+    )
+
+    if use_parallel:
+        logger.info(
+            f"[PARALLEL] File {original_size:.1f}MB > {PARALLEL_THRESHOLD_MB}MB threshold "
+            f"and > {PARALLEL_SERIAL_CUTOFF_MB}MB cutoff, using parallel compression (est_chunks={est_chunks})"
+        )
         effective_cpu = get_effective_cpu_count()
         max_workers, env_workers = _resolve_parallel_workers(effective_cpu)
         env_label = env_workers if env_workers is not None else "unset"
@@ -230,7 +246,7 @@ def compress_pdf(
                 target_chunk_mb,
                 max_chunk_mb,
             )
-        return compress_ghostscript.compress_parallel(
+        result = compress_ghostscript.compress_parallel(
             input_path=input_path,
             working_dir=working_dir,
             base_name=input_path.stem,
@@ -242,6 +258,21 @@ def compress_pdf(
             target_chunk_mb=target_chunk_mb,
             max_chunk_mb=max_chunk_mb,
         )
+        try:
+            if split_threshold_mb:
+                expected_parts = math.ceil(result["compressed_size_mb"] / split_threshold_mb)
+                if result.get("total_parts", 0) > expected_parts:
+                    logger.warning(
+                        "[PARALLEL] Parts (%s) exceeded expected ceil(%s/%.1f)=%s; sizes=%s",
+                        result.get("total_parts"),
+                        result.get("compressed_size_mb"),
+                        split_threshold_mb,
+                        expected_parts,
+                        result.get("part_sizes"),
+                    )
+        except Exception:
+            pass
+        return result
 
     # =========================================================================
     # ROUTE: Small files use serial compression (existing logic)
