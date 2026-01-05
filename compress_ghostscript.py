@@ -547,7 +547,11 @@ def compress_parallel(
     if total_pages and max_pages_per_chunk > 0:
         num_chunks_by_pages = math.ceil(total_pages / max_pages_per_chunk)
 
-    num_chunks = max(2, min(max_parallel_chunks, max(num_chunks_by_size, num_chunks_by_pages)))
+    if original_size_mb >= 200:
+        num_chunks = max(2, min(max_parallel_chunks, num_chunks_by_size))
+        logger.info(f"[PARALLEL] Large file mode: size-based chunks={num_chunks}")
+    else:
+        num_chunks = max(2, min(max_parallel_chunks, max(num_chunks_by_size, num_chunks_by_pages)))
     if total_pages:
         logger.info(
             f"[PARALLEL] Total pages: {total_pages}, max pages/chunk: {max_pages_per_chunk}, "
@@ -739,305 +743,60 @@ def compress_parallel(
     compress_time = time.time() - start_ts - split_time
     logger.info("[PERF] Compress: %.1fs", compress_time)
 
-    # Step 4: Merge compressed chunks back together
-    report_progress(75, "merging", "Merging compressed chunks...")
-    merged_path = working_dir / f"{base_name}_compressed.pdf"
-    merge_pdfs(ordered_paths, merged_path)
+    # Step 4: If all chunks are already under split threshold, skip merge and return them.
+    # Otherwise, split each compressed chunk directly to <= threshold and return parts in order.
+    all_under_threshold = all(get_file_size_mb(p) <= split_threshold_mb for p in ordered_paths)
 
-    compressed_size_mb = get_file_size_mb(merged_path)
-    compressed_bytes = merged_path.stat().st_size
-    reduction_percent = ((original_size_mb - compressed_size_mb) / original_size_mb) * 100
+    split_start = time.time()
+    if all_under_threshold:
+        final_parts = ordered_paths
+        logger.info(f"[PARALLEL] All chunks <= {split_threshold_mb}MB; skipping merge and returning chunks")
+    else:
+        report_progress(75, "splitting", f"Splitting compressed chunks into parts <= {split_threshold_mb}MB")
+        final_parts: List[Path] = []
+        for idx, chunk_path in enumerate(ordered_paths):
+            chunk_size = get_file_size_mb(chunk_path)
+            if chunk_size <= split_threshold_mb:
+                final_parts.append(chunk_path)
+                continue
 
-    logger.info(f"[PARALLEL] Merged: {original_size_mb:.1f}MB -> {compressed_size_mb:.1f}MB ({reduction_percent:.1f}% reduction)")
-    merge_time = time.time() - start_ts - split_time - compress_time
-    total_time = time.time() - start_ts
-    logger.info("[PERF] Merge: %.1fs", merge_time)
-    logger.info(
-        "[PERF] Total: %.1fs (split=%.1fs, compress=%.1fs, merge=%.1fs)",
-        total_time,
-        split_time,
-        compress_time,
-        merge_time,
-    )
+            # Split oversized chunk by size
+            chunk_parts = split_for_delivery(
+                chunk_path,
+                working_dir,
+                f"{chunk_path.stem}",
+                split_threshold_mb,
+                progress_callback=progress_callback,
+                skip_optimization_under_threshold=True,
+            )
+            final_parts.extend(chunk_parts)
 
-    # Cleanup chunk files
+        logger.info(
+            "[PARALLEL] Split compressed chunks into %s part(s) without global merge (threshold=%.1fMB, chunks=%s)",
+            len(final_parts),
+            split_threshold_mb,
+            len(ordered_paths),
+        )
+
+    # Cleanup original chunk files
     for chunk in chunk_paths:
         chunk.unlink(missing_ok=True)
     for _, compressed in compressed_chunks:
         compressed.unlink(missing_ok=True)
 
-    # =========================================================================
-    # CRITICAL: If parallel compression made file BIGGER, fall back to serial
-    # This can happen because PyPDF2 merge duplicates resources across chunks
-    # =========================================================================
-    if compressed_size_mb >= original_size_mb:
-        bloat_bytes = int((compressed_size_mb - original_size_mb) * 1024 * 1024)
-        bloat_pct = ((compressed_size_mb - original_size_mb) / original_size_mb) * 100
+    split_total = time.time() - split_start
+    logger.info("[PERF] Direct split time: %.1fs", split_total)
+    report_progress(100, "complete", f"Complete: {len(final_parts)} parts")
 
-        logger.warning(f"[PARALLEL] " + "="*50)
-        logger.warning(f"[PARALLEL] ⚠️  PARALLEL COMPRESSION CAUSED BLOAT!")
-        logger.warning(f"[PARALLEL] " + "="*50)
-        logger.warning(f"[PARALLEL]   Original size:     {original_size_mb:.2f}MB")
-        logger.warning(f"[PARALLEL]   After parallel:    {compressed_size_mb:.2f}MB")
-        logger.warning(f"[PARALLEL]   Bloat:             +{bloat_pct:.1f}% (+{bloat_bytes:,} bytes)")
-        logger.warning(f"[PARALLEL]   Chunks processed:  {num_chunks}")
-        logger.warning(f"[PARALLEL]   Root cause: PyPDF2 merge duplicated resources across chunks")
-        logger.warning(f"[PARALLEL]   Action: Falling back to serial compression (single Ghostscript pass)...")
-        logger.warning(f"[PARALLEL] " + "="*50)
+    # Verify parts exist and sizes
+    verified_parts: List[Path] = []
+    for i, part in enumerate(final_parts):
+        if not part.exists() or part.stat().st_size == 0:
+            raise SplitError(f"Part {i+1} missing or empty after split: {part}")
+        verified_parts.append(part)
+        logger.info(f"[PARALLEL] Part {i+1} verified: {part.name} ({part.stat().st_size / (1024*1024):.1f}MB)")
 
-        if not PARALLEL_SERIAL_FALLBACK:
-            logger.warning("[PARALLEL] Serial fallback disabled; returning original or split output")
-            merged_path.unlink(missing_ok=True)
-
-            if effective_split_trigger and original_size_mb > effective_split_trigger:
-                final_parts = split_for_delivery(
-                    input_path,
-                    working_dir,
-                    base_name,
-                    split_threshold_mb,
-                    skip_optimization_under_threshold=True,
-                )
-
-                return {
-                    "output_path": str(final_parts[0]),
-                    "output_paths": [str(p) for p in final_parts],
-                    "original_size_mb": round(original_size_mb, 2),
-                    "compressed_size_mb": round(original_size_mb, 2),
-                    "reduction_percent": 0.0,
-                    "compression_method": "none",
-                    "compression_mode": compression_mode,
-                    "was_split": len(final_parts) > 1,
-                    "total_parts": len(final_parts),
-                    "success": True,
-                    "note": "Parallel bloat; serial fallback disabled",
-                    "page_count": None,
-                    "part_sizes": [p.stat().st_size for p in final_parts],
-                    "parallel_chunks": num_chunks
-                }
-
-            return {
-                "output_path": str(input_path),
-                "output_paths": [str(input_path)],
-                "original_size_mb": round(original_size_mb, 2),
-                "compressed_size_mb": round(original_size_mb, 2),
-                "reduction_percent": 0.0,
-                "compression_method": "none",
-                "compression_mode": compression_mode,
-                "was_split": False,
-                "total_parts": 1,
-                "success": True,
-                "note": "Parallel bloat; serial fallback disabled",
-                "page_count": None,
-                "part_sizes": [input_path.stat().st_size],
-                "parallel_chunks": num_chunks
-            }
-
-        # Delete the inflated merged file
-        merged_path.unlink(missing_ok=True)
-
-        # Fall back to serial compression (single Ghostscript pass on entire file)
-        report_progress(40, "compressing", "Parallel failed, trying serial compression...")
-
-        serial_output = working_dir / f"{base_name}_serial_compressed.pdf"
-        serial_threads = _resolve_gs_threads(None)
-        success, message = compress_fn(input_path, serial_output, num_threads=serial_threads)
-
-        if success and serial_output.exists():
-            serial_size_mb = get_file_size_mb(serial_output)
-
-            # If serial also made it bigger, use the original (split only if needed)
-            if serial_size_mb >= original_size_mb:
-                logger.warning(f"[PARALLEL] Serial also increased size. Using original file.")
-                serial_output.unlink(missing_ok=True)
-
-                if effective_split_trigger and original_size_mb > effective_split_trigger:
-                    # Split the original file without compression
-                    final_parts = split_for_delivery(
-                        input_path,
-                        working_dir,
-                        base_name,
-                        split_threshold_mb,
-                        skip_optimization_under_threshold=True,
-                    )
-
-                    return {
-                        "output_path": str(final_parts[0]),
-                        "output_paths": [str(p) for p in final_parts],
-                        "original_size_mb": round(original_size_mb, 2),
-                        "compressed_size_mb": round(original_size_mb, 2),
-                        "reduction_percent": 0.0,
-                        "compression_method": "none",
-                        "compression_mode": compression_mode,
-                        "was_split": len(final_parts) > 1,
-                        "total_parts": len(final_parts),
-                        "success": True,
-                        "note": "File already optimized, split only",
-                        "page_count": None,
-                        "part_sizes": [p.stat().st_size for p in final_parts],
-                        "parallel_chunks": num_chunks
-                    }
-
-                return {
-                    "output_path": str(input_path),
-                    "output_paths": [str(input_path)],
-                    "original_size_mb": round(original_size_mb, 2),
-                    "compressed_size_mb": round(original_size_mb, 2),
-                    "reduction_percent": 0.0,
-                    "compression_method": "none",
-                    "compression_mode": compression_mode,
-                    "was_split": False,
-                    "total_parts": 1,
-                    "success": True,
-                    "note": "File already optimized, no split needed",
-                    "page_count": None,
-                    "part_sizes": [input_path.stat().st_size],
-                    "parallel_chunks": num_chunks
-                }
-
-            # Serial worked - use that result
-            serial_reduction_pct = ((original_size_mb - serial_size_mb) / original_size_mb) * 100
-            serial_reduction_mb = original_size_mb - serial_size_mb
-
-            logger.info(f"[PARALLEL] " + "-"*50)
-            logger.info(f"[PARALLEL] ✓ SERIAL FALLBACK SUCCEEDED")
-            logger.info(f"[PARALLEL]   Original:    {original_size_mb:.2f}MB")
-            logger.info(f"[PARALLEL]   Compressed:  {serial_size_mb:.2f}MB")
-            logger.info(f"[PARALLEL]   Reduction:   {serial_reduction_pct:.1f}% (-{serial_reduction_mb:.2f}MB)")
-            logger.info(f"[PARALLEL] " + "-"*50)
-
-            # Rename serial output to expected name
-            final_compressed = working_dir / f"{base_name}_compressed.pdf"
-            serial_output.rename(final_compressed)
-            merged_path = final_compressed
-
-            compressed_size_mb = serial_size_mb
-            compressed_bytes = merged_path.stat().st_size
-            reduction_percent = ((original_size_mb - compressed_size_mb) / original_size_mb) * 100
-        else:
-            # Serial failed too - use original (split only if needed)
-            logger.error(f"[PARALLEL] Serial compression also failed: {message}")
-
-            if effective_split_trigger and original_size_mb > effective_split_trigger:
-                final_parts = split_for_delivery(
-                    input_path,
-                    working_dir,
-                    base_name,
-                    split_threshold_mb,
-                    skip_optimization_under_threshold=True,
-                )
-
-                return {
-                    "output_path": str(final_parts[0]),
-                    "output_paths": [str(p) for p in final_parts],
-                    "original_size_mb": round(original_size_mb, 2),
-                    "compressed_size_mb": round(original_size_mb, 2),
-                    "reduction_percent": 0.0,
-                    "compression_method": "none",
-                    "compression_mode": compression_mode,
-                    "was_split": len(final_parts) > 1,
-                    "total_parts": len(final_parts),
-                    "success": True,
-                    "note": "Compression failed, split original",
-                    "page_count": None,
-                    "part_sizes": [p.stat().st_size for p in final_parts],
-                    "parallel_chunks": num_chunks
-                }
-
-            return {
-                "output_path": str(input_path),
-                "output_paths": [str(input_path)],
-                "original_size_mb": round(original_size_mb, 2),
-                "compressed_size_mb": round(original_size_mb, 2),
-                "reduction_percent": 0.0,
-                "compression_method": "none",
-                "compression_mode": compression_mode,
-                "was_split": False,
-                "total_parts": 1,
-                "success": True,
-                "note": "Compression failed, no split needed",
-                "page_count": None,
-                "part_sizes": [input_path.stat().st_size],
-                "parallel_chunks": num_chunks
-            }
-
-    # Step 5: Final split by 25MB threshold if needed
-    if effective_split_trigger and compressed_size_mb > effective_split_trigger:
-        report_progress(
-            85,
-            "splitting",
-            f"Splitting into parts under {split_threshold_mb}MB (trigger {effective_split_trigger}MB)...",
-        )
-        final_parts = split_for_delivery(
-            merged_path,
-            working_dir,
-            base_name,
-            split_threshold_mb,
-            progress_callback=progress_callback,
-            skip_optimization_under_threshold=True,
-        )
-
-        # Only delete merged file if split actually created NEW files
-        # (split_by_size returns [merged_path] if already under threshold)
-        # Use resolve() for robust path comparison
-        merged_resolved = merged_path.resolve()
-        parts_are_new_files = (
-            len(final_parts) > 1 or
-            (len(final_parts) == 1 and final_parts[0].resolve() != merged_resolved)
-        )
-
-        if parts_are_new_files:
-            merged_path.unlink(missing_ok=True)
-            logger.info(f"[PARALLEL] Deleted merged file, keeping {len(final_parts)} split parts")
-        else:
-            logger.info(f"[PARALLEL] Keeping merged file as final output")
-
-        # Verify all output files exist before returning
-        missing_parts: List[str] = []
-        for i, part in enumerate(final_parts):
-            if not part.exists():
-                logger.error(f"[PARALLEL] Part {i+1} missing after split: {part}")
-                missing_parts.append(f"missing part {i+1}")
-            elif part.stat().st_size == 0:
-                logger.error(f"[PARALLEL] Part {i+1} is empty after split: {part}")
-                missing_parts.append(f"empty part {i+1}")
-            else:
-                logger.info(f"[PARALLEL] Part {i+1} verified: {part.name} ({part.stat().st_size / (1024*1024):.1f}MB)")
-
-        if missing_parts:
-            raise SplitError(f"Parallel split output incomplete: {', '.join(missing_parts)}")
-
-        # Get page count from original (reuse cached value when available)
-        page_count = total_pages
-        if page_count is None:
-            from PyPDF2 import PdfReader
-            try:
-                with open(input_path, 'rb') as f:
-                    page_count = len(PdfReader(f, strict=False).pages)
-            except Exception:
-                page_count = None
-
-        report_progress(100, "complete", f"Complete: {len(final_parts)} parts")
-
-        return {
-            "output_path": str(final_parts[0]),
-            "output_paths": [str(p) for p in final_parts],
-            "original_size_mb": round(original_size_mb, 2),
-            "compressed_size_mb": round(compressed_size_mb, 2),
-            "reduction_percent": round(reduction_percent, 1),
-            "compression_method": "ghostscript_parallel",
-            "compression_mode": compression_mode,
-            "was_split": len(final_parts) > 1,  # Only true if actually split into multiple parts
-            "total_parts": len(final_parts),
-            "success": True,
-            "page_count": page_count,
-            "part_sizes": [p.stat().st_size for p in final_parts],
-            "parallel_chunks": num_chunks
-        }
-
-    # No split needed - return single file
-    report_progress(100, "complete", "Compression complete (no split)")
-
-    # Get page count (reuse cached value when available)
+    # Page count from original (if available)
     page_count = total_pages
     if page_count is None:
         from PyPDF2 import PdfReader
@@ -1047,18 +806,23 @@ def compress_parallel(
         except Exception:
             page_count = None
 
+    # Final size and reduction
+    combined_bytes = sum(p.stat().st_size for p in verified_parts)
+    combined_mb = combined_bytes / (1024 * 1024)
+    reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
+
     return {
-        "output_path": str(merged_path),
-        "output_paths": [str(merged_path)],
+        "output_path": str(verified_parts[0]),
+        "output_paths": [str(p) for p in verified_parts],
         "original_size_mb": round(original_size_mb, 2),
-        "compressed_size_mb": round(compressed_size_mb, 2),
+        "compressed_size_mb": round(combined_mb, 2),
         "reduction_percent": round(reduction_percent, 1),
         "compression_method": "ghostscript_parallel",
         "compression_mode": compression_mode,
-        "was_split": False,
-        "total_parts": 1,
+        "was_split": len(verified_parts) > 1,
+        "total_parts": len(verified_parts),
         "success": True,
         "page_count": page_count,
-        "part_sizes": [merged_path.stat().st_size],
+        "part_sizes": [p.stat().st_size for p in verified_parts],
         "parallel_chunks": num_chunks
     }

@@ -205,14 +205,15 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
             bloat_bytes = output_bytes - input_total_bytes
             bloat_mb = bloat_bytes / (1024 * 1024)
             bloat_pct = (bloat_bytes / input_total_bytes) * 100 if input_total_bytes > 0 else 0
+            output_mb = output_bytes / (1024 * 1024)
 
             logger.warning(f"[merge_pdfs] ⚠️  BLOAT DETECTED - Output larger than inputs!")
             logger.warning(f"[merge_pdfs]    Input total:  {input_total_mb:.2f}MB ({input_total_bytes:,} bytes)")
             logger.warning(f"[merge_pdfs]    Output size:  {output_mb:.2f}MB ({output_bytes:,} bytes)")
             logger.warning(f"[merge_pdfs]    Bloat: +{bloat_mb:.2f}MB (+{bloat_pct:.1f}%)")
             logger.warning(f"[merge_pdfs]    Likely cause: PyPDF2 fallback duplicated shared resources")
-            # Attempt a lossless Ghostscript pass only if bloat is meaningful (>1%).
-            if gs_cmd and bloat_pct > 1.0:
+            # Attempt a lossless Ghostscript pass only if bloat is meaningful (>1%) and size is reasonable (<100MB).
+            if gs_cmd and bloat_pct > 1.0 and output_mb < 100:
                 dedup_path = output_path.with_name(f"{output_path.stem}_dedup.pdf")
                 success, _ = optimize_split_part(output_path, dedup_path)
                 if success and dedup_path.exists() and dedup_path.stat().st_size < output_bytes:
