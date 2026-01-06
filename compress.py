@@ -258,20 +258,6 @@ def compress_pdf(
             target_chunk_mb=target_chunk_mb,
             max_chunk_mb=max_chunk_mb,
         )
-        try:
-            if split_threshold_mb:
-                expected_parts = math.ceil(result["compressed_size_mb"] / split_threshold_mb)
-                if result.get("total_parts", 0) > expected_parts:
-                    logger.warning(
-                        "[PARALLEL] Parts (%s) exceeded expected ceil(%s/%.1f)=%s; sizes=%s",
-                        result.get("total_parts"),
-                        result.get("compressed_size_mb"),
-                        split_threshold_mb,
-                        expected_parts,
-                        result.get("part_sizes"),
-                    )
-        except Exception:
-            pass
         return result
 
     # =========================================================================

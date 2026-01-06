@@ -1,139 +1,234 @@
-# SJ PDF Compressor
+# SJ PDF Compressor (Sweet James)
 
-Compresses PDFs and auto-splits into ≤25MB parts for email/Salesforce when output exceeds the split trigger. Parallel Ghostscript is used for large files; sync limit is 300MB.
+Plain-English summary: this service takes a PDF, compresses it with Ghostscript,
+and splits it into email-safe parts when needed. It exposes a small HTTP API for
+Salesforce and a simple dashboard for manual testing.
 
-## Usage
+---
 
-```bash
-POST /compress-sync
-Authorization: Bearer <token>
-Content-Type: application/json
+## 1) What this repo does
 
-{"file_download_link": "https://source-url/document.pdf"}
-```
+- Accepts PDFs from a URL, an upload, or base64.
+- Compresses them with Ghostscript (fast + tuned for scanned legal docs).
+- Splits output to <= 25MB parts when the output is too big for email/Salesforce.
+- Returns download links and (for Salesforce) can callback asynchronously.
+- Uses job IDs and a cleanup thread so files are temporary and safe.
 
-Response:
-```json
-{
-  "success": true,
-  "files": ["/download/part1.pdf", "/download/part2.pdf"],
-  "original_mb": 115.2,
-  "compressed_mb": 45.8
-}
-```
+---
 
-Errors return `error_type`/`error_message` (e.g., `DownloadError`, `FileTooLarge`, `Timeout`, `InvalidPDF`).
+## 2) How to run it
 
-## How it works (backend flow)
+### Local (dev)
 
-- Two modes:
-  - `/compress-sync` (blocking) for dashboard/manual tests or legacy callers.
-  - `/compress-sync` with `matterId` (new Salesforce flow): returns `202` fast, does the work in background, then POSTs results to `SALESFORCE_CALLBACK_URL`.
-- Compression pipeline:
-  - Downloads the PDF (or accepts upload/base64), validates header, tracks files for cleanup.
-  - Uses Ghostscript; small files compress serially, big files can use parallel chunks.
-  - If output exceeds `SPLIT_TRIGGER_MB`, auto-splits into ≤ `SPLIT_THRESHOLD_MB` parts and logs part sizes.
-- Outputs are served from `/download/{file}`; `BASE_URL` makes links absolute and HTTPS for callbacks.
-- Cleanup daemon deletes old files after `FILE_RETENTION_SECONDS`.
-
-## Salesforce integration
-
-- Entry point: Salesforce calls `POST /compress-sync` with `file_download_link` (presigned URL) and, for async, a `matterId`.
-- Async behavior: when `matterId` is present, we enqueue the job and immediately return `202 + job_id`. A worker downloads the PDF, compresses/splits, then posts results to the prod callback URL in `SALESFORCE_CALLBACK_URL`. Download links in the callback are absolute, built with `BASE_URL`.
-- Error callbacks: if download or processing fails, we still send a callback with `compressedLinks: []` and an `error` message. Download failures are usually expired/invalid presigned URLs (404/401/403).
-- Auth: if `API_TOKEN` is set, Salesforce must send `Authorization: Bearer <token>`.
-- Large files: use the async path (`matterId`) to avoid sync timeouts on big uploads.
-
-## Why this is better than iLovePDF (for our use case)
-
-- Self-hosted and API-driven: no external throttling or account limits; predictable SLAs.
-- Tuned for Salesforce: async callback avoids Apex timeouts; includes `matterId` correlation and part sizes for verification.
-- Auto-splitting built in: guarantees parts stay under our configured threshold without manual steps.
-- Observability: structured errors, progress updates (async), and detailed logging for download/compression/splitting.
-- Security/control: bearer auth option, no third-party data sharing, short-lived on-disk storage with cleanup.
-
-## Quick testing (dashboard)
-
-- Navigate to `/` to open the dashboard.
-- Upload a PDF (or supply a URL) and submit; the dashboard uses `/compress-sync` (blocking) and returns download links directly.
-- For Salesforce-style async: send JSON to `/compress-sync` with `file_download_link` and `matterId`; you will get `202` + `job_id`, and the service will callback with absolute download URLs.
-
-## Testing
-
-Run unit tests:
+- Python 3.11
+- Ghostscript installed (gs)
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
 ```
 
-## Configuration (essentials)
+### Azure App Service (prod)
 
-By default the service uses aggressive compression (downsampling) to minimize
-output size. Set `ALLOW_LOSSY_COMPRESSION=0` and `COMPRESSION_MODE=lossless` to
-preserve original image quality.
+- Uses `startup.sh` and gunicorn
+- Requires Ghostscript installed in the container
 
-| Variable | Default | Description |
-|----------|---------|-------------|
+---
+
+## 3) Main API endpoints (what to call)
+
+### POST /compress (async)
+
+- Input: JSON with one of:
+  - `file_download_link` (URL)
+  - `file_content_base64`
+- Optional: `name`, `pages`, `password`, `callbackUrl`
+- Returns: `job_id`
+- Poll: `GET /status/<job_id>`
+
+### POST /compress-sync (blocking)
+
+- Input: JSON with `file_download_link` or a multipart upload
+- Optional: `name`
+- Used by: dashboard/manual testing and a few legacy callers that expect a single request/response
+- Not used by: Salesforce long-running flows (timeouts). For Salesforce, use async with `matterId`.
+- If `matterId` is present, it switches to async callback flow (returns 202)
+- This endpoint is retained for backward compatibility and local testing
+
+### GET /download/<filename>
+
+- Serves the file
+- `?name=...` controls the download filename shown to the user
+
+### GET /status/<job_id>
+
+- Returns current job state and links when finished
+
+### POST /job/check
+
+- Lightweight PDF.co-style status endpoint
+
+### GET /diagnose/<job_id>
+
+- Diagnostic report for completed jobs
+
+---
+
+## 4) Naming behavior (important for user downloads)
+
+- The internal filenames are job-id based (safe for storage).
+- The download filename shown to users is based on the original input name:
+  - `OriginalName_compressed.pdf`
+  - `OriginalName_compressed_part1.pdf`, `..._part2.pdf`
+- Source order for name:
+  1) request field `name`
+  2) upload filename
+  3) URL filename
+  4) fallback `document`
+
+---
+
+## 5) Compression logic (simple version)
+
+1) Validate PDF header
+2) Decide compression mode (lossless/aggressive/adaptive)
+3) Choose path:
+   - **Serial** for smaller files
+   - **Parallel** for large files
+4) Compress with Ghostscript
+5) If output > SPLIT_TRIGGER_MB, split into parts <= SPLIT_THRESHOLD_MB
+6) Verify outputs, return links
+
+### Ghostscript specifics
+
+- Aggressive mode uses `/screen` plus JPEG encoding for maximum size reduction
+- Lossless mode uses `/default` and de-duplication only
+- Parallel mode splits by pages, compresses chunks concurrently, then splits
+  each chunk to <= threshold
+
+---
+
+## 6) File map (where the logic lives)
+
+- `app.py`:
+  - Flask API, request parsing, async queue, callbacks, download naming
+- `compress.py`:
+  - Top-level compression flow and serial/parallel selection
+- `compress_ghostscript.py`:
+  - Ghostscript command building + parallel chunk compression
+- `split_pdf.py`:
+  - Splitting logic (binary search + size-based)
+- `job_queue.py`:
+  - Background workers and job state
+- `utils.py`:
+  - Safe download, CPU detection, helpers
+- `pdf_diagnostics.py`:
+  - Diagnostics + quality warnings
+- `exceptions.py`:
+  - Typed errors for clean responses
+
+---
+
+## 7) Salesforce flow (how it’s used in production)
+
+- Salesforce calls `POST /compress-sync` with:
+  - `file_download_link`
+  - `matterId`
+- Service responds `202 + job_id` quickly
+- Worker downloads, compresses, splits, then POSTs results to
+  `SALESFORCE_CALLBACK_URL`
+- Callback includes absolute download links built from `BASE_URL`
+
+---
+
+## 8) Configuration (the important env vars)
+
+These are the same settings you see in Azure App Settings.
+
+### Core
+
+| Variable | Meaning |
+|----------|---------|
+| API_TOKEN | Bearer token for auth |
+| BASE_URL | Public HTTPS base used to build absolute links |
+| SALESFORCE_CALLBACK_URL | Callback target for async flow |
+| COMPRESSION_MODE | aggressive / lossless / adaptive |
+| ALLOW_LOSSY_COMPRESSION | 1/0 allow downsampling |
+| SPLIT_THRESHOLD_MB | Max size per part (default 25) |
+| SPLIT_TRIGGER_MB | Only split when output exceeds this |
+| FILE_RETENTION_SECONDS | How long files stay before cleanup |
+
+### Parallel/Chunking
+
+| Variable | Meaning |
+|----------|---------|
+| TARGET_CHUNK_MB | Target chunk size |
+| MAX_CHUNK_MB | Max chunk size before re-splitting |
+| MAX_PARALLEL_CHUNKS | Upper bound on chunk count |
+| MAX_PAGES_PER_CHUNK | Advisory page cap |
+| PARALLEL_MAX_WORKERS | Cap parallel workers |
+| GS_NUM_RENDERING_THREADS | Threads per Ghostscript process |
+
+### Ghostscript tuning
+
+| Variable | Meaning |
+|----------|---------|
+| GS_FAST_WEB_VIEW | PDF linearization on/off |
+| GS_BAND_HEIGHT | Banding height |
+| GS_BAND_BUFFER_SPACE_MB | Band buffer size |
+| GS_COLOR_DOWNSAMPLE_TYPE | /Subsample /Average /Bicubic |
+| GS_GRAY_DOWNSAMPLE_TYPE | /Subsample /Average /Bicubic |
+
+### Split tuning
+
+| Variable | Meaning |
+|----------|---------|
+| SPLIT_SAFETY_BUFFER_MB | Buffer under the limit |
+| SPLIT_OPTIMIZE_MAX_OVERAGE_MB | Skip optimization if too far over |
+| SPLIT_MINIMIZE_PARTS | Try extra pass to reduce part count |
+| SPLIT_ULTRA_JPEGQ | JPEG quality for extra pass |
+| SPLIT_ULTRA_GAP_PCT | Only run extra pass if close to dropping a part |
+
+---
+
+## 9) Quick dev test
+
+```bash
+curl -X POST /compress \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"file_download_link":"https://source/file.pdf","name":"Case_File.pdf"}'
+```
+
+Then poll:
+
+```bash
+GET /status/<job_id>
+```
+
 | `API_TOKEN` | - | Bearer token for auth (set to lock down endpoints) |
-| `BASE_URL` | empty | Public HTTPS host used to build absolute download links |
-| `SALESFORCE_CALLBACK_URL` | empty | Where to POST async results when `matterId` is present |
-| `SPLIT_THRESHOLD_MB` | 25 | Max size per output file after splitting |
-| `SPLIT_TRIGGER_MB` | 30 | Split only when output exceeds this size (parts still use `SPLIT_THRESHOLD_MB`) |
-| `SPLIT_SAFETY_BUFFER_MB` | 0 | Buffer to keep split parts under the limit (email overhead) |
-| `ATTACHMENT_MAX_MB` | unset | If set, compute a safe split size for email limits (accounts for Base64/MIME overhead) |
-| `ATTACHMENT_OVERHEAD_PCT` | 0.35 | Overhead ratio for Base64/MIME when `ATTACHMENT_MAX_MB` is set |
-| `ATTACHMENT_OVERHEAD_MB` | 0.5 | Fixed MB overhead for headers/body when `ATTACHMENT_MAX_MB` is set |
-| `COMPRESSION_MODE` | aggressive | `lossless`, `aggressive`, or `adaptive` (quality vs size tradeoff) |
-| `ALLOW_LOSSY_COMPRESSION` | 1 | Set to `1` to allow downsampling/quality-reducing compression |
-| `SCANNED_CONFIDENCE_FOR_AGGRESSIVE` | 70 | Min scanned-doc confidence for adaptive aggressive mode |
-| `TARGET_CHUNK_MB` | 40 | Target chunk size for parallel compression |
-| `MAX_CHUNK_MB` | 60 | Max chunk size before re-splitting (prevents long-running chunks) |
-| `MAX_PARALLEL_CHUNKS` | 16 | Upper bound on chunk count per file |
-| `PARALLEL_MAX_WORKERS` | auto | Cap parallel Ghostscript workers (defaults to effective CPU count) |
-| `MAX_PAGES_PER_CHUNK` | 200 | Cap pages per chunk to avoid very large per-chunk workloads |
-| `GS_NUM_RENDERING_THREADS` | unset | Override Ghostscript rendering threads (serial/optimize passes) |
-| `PARALLEL_SERIAL_FALLBACK` | 1 | Set to `0` to skip serial fallback when parallel output bloats |
-| `GS_FAST_WEB_VIEW` | 1 | Set to `0` to disable PDF linearization (faster, larger files) |
-| `GS_BAND_HEIGHT` | 100 | Ghostscript banding height (set `0` to omit) |
-| `GS_BAND_BUFFER_SPACE_MB` | 500 | Ghostscript band buffer in MB (set `0` to omit) |
-| `GS_COLOR_DOWNSAMPLE_TYPE` | /Bicubic | `/Subsample`, `/Average`, or `/Bicubic` for color images |
-| `GS_GRAY_DOWNSAMPLE_TYPE` | /Bicubic | `/Subsample`, `/Average`, or `/Bicubic` for gray images |
-| `SPLIT_OPTIMIZE_MAX_OVERAGE_MB` | 1.0 | Skip optimizing page-split parts that exceed the limit by more than this |
-| `SPLIT_MINIMIZE_PARTS` | 1 | Try an extra compression pass when it can reduce the number of split parts |
-| `SPLIT_ULTRA_JPEGQ` | 50 | JPEG quality for the extra split compression pass (lower = smaller, more loss) |
-| `SPLIT_ULTRA_GAP_PCT` | 0.12 | Only try extra compression when close to dropping a part (smaller = stricter) |
-| `ASYNC_WORKERS` | auto | Background job worker threads (defaults to `min(2, effective_cpu)`) |
-| `FILE_RETENTION_SECONDS` | 86400 | Auto-delete files after this many seconds |
-| `MIN_FILE_RETENTION_SECONDS` | 3600 | Minimum retention enforced even if `FILE_RETENTION_SECONDS` is lower |
-| `UPLOAD_FOLDER` | empty | Absolute path for storing PDFs; on Azure use a persistent path under `/home` |
-| `SYNC_TIMEOUT_SECONDS` | 540 | Timeout for `/compress-sync` work before 504 |
-| `SYNC_AUTO_ASYNC_MB` | 120 | Auto-queue sync requests above this size and return `202` + job_id |
-| `ASYNC_MAX_MB` | 450 | Max PDF size allowed for async jobs (downloaded via signed URL) |
-| `DISABLE_ASYNC_WORKERS` | unset | Set to `1` to disable background workers |
+---
 
-## Ghostscript CPU usage (notes)
+## 10) Known tradeoffs (intentional)
 
-Based on the Ghostscript docs (https://www.ghostscript.com/doc/Use.html and
-https://www.ghostscript.com/doc/Language.html):
+- Parallel mode may produce more parts than serial. This is expected and faster.
+- Large files prioritize size-based chunking for throughput.
+- Internal filenames are job-based; user-facing names are set at download time.
+- These tradeoffs are intentional and tied to our real user inputs: large legal PDFs
+  that must be compressed quickly and safely within email/Salesforce size limits.
+  Any change to compression, chunking, or splitting should be evaluated against
+  real-world PDF sizes and user workflows before shipping.
+- Sync does not change compression logic. It uses the same compress/split pipeline
+  as async; the only sync-only behavior is size gating, timeouts, and auto-async
+  handoff for large files.
 
-- `-dNumRenderingThreads` can use multiple CPU cores when banding/clist rendering;
-  docs recommend setting it to the number of available cores for best throughput.
-- `BandHeight` controls band size, and `BandBufferSpace` limits band buffer memory.
-  The docs note that if you only want to allocate more memory for banding, use
-  `BufferSpace` instead of `BandBufferSpace`.
-- Some vector devices (including `pdfwrite`) only write output on exit; changing
-  `OutputFile` mid-run flushes the pages received so far and then starts a new file.
+---
 
-In this service:
-- We detect effective CPU limits from cgroup quotas (not the host CPU count) to
-  avoid oversubscribing containers.
-- We run multiple Ghostscript processes in parallel for large PDFs, so per-process
-  rendering threads are capped to the effective CPU share.
-- You can override per-process thread count with `GS_NUM_RENDERING_THREADS` if needed.
+## 11) Deployment notes (Azure)
 
-## Deployment notes
-
-- Azure App Service: install Ghostscript, run gunicorn (see `startup.sh`).
-- Use a persistent upload folder (`UPLOAD_FOLDER` under `/home`) or a shared store; `/tmp` is not persisted across restarts.
-- For multiple instances, store outputs in shared storage (Azure Files/Blob) or keep a single instance.
-- Ensure `BASE_URL` and `SALESFORCE_CALLBACK_URL` are set; restart after config changes.
+- App Service Linux + Python 3.11
+- Install Ghostscript in startup
+- Use `/home` storage for uploads (persistent)
+- Set `BASE_URL` and `SALESFORCE_CALLBACK_URL`

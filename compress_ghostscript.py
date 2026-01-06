@@ -520,8 +520,6 @@ def compress_parallel(
     max_chunk_mb = max(target_chunk_mb, tuned_max_chunk)
     max_parallel_chunks = max(2, tuned_max_chunks)
     max_pages_per_chunk = max(1, tuned_max_pages)
-    effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
-
     logger.info(
         f"[PARALLEL] Starting parallel compression for {input_path.name} "
         f"({original_size_mb:.1f}MB, mode={compression_mode})"

@@ -11,7 +11,7 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -188,6 +188,53 @@ def build_download_url(path_str: str) -> str:
         base = "https://" + base[len("http://"):]
 
     return f"{base}{rel}" if base else rel
+
+
+def _normalize_display_base(name_hint: str | None) -> str:
+    if not name_hint:
+        return "document"
+    raw = name_hint.strip()
+    if not raw:
+        return "document"
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        candidate = parsed.path or ""
+        filename = Path(candidate).name
+        if not filename or not Path(filename).suffix:
+            return "document"
+    else:
+        candidate = parsed.path if parsed.path else raw
+        filename = Path(candidate).name
+    stem = Path(filename).stem if filename else ""
+    safe_stem = secure_filename(stem)
+    return safe_stem or "document"
+
+
+def _build_display_filename(base_name: str, part_idx: int, total_parts: int) -> str:
+    if total_parts > 1:
+        return f"{base_name}_compressed_part{part_idx}.pdf"
+    return f"{base_name}_compressed.pdf"
+
+
+def _build_download_links(output_paths: list[Path], name_hint: str | None) -> list[str]:
+    if not output_paths:
+        return []
+    base_name = _normalize_display_base(name_hint)
+    total_parts = len(output_paths)
+    links: list[str] = []
+    for idx, path in enumerate(output_paths, start=1):
+        display_name = _build_display_filename(base_name, idx, total_parts)
+        display_name = secure_filename(display_name)
+        if not display_name:
+            display_name = (
+                f"document_compressed_part{idx}.pdf"
+                if total_parts > 1
+                else "document_compressed.pdf"
+            )
+        if not display_name.lower().endswith(".pdf"):
+            display_name = f"{display_name}.pdf"
+        links.append(f"/download/{path.name}?name={quote(display_name)}")
+    return links
 
 
 def send_salesforce_callback(callback_url: str, payload: dict, job_id: str, max_retries: int = 3, timeout: int = 5) -> bool:
@@ -613,7 +660,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         progress_callback(98, "finalizing", "Preparing download links...")
 
         # Build download links
-        download_links = [f"/download/{p.name}" for p in output_paths]
+        download_links = _build_download_links(output_paths, name_hint)
         files = [build_download_url(link) for link in download_links]
 
         # Build timing info
@@ -834,6 +881,8 @@ def compress():
             task_data["password"] = data["password"]
         if isinstance(data.get("name"), str):
             task_data["name"] = data["name"]
+        if not task_data.get("name") and task_data.get("download_url"):
+            task_data["name"] = task_data["download_url"]
         if isinstance(data.get("callbackUrl"), str):
             task_data["callbackUrl"] = data["callbackUrl"]
         if data.get("async") is True:
@@ -852,6 +901,7 @@ def compress():
             return jsonify({"success": False, "error": "Invalid PDF file"}), 400
 
         task_data['pdf_bytes'] = pdf_bytes
+        task_data["name"] = f.filename
         logger.info(f"Compress request with upload: {len(pdf_bytes) / (1024*1024):.1f}MB")
 
     # Create job and enqueue for processing
@@ -1009,6 +1059,7 @@ def compress_sync():
     # Generate unique ID for this request (supports concurrent users)
     file_id = str(uuid.uuid4()).replace('-', '')[:16]
     input_path = UPLOAD_FOLDER / f"{file_id}_input.pdf"
+    name_hint: str | None = None
 
     try:
         # Dual input handling - JSON (Salesforce) or form-data (Dashboard)
@@ -1023,6 +1074,8 @@ def compress_sync():
                     "error_message": "Invalid JSON body"
                 }), 400
             file_url = data.get('file_download_link') or data.get('file_url')
+            if isinstance(data.get("name"), str):
+                name_hint = data["name"]
             matter_id = data.get('matterId')  # Salesforce sends camelCase
             if not file_url:
                 return jsonify({
@@ -1049,6 +1102,10 @@ def compress_sync():
                     "callback_url": callback_url,
                     "base_url": base_url_hint,
                 }
+                if not name_hint:
+                    name_hint = file_url
+                if name_hint:
+                    task_data["name"] = name_hint
                 try:
                     job_queue.enqueue(job_id, task_data)
                 except Exception as e:
@@ -1071,6 +1128,8 @@ def compress_sync():
             host_hint = parsed.hostname or "unknown-host"
             path_hint = (parsed.path or "")[:50]
             logger.info(f"[sync:{file_id}] Downloading from host={host_hint} path={path_hint}...")
+            if not name_hint:
+                name_hint = file_url
             utils.download_pdf(
                 file_url,
                 input_path,
@@ -1112,6 +1171,7 @@ def compress_sync():
                     "error_message": "Invalid PDF file"
                 }), 400
             input_path.write_bytes(pdf_bytes)
+            name_hint = f.filename
             logger.info(f"[sync:{file_id}] Received upload: {f.filename} ({len(pdf_bytes) / (1024*1024):.1f}MB)")
 
         else:
@@ -1219,7 +1279,7 @@ def compress_sync():
                 try:
                     completed = fut.result()
                     output_paths, part_sizes = _verify_output_files(completed, f"sync-timeout:{file_id}")
-                    download_links = [f"/download/{p.name}" for p in output_paths]
+                    download_links = _build_download_links(output_paths, name_hint)
                     files = [build_download_url(link) for link in download_links]
 
                     job_queue.update_job(job_id, "completed", result={
@@ -1279,7 +1339,8 @@ def compress_sync():
             }), 500
 
         # Always return part sizes for Salesforce verification
-        files = [build_download_url(p) for p in output_paths]
+        download_links = _build_download_links(output_paths, name_hint)
+        files = [build_download_url(link) for link in download_links]
 
         logger.info(f"[sync:{file_id}] Complete: {len(files)} file(s), {result['original_size_mb']:.1f}MB → {result['compressed_size_mb']:.1f}MB")
         logger.info(f"[sync:{file_id}] Download URLs: {files}")
@@ -1342,7 +1403,16 @@ def download(filename):
 
     track_file(file_path)
     logger.info(f"[download] Serving file: {file_path.name} ({file_path.stat().st_size / (1024*1024):.1f}MB)")
-    return send_file(file_path, as_attachment=True, download_name=safe_filename)
+    display_name = request.args.get("name")
+    if display_name:
+        display_name = secure_filename(display_name)
+        if not display_name:
+            display_name = safe_filename
+        elif not display_name.lower().endswith(".pdf"):
+            display_name = f"{display_name}.pdf"
+    else:
+        display_name = safe_filename
+    return send_file(file_path, as_attachment=True, download_name=display_name)
 
 
 @app.route('/favicon.ico')
@@ -1394,7 +1464,8 @@ def diagnose(job_id: str):
     # Convert download links back to file paths
     output_paths = []
     for link in download_links:
-        filename = link.split("/")[-1]
+        parsed = urlparse(link)
+        filename = Path(parsed.path).name
         output_paths.append(str(UPLOAD_FOLDER / filename))
 
     # Check if input file still exists
