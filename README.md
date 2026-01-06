@@ -208,7 +208,6 @@ Then poll:
 GET /status/<job_id>
 ```
 
-| `API_TOKEN` | - | Bearer token for auth (set to lock down endpoints) |
 ---
 
 ## 10) Known tradeoffs (intentional)
