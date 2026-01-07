@@ -11,7 +11,7 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, parse_qs
 
 import requests
 
@@ -237,6 +237,31 @@ def _build_download_links(output_paths: list[Path], name_hint: str | None) -> li
     return links
 
 
+def _log_output_page_counts(output_paths: list[Path], label: str, input_pages: int | None = None) -> None:
+    if not LOG_PART_PAGE_COUNTS or not output_paths:
+        return
+    try:
+        from PyPDF2 import PdfReader
+    except Exception as exc:
+        logger.warning("[%s] Output page count skipped (PyPDF2 unavailable): %s", label, exc)
+        return
+
+    if input_pages is not None:
+        logger.info("[%s] Input pages: %s", label, input_pages)
+
+    total_pages = 0
+    for idx, path in enumerate(output_paths, start=1):
+        try:
+            with open(path, "rb") as f:
+                count = len(PdfReader(f, strict=False).pages)
+            total_pages += count
+            logger.info("[%s] Output pages part %s: %s = %s pages", label, idx, path.name, count)
+        except Exception as exc:
+            logger.warning("[%s] Output page count failed for %s: %s", label, path.name, exc)
+
+    logger.info("[%s] Output pages total: %s parts = %s pages", label, len(output_paths), total_pages)
+
+
 def send_salesforce_callback(callback_url: str, payload: dict, job_id: str, max_retries: int = 3, timeout: int = 5) -> bool:
     """Send callback to Salesforce with basic retry/backoff. Runs in a worker thread."""
     headers = {"Content-Type": "application/json"}
@@ -298,6 +323,197 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+LOG_PART_PAGE_COUNTS = _env_bool("LOG_PART_PAGE_COUNTS", True)
+
+DASHBOARD_FILE_MAP = [
+    {
+        "step": 1,
+        "file": "app.py",
+        "summary": "Entry + finalize: API, request parsing, queue, callbacks, download naming",
+        "functions": [
+            "compress",
+            "compress_sync",
+            "process_compression_job",
+            "_build_download_links",
+            "send_salesforce_callback",
+        ],
+        "variables": [
+            "SYNC_MAX_MB",
+            "ASYNC_MAX_MB",
+            "SPLIT_THRESHOLD_MB",
+        ],
+    },
+    {
+        "step": 2,
+        "file": "job_queue.py",
+        "summary": "Async worker + job state (async only)",
+        "functions": ["create_job", "enqueue", "update_job", "get_stats"],
+        "variables": [],
+    },
+    {
+        "step": 3,
+        "file": "utils.py",
+        "summary": "Safe download + CPU detection",
+        "functions": ["download_pdf", "get_effective_cpu_count"],
+        "variables": [],
+    },
+    {
+        "step": 4,
+        "file": "pdf_diagnostics.py",
+        "summary": "Diagnostics + quality warnings",
+        "functions": ["get_quality_warnings", "detect_scanned_document"],
+        "variables": [],
+    },
+    {
+        "step": 5,
+        "file": "compress.py",
+        "summary": "Compression flow + serial/parallel selection",
+        "functions": ["compress_pdf", "_resolve_parallel_workers"],
+        "variables": ["PARALLEL_THRESHOLD_MB"],
+    },
+    {
+        "step": 6,
+        "file": "compress_ghostscript.py",
+        "summary": "Ghostscript command + parallel chunk compression",
+        "functions": [
+            "compress_parallel",
+            "compress_pdf_with_ghostscript",
+            "_resolve_gs_threads",
+        ],
+        "variables": [
+            "TARGET_CHUNK_MB",
+            "MAX_CHUNK_MB",
+            "MAX_PAGES_PER_CHUNK",
+        ],
+    },
+    {
+        "step": 7,
+        "file": "split_pdf.py",
+        "summary": "Split logic (size-based + binary search)",
+        "functions": ["split_pdf", "split_by_size", "split_for_delivery"],
+        "variables": [],
+    },
+    {
+        "step": 8,
+        "file": "exceptions.py",
+        "summary": "Typed errors used across the flow",
+        "functions": [
+            "PDFCompressionError",
+            "DownloadError",
+            "SplitError",
+            "EncryptionError",
+        ],
+        "variables": [],
+    },
+]
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_display_names(download_links: list[str]) -> list[str]:
+    names = []
+    for link in download_links:
+        try:
+            parsed = urlparse(link)
+            name = parse_qs(parsed.query).get("name", [None])[0]
+            if name:
+                names.append(name)
+            else:
+                path_name = Path(parsed.path).name
+                names.append(path_name or link)
+        except Exception:
+            names.append(link)
+    return names
+
+
+def _format_recent_jobs(recent_jobs: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    formatted = []
+    for job in recent_jobs:
+        result = job.get("result") or {}
+        progress = job.get("progress") or {}
+        status = job.get("status") or "unknown"
+        status_class = "ok" if status == "completed" else "warn" if status == "failed" else "neutral"
+
+        original_mb = _safe_float(result.get("original_mb") or result.get("original_size_mb"))
+        compressed_mb = _safe_float(result.get("compressed_mb") or result.get("compressed_size_mb"))
+        reduction_pct = _safe_float(result.get("reduction_percent"))
+        total_parts = result.get("total_parts")
+        if total_parts is None and result.get("download_links"):
+            total_parts = len(result["download_links"])
+        page_count = result.get("page_count")
+        compression_mode = result.get("compression_mode")
+
+        size_display = None
+        if original_mb is not None:
+            if compressed_mb is not None:
+                size_display = f"{original_mb:.1f}MB -> {compressed_mb:.1f}MB"
+            else:
+                size_display = f"{original_mb:.1f}MB"
+            if reduction_pct is not None:
+                size_display = f"{size_display} ({reduction_pct:.1f}%)"
+
+        parts_bits = []
+        if total_parts:
+            parts_bits.append(f"parts: {total_parts}")
+        if page_count:
+            parts_bits.append(f"pages: {page_count}")
+        if compression_mode:
+            parts_bits.append(f"mode: {compression_mode}")
+        parts_display = " | ".join(parts_bits) if parts_bits else None
+
+        timings = result.get("processing_time") or {}
+        timing_bits = []
+        download_s = _safe_float(timings.get("download_seconds"))
+        compress_s = _safe_float(timings.get("compression_seconds"))
+        total_s = _safe_float(timings.get("total_seconds"))
+        if download_s is not None:
+            timing_bits.append(f"download {download_s:.1f}s")
+        if compress_s is not None:
+            timing_bits.append(f"compress {compress_s:.1f}s")
+        if total_s is not None:
+            timing_bits.append(f"total {total_s:.1f}s")
+        timing_display = " | ".join(timing_bits) if timing_bits else None
+
+        age_seconds = job.get("age_seconds")
+        if isinstance(age_seconds, int):
+            age_display = f"{age_seconds}s" if age_seconds < 90 else f"{age_seconds / 60:.1f}m"
+        else:
+            age_display = "n/a"
+
+        progress_percent = progress.get("percent")
+        progress_stage = progress.get("stage")
+        progress_message = progress.get("message")
+        progress_bits = []
+        if progress_stage:
+            progress_bits.append(str(progress_stage))
+        if progress_percent is not None:
+            progress_bits.append(f"{progress_percent}%")
+        if progress_message:
+            progress_bits.append(str(progress_message))
+        progress_display = " | ".join(progress_bits) if progress_bits else None
+
+        file_names = _extract_display_names(result.get("download_links") or [])[:6]
+
+        formatted.append({
+            "job_id": job.get("job_id"),
+            "status": status,
+            "status_class": status_class,
+            "age_display": age_display,
+            "progress_display": progress_display,
+            "size_display": size_display,
+            "parts_display": parts_display,
+            "timing_display": timing_display,
+            "error": job.get("error"),
+            "file_names": file_names,
+        })
+    return formatted
+
+
 def build_health_snapshot() -> Dict[str, Any]:
     """Build a lightweight snapshot for health endpoints and the debug dashboard."""
     gs_cmd = get_ghostscript_command()
@@ -308,10 +524,18 @@ def build_health_snapshot() -> Dict[str, Any]:
 
     queue_stats = job_queue.get_stats()
     effective_cpu = utils.get_effective_cpu_count()
+    recent_jobs = []
+    try:
+        recent_limit = _env_int("DASHBOARD_RECENT_JOBS", 8)
+        recent_jobs = _format_recent_jobs(job_queue.get_recent_jobs(recent_limit))
+    except Exception:
+        recent_jobs = []
 
     return {
         "status": "healthy" if gs_cmd else "degraded",
         "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "file_map": DASHBOARD_FILE_MAP,
+        "recent_jobs": recent_jobs,
         "ghostscript": {
             "available": gs_cmd is not None,
             "command": gs_cmd or "missing",
@@ -662,6 +886,8 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         # Track all output files
         for path in output_paths:
             track_file(path)
+
+        _log_output_page_counts(output_paths, job_id, result.get("page_count"))
 
         progress_callback(98, "finalizing", "Preparing download links...")
 
@@ -1285,6 +1511,7 @@ def compress_sync():
                 try:
                     completed = fut.result()
                     output_paths, part_sizes = _verify_output_files(completed, f"sync-timeout:{file_id}")
+                    _log_output_page_counts(output_paths, f"sync-timeout:{file_id}", completed.get("page_count"))
                     download_links = _build_download_links(output_paths, name_hint)
                     files = [build_download_url(link) for link in download_links]
 
@@ -1345,6 +1572,7 @@ def compress_sync():
             }), 500
 
         # Always return part sizes for Salesforce verification
+        _log_output_page_counts(output_paths, f"sync:{file_id}", result.get("page_count"))
         download_links = _build_download_links(output_paths, name_hint)
         files = [build_download_url(link) for link in download_links]
 

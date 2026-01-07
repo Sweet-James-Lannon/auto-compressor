@@ -148,6 +148,25 @@ def get_stats() -> Dict[str, Any]:
     }
 
 
+def get_recent_jobs(limit: int = 10) -> list[Dict[str, Any]]:
+    """Return a small list of recent jobs for dashboard visibility."""
+    now = time.time()
+    with _job_lock:
+        jobs = sorted(_jobs.values(), key=lambda j: j.created_at, reverse=True)[:max(0, limit)]
+        summaries = []
+        for job in jobs:
+            summaries.append({
+                "job_id": job.job_id,
+                "status": job.status,
+                "created_at": job.created_at,
+                "age_seconds": int(now - job.created_at),
+                "progress": job.progress,
+                "result": job.result,
+                "error": job.error,
+            })
+    return summaries
+
+
 def _worker() -> None:
     """Background worker that processes jobs from the queue."""
     logger.info("Job queue worker started")

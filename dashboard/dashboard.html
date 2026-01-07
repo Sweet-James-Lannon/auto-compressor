@@ -84,6 +84,15 @@
             animation: fadeUp 0.5s ease both;
         }
 
+        .card-head {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+
         .card:nth-child(2) { animation-delay: 0.05s; }
         .card:nth-child(3) { animation-delay: 0.1s; }
         .card:nth-child(4) { animation-delay: 0.15s; }
@@ -97,6 +106,46 @@
             margin-bottom: 12px;
             color: var(--accent-2);
             letter-spacing: 0.02em;
+        }
+
+        .card-head h2 {
+            margin-bottom: 0;
+        }
+
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: #fff;
+            font-size: 0.8rem;
+            cursor: pointer;
+        }
+
+        .toggle input {
+            accent-color: var(--accent);
+        }
+
+        .toggle-button {
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 4px 12px;
+            background: #fff;
+            font-size: 0.8rem;
+            cursor: pointer;
+        }
+
+        .toggle-button:hover {
+            background: #f1f5ff;
         }
 
         .row {
@@ -143,6 +192,126 @@
         .badge.warn {
             color: var(--warn);
             background: rgba(196, 85, 0, 0.08);
+        }
+
+        .badge.neutral {
+            color: var(--muted);
+            background: rgba(90, 97, 109, 0.08);
+        }
+
+        .card.wide {
+            grid-column: 1 / -1;
+        }
+
+        .map-list {
+            display: grid;
+            gap: 12px;
+        }
+
+        .map-item {
+            padding: 10px 0;
+            border-bottom: 1px dashed rgba(28, 31, 36, 0.15);
+        }
+
+        .map-item:last-child {
+            border-bottom: none;
+        }
+
+        .map-title {
+            font-weight: 600;
+            color: var(--ink);
+        }
+
+        .map-desc {
+            color: var(--muted);
+            font-size: 0.88rem;
+            margin-top: 2px;
+        }
+
+        .map-meta {
+            font-size: 0.82rem;
+            margin-top: 6px;
+        }
+
+        .map-item summary {
+            list-style: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .map-item summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .map-toggle {
+            font-size: 0.75rem;
+            color: var(--muted);
+        }
+
+        .job {
+            padding: 10px 0;
+            border-bottom: 1px dashed rgba(28, 31, 36, 0.15);
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .job:last-child {
+            border-bottom: none;
+        }
+
+        .job-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .job-meta {
+            font-size: 0.82rem;
+            color: var(--muted);
+        }
+
+        .job-files,
+        .job-error {
+            font-size: 0.82rem;
+        }
+
+        body.hide-functions .map-meta.functions {
+            display: none;
+        }
+
+        body.hide-vars .map-meta.vars {
+            display: none;
+        }
+
+        body.hide-jobs .jobs-section {
+            display: none;
+        }
+
+        body.focus-map .metrics-section,
+        body.focus-map .notes {
+            display: none;
+        }
+
+        body.focus-map .map-section {
+            grid-template-columns: 1fr;
+        }
+
+        body.compact .card {
+            padding: 12px 14px;
+        }
+
+        body.compact .row {
+            padding: 4px 0;
+        }
+
+        body.compact .map-item,
+        body.compact .job {
+            padding: 6px 0;
         }
 
         .notes {
@@ -206,7 +375,7 @@
             </div>
         </header>
 
-        <section class="grid">
+        <section class="grid metrics-section">
             <article class="card">
                 <h2>Service</h2>
                 <div class="row">
@@ -380,10 +549,143 @@
             </article>
         </section>
 
+        <section class="grid map-section">
+            <article class="card wide">
+                <div class="card-head">
+                    <h2>File Map (where logic lives)</h2>
+                    <div class="controls">
+                        <label class="toggle">
+                            <input type="checkbox" id="toggle-functions" checked>
+                            Functions
+                        </label>
+                        <label class="toggle">
+                            <input type="checkbox" id="toggle-vars" checked>
+                            Vars
+                        </label>
+                        <label class="toggle">
+                            <input type="checkbox" id="toggle-jobs" checked>
+                            Jobs
+                        </label>
+                        <button class="toggle-button" id="toggle-details" type="button">Collapse all</button>
+                        <button class="toggle-button" id="toggle-focus" type="button">Focus map</button>
+                        <button class="toggle-button" id="toggle-compact" type="button">Compact view</button>
+                    </div>
+                </div>
+                <div class="map-list">
+                    {% for item in snapshot.file_map %}
+                    <details class="map-item" open>
+                        <summary>
+                            <span class="map-title">Step {{ item.step }} · {{ item.file }}</span>
+                            <span class="map-toggle">toggle</span>
+                        </summary>
+                        <div class="map-desc">{{ item.summary }}</div>
+                        <div class="map-meta functions">
+                            <span class="label">Functions</span>
+                            <span class="value mono">{{ item.functions | join(", ") }}</span>
+                        </div>
+                        {% if item.variables %}
+                        <div class="map-meta vars">
+                            <span class="label">Key vars</span>
+                            <span class="value mono">{{ item.variables | join(", ") }}</span>
+                        </div>
+                        {% endif %}
+                    </details>
+                    {% endfor %}
+                </div>
+            </article>
+
+            <article class="card wide jobs-section">
+                <h2>Recent Jobs (what just happened)</h2>
+                {% if snapshot.recent_jobs %}
+                    {% for job in snapshot.recent_jobs %}
+                    <div class="job">
+                        <div class="job-title">
+                            <span class="mono">{{ job.job_id }}</span>
+                            <span class="badge {{ job.status_class }}">{{ job.status }}</span>
+                        </div>
+                        <div class="job-meta">Age: {{ job.age_display }}{% if job.progress_display %} | {{ job.progress_display }}{% endif %}</div>
+                        {% if job.size_display %}
+                        <div class="job-meta">Size: {{ job.size_display }}</div>
+                        {% endif %}
+                        {% if job.parts_display %}
+                        <div class="job-meta">Details: {{ job.parts_display }}</div>
+                        {% endif %}
+                        {% if job.timing_display %}
+                        <div class="job-meta">Timing: {{ job.timing_display }}</div>
+                        {% endif %}
+                        {% if job.file_names %}
+                        <div class="job-files mono">Files: {{ job.file_names | join(", ") }}</div>
+                        {% endif %}
+                        {% if job.error %}
+                        <div class="job-error mono">Error: {{ job.error }}</div>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="label">No recent jobs yet.</div>
+                {% endif %}
+            </article>
+        </section>
+
         <section class="notes">
             <h2>Part Count Rule</h2>
             <p>Parts are roughly: ceil(output_mb / split_threshold_mb). With a 25MB cap, fewer parts require more lossy compression.</p>
         </section>
     </main>
+    <script>
+        (function () {
+            const body = document.body;
+
+            const bindCheckbox = (id, className) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                body.classList.toggle(className, !el.checked);
+                el.addEventListener("change", () => {
+                    body.classList.toggle(className, !el.checked);
+                });
+            };
+
+            bindCheckbox("toggle-functions", "hide-functions");
+            bindCheckbox("toggle-vars", "hide-vars");
+            bindCheckbox("toggle-jobs", "hide-jobs");
+
+            const detailsBtn = document.getElementById("toggle-details");
+            const mapItems = Array.from(document.querySelectorAll(".map-item"));
+            let allOpen = true;
+
+            const setAllOpen = (open) => {
+                mapItems.forEach((item) => {
+                    item.open = open;
+                });
+                allOpen = open;
+                if (detailsBtn) {
+                    detailsBtn.textContent = open ? "Collapse all" : "Expand all";
+                }
+            };
+
+            if (detailsBtn) {
+                detailsBtn.addEventListener("click", () => {
+                    setAllOpen(!allOpen);
+                });
+                setAllOpen(true);
+            }
+
+            const focusBtn = document.getElementById("toggle-focus");
+            if (focusBtn) {
+                focusBtn.addEventListener("click", () => {
+                    body.classList.toggle("focus-map");
+                    focusBtn.textContent = body.classList.contains("focus-map") ? "Show full dashboard" : "Focus map";
+                });
+            }
+
+            const compactBtn = document.getElementById("toggle-compact");
+            if (compactBtn) {
+                compactBtn.addEventListener("click", () => {
+                    body.classList.toggle("compact");
+                    compactBtn.textContent = body.classList.contains("compact") ? "Normal view" : "Compact view";
+                });
+            }
+        })();
+    </script>
 </body>
 </html>
