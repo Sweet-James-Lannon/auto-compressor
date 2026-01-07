@@ -237,7 +237,12 @@ def _build_download_links(output_paths: list[Path], name_hint: str | None) -> li
     return links
 
 
-def _log_output_page_counts(output_paths: list[Path], label: str, input_pages: int | None = None) -> None:
+def _log_output_page_counts(
+    output_paths: list[Path],
+    label: str,
+    input_pages: int | None = None,
+    input_path: Path | None = None,
+) -> None:
     if not LOG_PART_PAGE_COUNTS or not output_paths:
         return
     try:
@@ -246,20 +251,81 @@ def _log_output_page_counts(output_paths: list[Path], label: str, input_pages: i
         logger.warning("[%s] Output page count skipped (PyPDF2 unavailable): %s", label, exc)
         return
 
+    input_size_mb = None
+    page_labels_present: bool | None = None
+    if input_path:
+        try:
+            input_size_mb = input_path.stat().st_size / (1024 * 1024)
+        except OSError:
+            input_size_mb = None
+        try:
+            with open(input_path, "rb") as f:
+                reader = PdfReader(f, strict=False)
+                if input_pages is None:
+                    input_pages = len(reader.pages)
+                try:
+                    root = reader.trailer.get("/Root")
+                    page_labels_present = bool(root and root.get("/PageLabels"))
+                except Exception:
+                    page_labels_present = None
+        except Exception as exc:
+            logger.warning("[%s] Input page audit failed for %s: %s", label, input_path.name, exc)
+
     if input_pages is not None:
         logger.info("[%s] Input pages: %s", label, input_pages)
+    if input_path or input_size_mb is not None or page_labels_present is not None:
+        audit_bits = []
+        if input_path:
+            audit_bits.append(input_path.name)
+        if input_size_mb is not None:
+            audit_bits.append(f"{input_size_mb:.1f}MB")
+        if input_pages is not None:
+            audit_bits.append(f"pages={input_pages}")
+        else:
+            audit_bits.append("pages=unknown")
+        if page_labels_present is not None:
+            audit_bits.append(f"page_labels={'yes' if page_labels_present else 'no'}")
+        logger.info("[%s] Input audit: %s", label, ", ".join(audit_bits))
 
     total_pages = 0
+    total_size_mb = 0.0
     for idx, path in enumerate(output_paths, start=1):
         try:
             with open(path, "rb") as f:
                 count = len(PdfReader(f, strict=False).pages)
+            size_mb = path.stat().st_size / (1024 * 1024)
             total_pages += count
-            logger.info("[%s] Output pages part %s: %s = %s pages", label, idx, path.name, count)
+            total_size_mb += size_mb
+            logger.info(
+                "[%s] Output pages part %s: %s = %s pages (%.1fMB)",
+                label,
+                idx,
+                path.name,
+                count,
+                size_mb,
+            )
         except Exception as exc:
             logger.warning("[%s] Output page count failed for %s: %s", label, path.name, exc)
 
-    logger.info("[%s] Output pages total: %s parts = %s pages", label, len(output_paths), total_pages)
+    logger.info(
+        "[%s] Output pages total: %s parts = %s pages (%.1fMB)",
+        label,
+        len(output_paths),
+        total_pages,
+        total_size_mb,
+    )
+    if input_pages is not None:
+        delta = total_pages - input_pages
+        if delta:
+            logger.warning(
+                "[%s] Page mismatch: output_total=%s input=%s delta=%+d",
+                label,
+                total_pages,
+                input_pages,
+                delta,
+            )
+        else:
+            logger.info("[%s] Page match: output_total=%s input=%s", label, total_pages, input_pages)
 
 
 def send_salesforce_callback(callback_url: str, payload: dict, job_id: str, max_retries: int = 3, timeout: int = 5) -> bool:
@@ -784,6 +850,11 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         if page_spec or password:
             from PyPDF2 import PdfReader, PdfWriter
             logger.info(f"[{job_id}] Applying page/password options (pages={bool(page_spec)}, password={'yes' if password else 'no'})")
+            if page_spec:
+                spec_preview = str(page_spec).strip()
+                if len(spec_preview) > 120:
+                    spec_preview = f"{spec_preview[:117]}..."
+                logger.info("[%s] Page selection spec: %s", job_id, spec_preview)
 
             def _parse_pages(spec: str, total: int) -> list[int]:
                 pages: list[int] = []
@@ -832,15 +903,45 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
                         pass
                 total_pages = len(reader.pages)
                 selected = _parse_pages(page_spec, total_pages) if page_spec else list(range(1, total_pages + 1))
+                if page_spec and not selected:
+                    logger.warning(
+                        "[%s] Page selection matched 0 pages; defaulting to full document",
+                        job_id,
+                    )
                 if not selected:
                     selected = list(range(1, total_pages + 1))
                 writer = PdfWriter()
+                added = 0
+                skipped = 0
+                first_error: Exception | None = None
+                first_error_page: int | None = None
                 for p in selected:
                     # p is 1-based
                     try:
                         writer.add_page(reader.pages[p - 1])
-                    except Exception:
+                        added += 1
+                    except Exception as exc:
+                        skipped += 1
+                        if first_error is None:
+                            first_error = exc
+                            first_error_page = p
                         continue
+                logger.info(
+                    "[%s] Page selection summary: total=%s selected=%s added=%s skipped=%s",
+                    job_id,
+                    total_pages,
+                    len(selected),
+                    added,
+                    skipped,
+                )
+                if skipped and first_error:
+                    logger.warning(
+                        "[%s] Page selection skipped %s pages (first failed page=%s); first error: %s",
+                        job_id,
+                        skipped,
+                        first_error_page,
+                        first_error,
+                    )
                 with open(subset_path, "wb") as out_f:
                     writer.write(out_f)
             input_path = subset_path
@@ -887,7 +988,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         for path in output_paths:
             track_file(path)
 
-        _log_output_page_counts(output_paths, job_id, result.get("page_count"))
+        _log_output_page_counts(output_paths, job_id, result.get("page_count"), input_path)
 
         progress_callback(98, "finalizing", "Preparing download links...")
 
@@ -1511,7 +1612,12 @@ def compress_sync():
                 try:
                     completed = fut.result()
                     output_paths, part_sizes = _verify_output_files(completed, f"sync-timeout:{file_id}")
-                    _log_output_page_counts(output_paths, f"sync-timeout:{file_id}", completed.get("page_count"))
+                    _log_output_page_counts(
+                        output_paths,
+                        f"sync-timeout:{file_id}",
+                        completed.get("page_count"),
+                        input_path,
+                    )
                     download_links = _build_download_links(output_paths, name_hint)
                     files = [build_download_url(link) for link in download_links]
 
@@ -1572,7 +1678,12 @@ def compress_sync():
             }), 500
 
         # Always return part sizes for Salesforce verification
-        _log_output_page_counts(output_paths, f"sync:{file_id}", result.get("page_count"))
+        _log_output_page_counts(
+            output_paths,
+            f"sync:{file_id}",
+            result.get("page_count"),
+            input_path,
+        )
         download_links = _build_download_links(output_paths, name_hint)
         files = [build_download_url(link) for link in download_links]
 
