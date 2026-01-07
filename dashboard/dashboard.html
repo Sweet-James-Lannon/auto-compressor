@@ -3,20 +3,25 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF Compressor Debug Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+    <title>PDF Compressor Monitor</title>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-1: #f6f4ef;
-            --bg-2: #e6efff;
-            --ink: #1c1f24;
-            --muted: #5a616d;
+            --bg-1: #edf2f9;
+            --bg-2: #dce8f9;
+            --ink: #18202b;
+            --muted: #5c6676;
             --card: #ffffff;
-            --border: #1c1f24;
-            --accent: #1f4db8;
-            --accent-2: #0a2a73;
-            --ok: #0c8a5a;
-            --warn: #c45500;
+            --panel: #f8fbff;
+            --panel-2: #eaf1fb;
+            --border: #1e2a3a;
+            --accent: #1f6feb;
+            --accent-2: #11489e;
+            --ok: #0c8f5d;
+            --warn: #c25a1b;
+            --info: #2f7ad5;
+            --shadow: rgba(18, 26, 38, 0.12);
+            --shadow-soft: rgba(18, 26, 38, 0.08);
         }
 
         * {
@@ -30,58 +35,291 @@
             color: var(--ink);
             min-height: 100vh;
             background:
-                radial-gradient(800px 400px at 20% -10%, #fff6cc 0%, transparent 60%),
-                radial-gradient(900px 500px at 110% 10%, #d6f0ff 0%, transparent 55%),
+                radial-gradient(500px 320px at 10% 0%, #fff4cf 0%, transparent 65%),
+                radial-gradient(700px 420px at 100% 10%, #d8efff 0%, transparent 60%),
                 linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%);
-            padding: 28px;
+            padding: 20px;
+        }
+
+        .window {
+            background: #fdfdff;
+            border: 2px solid var(--border);
+            border-radius: 18px;
+            overflow: hidden;
+            box-shadow: 14px 14px 0 rgba(18, 26, 38, 0.08);
+        }
+
+        .titlebar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 16px;
+            background: var(--panel);
+            border-bottom: 2px solid var(--border);
+        }
+
+        .titlebar-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .traffic {
+            display: flex;
+            gap: 6px;
+        }
+
+        .traffic span {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            border: 1px solid var(--border);
+        }
+
+        .traffic .red { background: #ff8b8b; }
+        .traffic .yellow { background: #ffd36c; }
+        .traffic .green { background: #8fe3b6; }
+
+        .titlebar-title {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .titlebar-title .title {
+            font-weight: 700;
+            font-size: 1.05rem;
+            letter-spacing: 0.01em;
+        }
+
+        .titlebar-title .subtitle {
+            font-size: 0.82rem;
+            margin-top: 0;
+        }
+
+        .titlebar-right {
+            font-size: 0.85rem;
+            color: var(--muted);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--ok);
+            box-shadow: 0 0 0 4px rgba(12, 143, 93, 0.12);
+            animation: pulse 1.6s ease-in-out infinite;
+        }
+
+        .shell {
+            display: grid;
+            grid-template-columns: 56px 230px 1fr;
+            min-height: 80vh;
+            background: #f4f7fb;
+        }
+
+        .activity-bar {
+            background: #ecf2fb;
+            border-right: 2px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 6px;
+        }
+
+        .activity {
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: #fff;
+            display: grid;
+            place-items: center;
+            font-size: 0.82rem;
+            font-weight: 600;
+            color: var(--muted);
+        }
+
+        .activity.active {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent-2);
+            box-shadow: 0 6px 0 rgba(31, 111, 235, 0.15);
+        }
+
+        .sidebar {
+            background: #f7faff;
+            border-right: 2px solid var(--border);
+            padding: 14px 14px 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+
+        .sidebar-section {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .sidebar-title {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: var(--muted);
+        }
+
+        .file-tree,
+        .step-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            font-size: 0.85rem;
+        }
+
+        .file,
+        .step-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 8px;
+            border-radius: 8px;
+            border: 1px dashed rgba(30, 42, 58, 0.2);
+            background: #fff;
+        }
+
+        .file.active {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent-2);
+        }
+
+        .step-num {
+            width: 20px;
+            height: 20px;
+            border-radius: 6px;
+            background: var(--panel-2);
+            display: grid;
+            place-items: center;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--accent-2);
+        }
+
+        .editor {
+            display: flex;
+            flex-direction: column;
+            background: #f4f7fb;
+        }
+
+        .tabs {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 10px;
+            background: #e8eef7;
+            border-bottom: 2px solid var(--border);
+        }
+
+        .tab {
+            padding: 6px 14px;
+            border-radius: 8px 8px 0 0;
+            background: #dfe7f3;
+            font-size: 0.82rem;
+            color: var(--muted);
+            border: 1px solid transparent;
+        }
+
+        .tab.active {
+            background: #fff;
+            color: var(--ink);
+            border-color: var(--border);
         }
 
         .wrap {
-            max-width: 1100px;
+            max-width: 1200px;
+            width: 100%;
             margin: 0 auto;
             display: flex;
             flex-direction: column;
             gap: 20px;
+            padding: 20px 24px 26px;
         }
 
-        header {
+        .panel-header {
             display: flex;
             flex-wrap: wrap;
             gap: 12px;
             align-items: flex-end;
             justify-content: space-between;
+            background: #fff;
+            border: 2px solid var(--border);
+            border-radius: 14px;
+            padding: 14px 18px;
+            box-shadow: 6px 6px 0 rgba(18, 26, 38, 0.08);
+        }
+
+        .statusbar {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            gap: 10px;
+            align-items: center;
+            padding: 8px 14px;
+            background: var(--panel);
+            border-top: 2px solid var(--border);
+        }
+
+        .status-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .status-group span {
+            background: #fff;
+            border: 1px solid rgba(30, 42, 58, 0.2);
+            border-radius: 999px;
+            padding: 2px 8px;
+            font-size: 0.78rem;
         }
 
         h1 {
-            font-size: clamp(1.8rem, 3vw, 2.6rem);
-            letter-spacing: -0.02em;
+            font-size: clamp(1.4rem, 2.4vw, 2.1rem);
+            letter-spacing: -0.01em;
         }
 
         .subtitle {
             color: var(--muted);
-            font-size: 0.95rem;
-            margin-top: 6px;
+            font-size: 0.9rem;
+            margin-top: 4px;
         }
 
         .timestamp {
             text-align: right;
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             color: var(--muted);
         }
 
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 16px;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 18px;
         }
 
         .card {
             background: var(--card);
-            border: 2px solid var(--border);
+            border: 1.5px solid var(--border);
             border-radius: 14px;
             padding: 16px 18px;
-            box-shadow: 6px 6px 0 rgba(28, 31, 36, 0.08);
-            animation: fadeUp 0.5s ease both;
+            box-shadow: 8px 8px 0 var(--shadow-soft);
+            animation: fadeUp 0.6s ease both;
         }
 
         .card-head {
@@ -102,7 +340,7 @@
         .card:nth-child(8) { animation-delay: 0.35s; }
 
         .card h2 {
-            font-size: 1.05rem;
+            font-size: 1rem;
             margin-bottom: 12px;
             color: var(--accent-2);
             letter-spacing: 0.02em;
@@ -126,7 +364,7 @@
             padding: 4px 10px;
             border: 1px solid var(--border);
             border-radius: 999px;
-            background: #fff;
+            background: var(--panel-2);
             font-size: 0.8rem;
             cursor: pointer;
         }
@@ -139,13 +377,13 @@
             border: 1px solid var(--border);
             border-radius: 999px;
             padding: 4px 12px;
-            background: #fff;
+            background: var(--panel-2);
             font-size: 0.8rem;
             cursor: pointer;
         }
 
         .toggle-button:hover {
-            background: #f1f5ff;
+            background: #dde8ff;
         }
 
         .row {
@@ -153,7 +391,7 @@
             justify-content: space-between;
             gap: 12px;
             padding: 6px 0;
-            border-bottom: 1px dashed rgba(28, 31, 36, 0.15);
+            border-bottom: 1px dashed rgba(30, 42, 58, 0.15);
         }
 
         .row:last-child {
@@ -171,7 +409,7 @@
         }
 
         .mono {
-            font-family: "JetBrains Mono", monospace;
+            font-family: "Fira Code", monospace;
             font-size: 0.85rem;
         }
 
@@ -209,12 +447,15 @@
         }
 
         .map-item {
-            padding: 10px 0;
-            border-bottom: 1px dashed rgba(28, 31, 36, 0.15);
+            padding: 10px 12px;
+            border: 1px dashed rgba(30, 42, 58, 0.2);
+            border-radius: 10px;
+            background: #fff;
         }
 
-        .map-item:last-child {
-            border-bottom: none;
+        .map-item[open] {
+            border-style: solid;
+            box-shadow: 4px 4px 0 var(--shadow-soft);
         }
 
         .map-title {
@@ -249,18 +490,20 @@
         .map-toggle {
             font-size: 0.75rem;
             color: var(--muted);
+            border: 1px solid rgba(30, 42, 58, 0.2);
+            border-radius: 999px;
+            padding: 2px 8px;
+            background: var(--panel-2);
         }
 
         .job {
-            padding: 10px 0;
-            border-bottom: 1px dashed rgba(28, 31, 36, 0.15);
+            padding: 10px 12px;
+            border: 1px dashed rgba(30, 42, 58, 0.2);
+            border-radius: 10px;
+            background: #fff;
             display: flex;
             flex-direction: column;
             gap: 6px;
-        }
-
-        .job:last-child {
-            border-bottom: none;
         }
 
         .job-title {
@@ -311,16 +554,17 @@
 
         body.compact .map-item,
         body.compact .job {
-            padding: 6px 0;
+            padding: 6px 8px;
         }
 
         .notes {
-            background: #fff7ed;
-            border: 2px solid #f2b36d;
+            background: #fff4d8;
+            border: 1.5px solid #f0c37a;
             border-radius: 14px;
             padding: 16px 18px;
             font-size: 0.9rem;
             color: #7a4a12;
+            box-shadow: 6px 6px 0 rgba(122, 74, 18, 0.12);
         }
 
         .notes h2 {
@@ -343,13 +587,44 @@
             }
         }
 
-        @media (max-width: 640px) {
-            body {
-                padding: 20px;
+        @keyframes pulse {
+            0% {
+                transform: scale(1);
+                opacity: 0.9;
+            }
+            50% {
+                transform: scale(1.4);
+                opacity: 0.4;
+            }
+            100% {
+                transform: scale(1);
+                opacity: 0.9;
+            }
+        }
+
+        @media (max-width: 980px) {
+            .shell {
+                grid-template-columns: 1fr;
             }
 
-            .timestamp {
-                text-align: left;
+            .activity-bar,
+            .sidebar {
+                display: none;
+            }
+
+            .wrap {
+                padding: 16px;
+            }
+
+            .titlebar {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+        }
+
+        @media (max-width: 640px) {
+            body {
+                padding: 12px;
             }
 
             .row {
@@ -360,22 +635,86 @@
             .value {
                 text-align: left;
             }
+
+            .tabs {
+                flex-wrap: wrap;
+            }
         }
     </style>
 </head>
 <body>
-    <main class="wrap">
-        <header>
-            <div>
-                <h1>PDF Compressor Status</h1>
-                <div class="subtitle">Live snapshot for debugging, QA, and capacity checks.</div>
+    <div class="window">
+        <header class="titlebar">
+            <div class="titlebar-left">
+                <div class="traffic">
+                    <span class="red"></span>
+                    <span class="yellow"></span>
+                    <span class="green"></span>
+                </div>
+                <div class="titlebar-title">
+                    <div class="title">PDF Compressor Status</div>
+                    <div class="subtitle">VS Code-style learning dashboard for the compression pipeline.</div>
+                </div>
             </div>
-            <div class="timestamp mono">
+            <div class="titlebar-right mono">
+                <span class="live-dot"></span>
                 Last update: {{ snapshot.timestamp }}
             </div>
         </header>
 
-        <section class="grid metrics-section">
+        <div class="shell">
+            <aside class="activity-bar">
+                <div class="activity active">D</div>
+                <div class="activity">M</div>
+                <div class="activity">J</div>
+                <div class="activity">S</div>
+            </aside>
+
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <div class="sidebar-title">Explorer</div>
+                    <div class="file-tree mono">
+                        <div class="file active">dashboard.html</div>
+                        <div class="file">app.py</div>
+                        <div class="file">compress.py</div>
+                        <div class="file">compress_ghostscript.py</div>
+                        <div class="file">split_pdf.py</div>
+                        <div class="file">job_queue.py</div>
+                        <div class="file">utils.py</div>
+                        <div class="file">pdf_diagnostics.py</div>
+                        <div class="file">exceptions.py</div>
+                    </div>
+                </div>
+                <div class="sidebar-section">
+                    <div class="sidebar-title">Flow steps</div>
+                    <div class="step-list">
+                        {% for item in snapshot.file_map %}
+                        <div class="step-item">
+                            <span class="step-num">{{ item.step }}</span>
+                            <span>{{ item.file }}</span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </aside>
+
+            <section class="editor">
+                <div class="tabs">
+                    <div class="tab active">dashboard.html</div>
+                    <div class="tab">flow_map.md</div>
+                    <div class="tab">recent_jobs.log</div>
+                </div>
+
+                <main class="wrap">
+                    <header class="panel-header">
+                        <div>
+                            <h1>Live Run View</h1>
+                            <div class="subtitle">Run Salesforce on one screen, track the pipeline steps and output here.</div>
+                        </div>
+                        <div class="mono">Instance: {{ snapshot.instance_id }}</div>
+                    </header>
+
+                    <section class="grid metrics-section">
             <article class="card">
                 <h2>Service</h2>
                 <div class="row">
@@ -547,9 +886,9 @@
                     <span class="value mono">{{ snapshot.limits.sync_timeout_seconds }}</span>
                 </div>
             </article>
-        </section>
+                    </section>
 
-        <section class="grid map-section">
+                    <section class="grid map-section">
             <article class="card wide">
                 <div class="card-head">
                     <h2>File Map (where logic lives)</h2>
@@ -625,13 +964,29 @@
                     <div class="label">No recent jobs yet.</div>
                 {% endif %}
             </article>
-        </section>
+                    </section>
 
-        <section class="notes">
-            <h2>Part Count Rule</h2>
-            <p>Parts are roughly: ceil(output_mb / split_threshold_mb). With a 25MB cap, fewer parts require more lossy compression.</p>
-        </section>
-    </main>
+                    <section class="notes">
+                        <h2>Part Count Rule</h2>
+                        <p>Parts are roughly: ceil(output_mb / split_threshold_mb). With a 25MB cap, fewer parts require more lossy compression.</p>
+                    </section>
+                </main>
+            </section>
+        </div>
+
+        <footer class="statusbar mono">
+            <div class="status-group">
+                <span>Queue: {{ snapshot.queue.queue_size }}</span>
+                <span>Processing: {{ snapshot.queue.processing }}</span>
+                <span>Workers: {{ snapshot.queue.worker_count }}</span>
+            </div>
+            <div class="status-group">
+                <span>GS: {{ 'available' if snapshot.ghostscript.available else 'missing' }}</span>
+                <span>Retention: {{ snapshot.storage.effective_retention_seconds }}s</span>
+                <span>Mode: {{ snapshot.compression.mode }}</span>
+            </div>
+        </footer>
+    </div>
     <script>
         (function () {
             const body = document.body;
