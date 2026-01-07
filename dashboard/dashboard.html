@@ -116,8 +116,8 @@
         }
 
         .shell {
-            display: grid;
-            grid-template-columns: 56px 230px 1fr;
+            display: flex;
+            flex-direction: column;
             min-height: 80vh;
             background: #f4f7fb;
         }
@@ -262,6 +262,26 @@
             border-radius: 14px;
             padding: 14px 18px;
             box-shadow: 6px 6px 0 rgba(18, 26, 38, 0.08);
+        }
+
+        .view-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            padding: 10px 14px;
+            background: var(--panel);
+            border: 1.5px solid var(--border);
+            border-radius: 12px;
+            box-shadow: 4px 4px 0 var(--shadow-soft);
+        }
+
+        .view-title {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: var(--muted);
+            margin-right: 8px;
         }
 
         .statusbar {
@@ -531,17 +551,16 @@
             display: none;
         }
 
+        body.hide-metrics .metrics-section {
+            display: none;
+        }
+
         body.hide-jobs .jobs-section {
             display: none;
         }
 
-        body.focus-map .metrics-section,
-        body.focus-map .notes {
+        body.hide-notes .notes {
             display: none;
-        }
-
-        body.focus-map .map-section {
-            grid-template-columns: 1fr;
         }
 
         body.compact .card {
@@ -603,15 +622,6 @@
         }
 
         @media (max-width: 980px) {
-            .shell {
-                grid-template-columns: 1fr;
-            }
-
-            .activity-bar,
-            .sidebar {
-                display: none;
-            }
-
             .wrap {
                 padding: 16px;
             }
@@ -663,46 +673,11 @@
         </header>
 
         <div class="shell">
-            <aside class="activity-bar">
-                <div class="activity active">D</div>
-                <div class="activity">M</div>
-                <div class="activity">J</div>
-                <div class="activity">S</div>
-            </aside>
-
-            <aside class="sidebar">
-                <div class="sidebar-section">
-                    <div class="sidebar-title">Explorer</div>
-                    <div class="file-tree mono">
-                        <div class="file active">dashboard.html</div>
-                        <div class="file">app.py</div>
-                        <div class="file">compress.py</div>
-                        <div class="file">compress_ghostscript.py</div>
-                        <div class="file">split_pdf.py</div>
-                        <div class="file">job_queue.py</div>
-                        <div class="file">utils.py</div>
-                        <div class="file">pdf_diagnostics.py</div>
-                        <div class="file">exceptions.py</div>
-                    </div>
-                </div>
-                <div class="sidebar-section">
-                    <div class="sidebar-title">Flow steps</div>
-                    <div class="step-list">
-                        {% for item in snapshot.file_map %}
-                        <div class="step-item">
-                            <span class="step-num">{{ item.step }}</span>
-                            <span>{{ item.file }}</span>
-                        </div>
-                        {% endfor %}
-                    </div>
-                </div>
-            </aside>
-
             <section class="editor">
                 <div class="tabs">
-                    <div class="tab active">dashboard.html</div>
-                    <div class="tab">flow_map.md</div>
-                    <div class="tab">recent_jobs.log</div>
+                    <div class="tab active">Flow Map</div>
+                    <div class="tab">Metrics</div>
+                    <div class="tab">Jobs</div>
                 </div>
 
                 <main class="wrap">
@@ -713,6 +688,62 @@
                         </div>
                         <div class="mono">Instance: {{ snapshot.instance_id }}</div>
                     </header>
+
+                    <div class="view-bar">
+                        <div class="view-title">View</div>
+                        <label class="toggle">
+                            <input type="checkbox" id="toggle-metrics" checked>
+                            Metrics
+                        </label>
+                        <label class="toggle">
+                            <input type="checkbox" id="toggle-jobs" checked>
+                            Jobs
+                        </label>
+                        <label class="toggle">
+                            <input type="checkbox" id="toggle-notes" checked>
+                            Notes
+                        </label>
+                    </div>
+
+                    <section class="grid map-section">
+            <article class="card wide">
+                <div class="card-head">
+                    <h2>File Map (order of operations)</h2>
+                    <div class="controls">
+                        <label class="toggle">
+                            <input type="checkbox" id="toggle-functions" checked>
+                            Functions
+                        </label>
+                        <label class="toggle">
+                            <input type="checkbox" id="toggle-vars" checked>
+                            Vars
+                        </label>
+                        <button class="toggle-button" id="toggle-details" type="button">Collapse all</button>
+                    </div>
+                </div>
+                <div class="map-list">
+                    {% for item in snapshot.file_map %}
+                    <details class="map-item" open>
+                        <summary>
+                            <span class="map-title">Step {{ item.step }} · {{ item.file }}</span>
+                            <span class="map-toggle">toggle</span>
+                        </summary>
+                        <div class="map-desc">{{ item.summary }}</div>
+                        <div class="map-meta functions">
+                            <span class="label">Functions</span>
+                            <span class="value mono">{{ item.functions | join(", ") }}</span>
+                        </div>
+                        {% if item.variables %}
+                        <div class="map-meta vars">
+                            <span class="label">Key vars</span>
+                            <span class="value mono">{{ item.variables | join(", ") }}</span>
+                        </div>
+                        {% endif %}
+                    </details>
+                    {% endfor %}
+                </div>
+            </article>
+                    </section>
 
                     <section class="grid metrics-section">
             <article class="card">
@@ -888,82 +919,38 @@
             </article>
                     </section>
 
-                    <section class="grid map-section">
-            <article class="card wide">
-                <div class="card-head">
-                    <h2>File Map (where logic lives)</h2>
-                    <div class="controls">
-                        <label class="toggle">
-                            <input type="checkbox" id="toggle-functions" checked>
-                            Functions
-                        </label>
-                        <label class="toggle">
-                            <input type="checkbox" id="toggle-vars" checked>
-                            Vars
-                        </label>
-                        <label class="toggle">
-                            <input type="checkbox" id="toggle-jobs" checked>
-                            Jobs
-                        </label>
-                        <button class="toggle-button" id="toggle-details" type="button">Collapse all</button>
-                        <button class="toggle-button" id="toggle-focus" type="button">Focus map</button>
-                        <button class="toggle-button" id="toggle-compact" type="button">Compact view</button>
-                    </div>
-                </div>
-                <div class="map-list">
-                    {% for item in snapshot.file_map %}
-                    <details class="map-item" open>
-                        <summary>
-                            <span class="map-title">Step {{ item.step }} · {{ item.file }}</span>
-                            <span class="map-toggle">toggle</span>
-                        </summary>
-                        <div class="map-desc">{{ item.summary }}</div>
-                        <div class="map-meta functions">
-                            <span class="label">Functions</span>
-                            <span class="value mono">{{ item.functions | join(", ") }}</span>
-                        </div>
-                        {% if item.variables %}
-                        <div class="map-meta vars">
-                            <span class="label">Key vars</span>
-                            <span class="value mono">{{ item.variables | join(", ") }}</span>
-                        </div>
-                        {% endif %}
-                    </details>
-                    {% endfor %}
-                </div>
-            </article>
-
-            <article class="card wide jobs-section">
-                <h2>Recent Jobs (what just happened)</h2>
-                {% if snapshot.recent_jobs %}
-                    {% for job in snapshot.recent_jobs %}
-                    <div class="job">
-                        <div class="job-title">
-                            <span class="mono">{{ job.job_id }}</span>
-                            <span class="badge {{ job.status_class }}">{{ job.status }}</span>
-                        </div>
-                        <div class="job-meta">Age: {{ job.age_display }}{% if job.progress_display %} | {{ job.progress_display }}{% endif %}</div>
-                        {% if job.size_display %}
-                        <div class="job-meta">Size: {{ job.size_display }}</div>
-                        {% endif %}
-                        {% if job.parts_display %}
-                        <div class="job-meta">Details: {{ job.parts_display }}</div>
-                        {% endif %}
-                        {% if job.timing_display %}
-                        <div class="job-meta">Timing: {{ job.timing_display }}</div>
-                        {% endif %}
-                        {% if job.file_names %}
-                        <div class="job-files mono">Files: {{ job.file_names | join(", ") }}</div>
-                        {% endif %}
-                        {% if job.error %}
-                        <div class="job-error mono">Error: {{ job.error }}</div>
-                        {% endif %}
-                    </div>
-                    {% endfor %}
-                {% else %}
-                    <div class="label">No recent jobs yet.</div>
-                {% endif %}
-            </article>
+                    <section class="grid jobs-section">
+                        <article class="card wide">
+                            <h2>Recent Jobs (what just happened)</h2>
+                            {% if snapshot.recent_jobs %}
+                                {% for job in snapshot.recent_jobs %}
+                                <div class="job">
+                                    <div class="job-title">
+                                        <span class="mono">{{ job.job_id }}</span>
+                                        <span class="badge {{ job.status_class }}">{{ job.status }}</span>
+                                    </div>
+                                    <div class="job-meta">Age: {{ job.age_display }}{% if job.progress_display %} | {{ job.progress_display }}{% endif %}</div>
+                                    {% if job.size_display %}
+                                    <div class="job-meta">Size: {{ job.size_display }}</div>
+                                    {% endif %}
+                                    {% if job.parts_display %}
+                                    <div class="job-meta">Details: {{ job.parts_display }}</div>
+                                    {% endif %}
+                                    {% if job.timing_display %}
+                                    <div class="job-meta">Timing: {{ job.timing_display }}</div>
+                                    {% endif %}
+                                    {% if job.file_names %}
+                                    <div class="job-files mono">Files: {{ job.file_names | join(", ") }}</div>
+                                    {% endif %}
+                                    {% if job.error %}
+                                    <div class="job-error mono">Error: {{ job.error }}</div>
+                                    {% endif %}
+                                </div>
+                                {% endfor %}
+                            {% else %}
+                                <div class="label">No recent jobs yet.</div>
+                            {% endif %}
+                        </article>
                     </section>
 
                     <section class="notes">
@@ -1002,7 +989,9 @@
 
             bindCheckbox("toggle-functions", "hide-functions");
             bindCheckbox("toggle-vars", "hide-vars");
+            bindCheckbox("toggle-metrics", "hide-metrics");
             bindCheckbox("toggle-jobs", "hide-jobs");
+            bindCheckbox("toggle-notes", "hide-notes");
 
             const detailsBtn = document.getElementById("toggle-details");
             const mapItems = Array.from(document.querySelectorAll(".map-item"));
@@ -1023,14 +1012,6 @@
                     setAllOpen(!allOpen);
                 });
                 setAllOpen(true);
-            }
-
-            const focusBtn = document.getElementById("toggle-focus");
-            if (focusBtn) {
-                focusBtn.addEventListener("click", () => {
-                    body.classList.toggle("focus-map");
-                    focusBtn.textContent = body.classList.contains("focus-map") ? "Show full dashboard" : "Focus map";
-                });
             }
 
             const compactBtn = document.getElementById("toggle-compact");
