@@ -22,6 +22,11 @@ MAX_PARALLEL_CHUNKS = int(os.environ.get("MAX_PARALLEL_CHUNKS", "16"))
 MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
 # Minimum chunk size to avoid spawning tiny Ghostscript jobs that add overhead.
 MIN_CHUNK_MB = 20.0
+# Guardrail: only trigger merge fallback when output is meaningfully larger than input.
+PARALLEL_BLOAT_PCT = 0.08
+PARALLEL_MERGE_ON_BLOAT = True
+# Log-only signal when chunking inflates total size (PyPDF2 duplicates resources).
+PARALLEL_SPLIT_INFLATION_PCT = 0.02
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -618,8 +623,11 @@ def compress_parallel(
     logger.info(f"[PARALLEL] Split into {num_chunks} chunk(s)")
     split_time = time.time() - start_ts
     logger.info("[PERF] Split: %.1fs", split_time)
+    split_inflation = False
+    chunk_total_mb = 0.0
     try:
         chunk_sizes = [get_file_size_mb(p) for p in chunk_paths]
+        chunk_total_mb = sum(chunk_sizes)
         logger.info(
             "[PARALLEL] Chunk stats: count=%s min=%.1fMB max=%.1fMB avg=%.1fMB target=%.1fMB max=%.1fMB",
             num_chunks,
@@ -629,6 +637,17 @@ def compress_parallel(
             target_chunk_mb,
             max_chunk_mb,
         )
+        if original_size_mb > 0:
+            inflation_ratio = chunk_total_mb / original_size_mb
+            if inflation_ratio > (1 + PARALLEL_SPLIT_INFLATION_PCT):
+                split_inflation = True
+                inflation_pct = (inflation_ratio - 1) * 100
+                logger.warning(
+                    "[PARALLEL] Split inflation detected: %.1fMB -> %.1fMB chunks (+%.1f%%)",
+                    original_size_mb,
+                    chunk_total_mb,
+                    inflation_pct,
+                )
     except Exception:
         pass
 
@@ -644,10 +663,11 @@ def compress_parallel(
 
         # Skip GS if chunk is below minimum size; likely not worth recompressing.
         try:
-            if get_file_size_mb(chunk_path) <= MIN_CHUNK_MB:
-                return chunk_path, True, "Skipped compression (below min size)"
+            chunk_mb = get_file_size_mb(chunk_path)
         except Exception:
-            pass
+            chunk_mb = None
+        if chunk_mb is not None and chunk_mb <= MIN_CHUNK_MB:
+            return chunk_path, True, f"SKIPPED: {chunk_mb:.1f}MB < {MIN_CHUNK_MB:.1f}MB"
 
         success, message = compress_fn(chunk_path, compressed_path, num_threads=gs_threads)
 
@@ -674,6 +694,7 @@ def compress_parallel(
 
     compressed_chunks = []
     failed_chunks = []
+    skipped_chunks = 0
 
     worker_count = min(max_workers, len(chunk_paths)) if chunk_paths else max_workers
     effective_cpu = get_effective_cpu_count()
@@ -716,9 +737,15 @@ def compress_parallel(
             chunk_idx, original_chunk = futures[future]
             try:
                 compressed_path, success, message = future.result()
+                skipped = isinstance(message, str) and message.startswith("SKIPPED:")
                 if success and compressed_path.exists():
                     compressed_chunks.append((chunk_idx, compressed_path))
-                    logger.info(f"[PARALLEL] Chunk {chunk_idx + 1} compressed successfully")
+                    if skipped:
+                        skipped_chunks += 1
+                        skip_reason = message.split(":", 1)[1].strip() if ":" in message else message
+                        logger.info("[PARALLEL] Chunk %s skipped (%s)", chunk_idx + 1, skip_reason)
+                    else:
+                        logger.info(f"[PARALLEL] Chunk {chunk_idx + 1} compressed successfully")
                 else:
                     # Compression failed - use original chunk
                     logger.warning(f"[PARALLEL] Chunk {chunk_idx + 1} compression failed: {message}")
@@ -737,7 +764,13 @@ def compress_parallel(
     all_chunks.sort(key=lambda x: x[0])
     ordered_paths = [p for _, p in all_chunks]
 
-    logger.info(f"[PARALLEL] Compression complete: {len(compressed_chunks)} succeeded, {len(failed_chunks)} used original")
+    compressed_ok = max(0, len(compressed_chunks) - skipped_chunks)
+    logger.info(
+        "[PARALLEL] Compression complete: %s compressed, %s skipped, %s used original",
+        compressed_ok,
+        skipped_chunks,
+        len(failed_chunks),
+    )
     compress_time = time.time() - start_ts - split_time
     logger.info("[PERF] Compress: %.1fs", compress_time)
 
@@ -816,6 +849,61 @@ def compress_parallel(
     combined_bytes = sum(p.stat().st_size for p in verified_parts)
     combined_mb = combined_bytes / (1024 * 1024)
     reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
+
+    merge_fallback_used = False
+    if PARALLEL_MERGE_ON_BLOAT and original_size_mb > 0:
+        bloat_ratio = (combined_mb / original_size_mb) - 1
+        if bloat_ratio > PARALLEL_BLOAT_PCT:
+            bloat_pct = bloat_ratio * 100
+            logger.warning(
+                "[PARALLEL] Bloat detected: %.1fMB -> %.1fMB (+%.1f%%). Running merge fallback.",
+                original_size_mb,
+                combined_mb,
+                bloat_pct,
+            )
+            merged_path = working_dir / f"{input_path.stem}_merged_dedup.pdf"
+            try:
+                merge_pdfs(verified_parts, merged_path)
+                if merged_path.exists():
+                    fallback_parts = split_for_delivery(
+                        merged_path,
+                        working_dir,
+                        f"{input_path.stem}_merged",
+                        split_threshold_mb,
+                        progress_callback=None,
+                        skip_optimization_under_threshold=True,
+                    )
+                    for part in verified_parts:
+                        part.unlink(missing_ok=True)
+                    merged_path.unlink(missing_ok=True)
+                    verified_parts = fallback_parts
+                    combined_bytes = sum(p.stat().st_size for p in verified_parts)
+                    combined_mb = combined_bytes / (1024 * 1024)
+                    reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
+                    merge_fallback_used = True
+                    logger.info(
+                        "[PARALLEL] Merge fallback complete: parts=%s, reduction=%.1f%%",
+                        len(verified_parts),
+                        reduction_percent,
+                    )
+                else:
+                    logger.warning("[PARALLEL] Merge fallback failed: merged file missing")
+            except Exception as exc:
+                logger.warning("[PARALLEL] Merge fallback failed: %s", exc)
+
+    logger.info(
+        "[PARALLEL] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s, compressed=%s, skipped=%s, "
+        "used_original=%s, split_inflation=%s, merge_fallback=%s",
+        original_size_mb,
+        combined_mb,
+        reduction_percent,
+        len(verified_parts),
+        compressed_ok,
+        skipped_chunks,
+        len(failed_chunks),
+        "yes" if split_inflation else "no",
+        "yes" if merge_fallback_used else "no",
+    )
 
     return {
         "output_path": str(verified_parts[0]),

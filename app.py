@@ -84,6 +84,7 @@ MIN_FILE_RETENTION_SECONDS = int(os.environ.get('MIN_FILE_RETENTION_SECONDS', '3
 EFFECTIVE_FILE_RETENTION_SECONDS = max(FILE_RETENTION_SECONDS, MIN_FILE_RETENTION_SECONDS)
 BASE_SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
 _attachment_limit = os.environ.get("ATTACHMENT_MAX_MB")
+ATTACHMENT_MAX_MB: float | None = None
 ATTACHMENT_OVERHEAD_PCT = float(os.environ.get("ATTACHMENT_OVERHEAD_PCT", "0.35"))
 ATTACHMENT_OVERHEAD_MB = float(os.environ.get("ATTACHMENT_OVERHEAD_MB", "0.5"))
 EFFECTIVE_SPLIT_THRESHOLD_MB = BASE_SPLIT_THRESHOLD_MB
@@ -91,6 +92,7 @@ EFFECTIVE_SPLIT_THRESHOLD_MB = BASE_SPLIT_THRESHOLD_MB
 if _attachment_limit:
     try:
         attachment_limit_mb = float(_attachment_limit)
+        ATTACHMENT_MAX_MB = attachment_limit_mb
         safe_mb = (attachment_limit_mb - ATTACHMENT_OVERHEAD_MB) / (1 + ATTACHMENT_OVERHEAD_PCT)
         if safe_mb > 0:
             EFFECTIVE_SPLIT_THRESHOLD_MB = min(BASE_SPLIT_THRESHOLD_MB, safe_mb)
@@ -287,22 +289,38 @@ def _log_output_page_counts(
             audit_bits.append(f"page_labels={'yes' if page_labels_present else 'no'}")
         logger.info("[%s] Input audit: %s", label, ", ".join(audit_bits))
 
+    email_limit_mb = ATTACHMENT_MAX_MB if ATTACHMENT_MAX_MB is not None else BASE_SPLIT_THRESHOLD_MB
+    email_limit_source = "ATTACHMENT_MAX_MB" if ATTACHMENT_MAX_MB is not None else "SPLIT_THRESHOLD_MB"
+    logger.info(
+        "[%s] Email size check: limit=%.1fMB (%s, overhead=%.0f%%+%.1fMB)",
+        label,
+        email_limit_mb,
+        email_limit_source,
+        ATTACHMENT_OVERHEAD_PCT * 100,
+        ATTACHMENT_OVERHEAD_MB,
+    )
+
     total_pages = 0
     total_size_mb = 0.0
     for idx, path in enumerate(output_paths, start=1):
         try:
             with open(path, "rb") as f:
                 count = len(PdfReader(f, strict=False).pages)
-            size_mb = path.stat().st_size / (1024 * 1024)
+            size_bytes = path.stat().st_size
+            size_mb = size_bytes / (1024 * 1024)
+            email_est_mb = size_mb * (1 + ATTACHMENT_OVERHEAD_PCT) + ATTACHMENT_OVERHEAD_MB
+            email_status = "OK" if email_est_mb <= email_limit_mb else "OVER"
             total_pages += count
             total_size_mb += size_mb
             logger.info(
-                "[%s] Output pages part %s: %s = %s pages (%.1fMB)",
+                "[%s] Output pages part %s: %s = %s pages (%.1fMB, email~%.1fMB %s)",
                 label,
                 idx,
                 path.name,
                 count,
                 size_mb,
+                email_est_mb,
+                email_status,
             )
         except Exception as exc:
             logger.warning("[%s] Output page count failed for %s: %s", label, path.name, exc)
@@ -545,11 +563,13 @@ def _format_recent_jobs(recent_jobs: list[Dict[str, Any]]) -> list[Dict[str, Any
             timing_bits.append(f"total {total_s:.1f}s")
         timing_display = " | ".join(timing_bits) if timing_bits else None
 
-        age_seconds = job.get("age_seconds")
-        if isinstance(age_seconds, int):
-            age_display = f"{age_seconds}s" if age_seconds < 90 else f"{age_seconds / 60:.1f}m"
-        else:
-            age_display = "n/a"
+        duration_display = "n/a"
+        if status == "completed":
+            total_s = _safe_float((result.get("processing_time") or {}).get("total_seconds"))
+            if total_s is not None:
+                duration_display = f"{total_s:.1f}s" if total_s < 90 else f"{total_s / 60:.1f}m"
+        elif status == "processing":
+            duration_display = "in progress"
 
         progress_percent = progress.get("percent")
         progress_stage = progress.get("stage")
@@ -569,7 +589,7 @@ def _format_recent_jobs(recent_jobs: list[Dict[str, Any]]) -> list[Dict[str, Any
             "job_id": job.get("job_id"),
             "status": status,
             "status_class": status_class,
-            "age_display": age_display,
+            "duration_display": duration_display,
             "progress_display": progress_display,
             "size_display": size_display,
             "parts_display": parts_display,

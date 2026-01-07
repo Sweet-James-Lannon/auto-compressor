@@ -942,7 +942,7 @@
                                         <span class="mono">{{ job.job_id }}</span>
                                         <span class="badge {{ job.status_class }}">{{ job.status }}</span>
                                     </div>
-                                    <div class="job-meta">Age: {{ job.age_display }}{% if job.progress_display %} | {{ job.progress_display }}{% endif %}</div>
+                                    <div class="job-meta">Duration: {{ job.duration_display }}{% if job.progress_display %} | {{ job.progress_display }}{% endif %}{% if job.timing_display %} | {{ job.timing_display }}{% endif %}</div>
                                     {% if job.size_display %}
                                     <div class="job-meta">Size: {{ job.size_display }}</div>
                                     {% endif %}
@@ -969,6 +969,8 @@
                     <section class="notes">
                         <h2>Part Count Rule</h2>
                         <p>Parts are roughly: ceil(output_mb / split_threshold_mb). With a 25MB cap, fewer parts require more lossy compression.</p>
+                        <p>Parallel guardrail: if chunked output ends up more than ~8% larger than input, the system runs a merge + re-split to dedupe resources.</p>
+                        <p>Logs to watch: [PARALLEL] Split inflation detected, Chunk N skipped, Summary (merge_fallback=yes/no).</p>
                     </section>
                 </main>
             </section>

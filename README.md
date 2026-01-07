@@ -107,6 +107,8 @@ python app.py
 - Lossless mode uses `/default` and de-duplication only
 - Parallel mode splits by pages, compresses chunks concurrently, then splits
   each chunk to <= threshold
+- Parallel guardrail: if parallel output ends up >8% larger than input, it
+  merges and re-splits to dedupe cross-chunk resources (rare, speed-safe).
 
 ---
 
@@ -158,6 +160,7 @@ These are the same settings you see in Azure App Settings.
 | ALLOW_LOSSY_COMPRESSION | 1/0 allow downsampling |
 | SPLIT_THRESHOLD_MB | Max size per part (default 25) |
 | SPLIT_TRIGGER_MB | Only split when output exceeds this |
+| ATTACHMENT_MAX_MB | Optional email attachment limit for size checks |
 | FILE_RETENTION_SECONDS | How long files stay before cleanup |
 
 ### Parallel/Chunking
