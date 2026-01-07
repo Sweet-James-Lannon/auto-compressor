@@ -412,6 +412,7 @@
             gap: 12px;
             padding: 6px 0;
             border-bottom: 1px dashed rgba(30, 42, 58, 0.15);
+            align-items: flex-start;
         }
 
         .row:last-child {
@@ -426,6 +427,10 @@
         .value {
             font-size: 0.92rem;
             text-align: right;
+            max-width: 60%;
+            min-width: 0;
+            word-break: break-word;
+            overflow-wrap: anywhere;
         }
 
         .mono {
@@ -593,6 +598,16 @@
 
         .notes p {
             line-height: 1.5;
+        }
+
+        .subhead {
+            margin-top: 12px;
+            padding-top: 10px;
+            border-top: 1px dashed rgba(30, 42, 58, 0.2);
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: var(--muted);
         }
 
         @keyframes fadeUp {
@@ -864,6 +879,23 @@
                     <span class="label">Attachment max</span>
                     <span class="value mono">{{ snapshot.split.attachment_max_mb }}</span>
                 </div>
+                <div class="subhead">Limits</div>
+                <div class="row">
+                    <span class="label">Sync max (MB)</span>
+                    <span class="value mono">{{ snapshot.limits.sync_max_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Async max (MB)</span>
+                    <span class="value mono">{{ snapshot.limits.async_max_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Auto-async (MB)</span>
+                    <span class="value mono">{{ snapshot.limits.sync_auto_async_mb }}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Sync timeout (sec)</span>
+                    <span class="value mono">{{ snapshot.limits.sync_timeout_seconds }}</span>
+                </div>
             </article>
 
             <article class="card">
@@ -898,25 +930,6 @@
                 </div>
             </article>
 
-            <article class="card">
-                <h2>Limits</h2>
-                <div class="row">
-                    <span class="label">Sync max (MB)</span>
-                    <span class="value mono">{{ snapshot.limits.sync_max_mb }}</span>
-                </div>
-                <div class="row">
-                    <span class="label">Async max (MB)</span>
-                    <span class="value mono">{{ snapshot.limits.async_max_mb }}</span>
-                </div>
-                <div class="row">
-                    <span class="label">Auto-async (MB)</span>
-                    <span class="value mono">{{ snapshot.limits.sync_auto_async_mb }}</span>
-                </div>
-                <div class="row">
-                    <span class="label">Sync timeout (sec)</span>
-                    <span class="value mono">{{ snapshot.limits.sync_timeout_seconds }}</span>
-                </div>
-            </article>
                     </section>
 
                     <section class="grid jobs-section">
