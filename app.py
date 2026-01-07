@@ -523,6 +523,12 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         })
 
     try:
+        name_hint: str | None = None
+        if isinstance(task_data.get("name"), str):
+            name_hint = task_data["name"]
+        elif isinstance(task_data.get("download_url"), str):
+            name_hint = task_data["download_url"]
+
         input_path: Path
 
         progress_callback(5, "uploading", "Receiving file...")
