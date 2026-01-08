@@ -953,7 +953,9 @@
                                     <div class="job-meta">Timing: {{ job.timing_display }}</div>
                                     {% endif %}
                                     {% if job.file_names %}
-                                    <div class="job-files mono">Files: {{ job.file_names | join(", ") }}</div>
+                                    <div class="job-files mono" title="{{ job.file_names_full | join(", ") }}">
+                                        Files{% if job.file_names_count %} ({{ job.file_names_count }}){% endif %}: {{ job.file_names | join(", ") }}{% if job.file_names_more %} (+{{ job.file_names_more }} more){% endif %}
+                                    </div>
                                     {% endif %}
                                     {% if job.error %}
                                     <div class="job-error mono">Error: {{ job.error }}</div>

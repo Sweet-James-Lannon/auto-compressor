@@ -713,7 +713,9 @@ def _format_recent_jobs(recent_jobs: list[Dict[str, Any]]) -> list[Dict[str, Any
             progress_bits.append(str(progress_message))
         progress_display = " | ".join(progress_bits) if progress_bits else None
 
-        file_names = _extract_display_names(result.get("download_links") or [])[:6]
+        file_names_full = _extract_display_names(result.get("download_links") or [])
+        file_names = file_names_full[:6]
+        file_names_more = max(0, len(file_names_full) - len(file_names))
 
         formatted.append({
             "job_id": job.get("job_id"),
@@ -726,6 +728,9 @@ def _format_recent_jobs(recent_jobs: list[Dict[str, Any]]) -> list[Dict[str, Any
             "timing_display": timing_display,
             "error": job.get("error"),
             "file_names": file_names,
+            "file_names_full": file_names_full,
+            "file_names_count": len(file_names_full),
+            "file_names_more": file_names_more,
         })
     return formatted
 
