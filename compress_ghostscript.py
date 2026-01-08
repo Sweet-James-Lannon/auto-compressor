@@ -27,6 +27,8 @@ PARALLEL_BLOAT_PCT = 0.08
 PARALLEL_MERGE_ON_BLOAT = True
 # Log-only signal when chunking inflates total size (PyPDF2 duplicates resources).
 PARALLEL_SPLIT_INFLATION_PCT = 0.02
+# If split inflation is high, force dedupe on split parts (targeted slow path).
+PARALLEL_DEDUP_SPLIT_INFLATION_PCT = float(os.environ.get("PARALLEL_DEDUP_SPLIT_INFLATION_PCT", "0.12"))
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -624,6 +626,8 @@ def compress_parallel(
     split_time = time.time() - start_ts
     logger.info("[PERF] Split: %.1fs", split_time)
     split_inflation = False
+    split_inflation_ratio = 1.0
+    force_split_dedup = False
     chunk_total_mb = 0.0
     try:
         chunk_sizes = [get_file_size_mb(p) for p in chunk_paths]
@@ -639,6 +643,7 @@ def compress_parallel(
         )
         if original_size_mb > 0:
             inflation_ratio = chunk_total_mb / original_size_mb
+            split_inflation_ratio = inflation_ratio
             if inflation_ratio > (1 + PARALLEL_SPLIT_INFLATION_PCT):
                 split_inflation = True
                 inflation_pct = (inflation_ratio - 1) * 100
@@ -650,6 +655,13 @@ def compress_parallel(
                 )
     except Exception:
         pass
+    if split_inflation_ratio > (1 + PARALLEL_DEDUP_SPLIT_INFLATION_PCT):
+        force_split_dedup = True
+        logger.warning(
+            "[PARALLEL] High split inflation %.1f%% (threshold %.1f%%); forcing dedupe on split parts",
+            (split_inflation_ratio - 1) * 100,
+            PARALLEL_DEDUP_SPLIT_INFLATION_PCT * 100,
+        )
 
     # Step 3: Compress each chunk in parallel
     report_progress(15, "compressing", f"Compressing {num_chunks} chunks in parallel...")
@@ -806,7 +818,7 @@ def compress_parallel(
                 f"{chunk_path.stem}",
                 split_threshold_mb,
                 progress_callback=progress_callback,
-                skip_optimization_under_threshold=True,
+                skip_optimization_under_threshold=not force_split_dedup,
             )
             final_parts.extend(chunk_parts)
 
@@ -851,6 +863,7 @@ def compress_parallel(
     reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
 
     merge_fallback_used = False
+    merge_fallback_time = 0.0
     if PARALLEL_MERGE_ON_BLOAT and original_size_mb > 0:
         bloat_ratio = (combined_mb / original_size_mb) - 1
         if bloat_ratio > PARALLEL_BLOAT_PCT:
@@ -863,15 +876,20 @@ def compress_parallel(
             )
             merged_path = working_dir / f"{input_path.stem}_merged_dedup.pdf"
             try:
+                merge_start = time.time()
                 merge_pdfs(verified_parts, merged_path)
                 if merged_path.exists():
+                    if force_split_dedup:
+                        logger.info("[PARALLEL] Merge fallback: keeping dedupe optimization on split parts")
+                    else:
+                        logger.info("[PARALLEL] Merge fallback: forcing dedupe optimization on split parts")
                     fallback_parts = split_for_delivery(
                         merged_path,
                         working_dir,
                         f"{input_path.stem}_merged",
                         split_threshold_mb,
                         progress_callback=None,
-                        skip_optimization_under_threshold=True,
+                        skip_optimization_under_threshold=False,
                     )
                     for part in verified_parts:
                         part.unlink(missing_ok=True)
@@ -881,6 +899,7 @@ def compress_parallel(
                     combined_mb = combined_bytes / (1024 * 1024)
                     reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
                     merge_fallback_used = True
+                    merge_fallback_time = time.time() - merge_start
                     logger.info(
                         "[PARALLEL] Merge fallback complete: parts=%s, reduction=%.1f%%",
                         len(verified_parts),
@@ -893,7 +912,7 @@ def compress_parallel(
 
     logger.info(
         "[PARALLEL] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s, compressed=%s, skipped=%s, "
-        "used_original=%s, split_inflation=%s, merge_fallback=%s",
+        "used_original=%s, split_inflation=%s, dedupe_parts=%s, merge_fallback=%s",
         original_size_mb,
         combined_mb,
         reduction_percent,
@@ -902,7 +921,17 @@ def compress_parallel(
         skipped_chunks,
         len(failed_chunks),
         "yes" if split_inflation else "no",
+        "yes" if force_split_dedup else "no",
         "yes" if merge_fallback_used else "no",
+    )
+    total_time = time.time() - start_ts
+    logger.info(
+        "[PARALLEL_METRICS] total=%.1fs split=%.1fs compress=%.1fs split_parts=%.1fs merge_fallback=%.1fs",
+        total_time,
+        split_time,
+        compress_time,
+        split_total,
+        merge_fallback_time,
     )
 
     return {
@@ -918,5 +947,10 @@ def compress_parallel(
         "success": True,
         "page_count": page_count,
         "part_sizes": [p.stat().st_size for p in verified_parts],
-        "parallel_chunks": num_chunks
+        "parallel_chunks": num_chunks,
+        "split_inflation": split_inflation,
+        "split_inflation_pct": round((split_inflation_ratio - 1) * 100, 1),
+        "dedupe_parts": force_split_dedup,
+        "merge_fallback": merge_fallback_used,
+        "merge_fallback_time": round(merge_fallback_time, 2),
     }

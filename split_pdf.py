@@ -324,7 +324,7 @@ def split_by_size(
             )
 
         part_path = output_dir / f"{base_name}_part{i+1}.pdf"
-        if raw_size <= threshold_mb:
+        if raw_size <= threshold_mb and skip_optimization_under_threshold:
             part_path.unlink(missing_ok=True)
             temp_part_path.rename(part_path)
             part_size = raw_size
@@ -335,6 +335,12 @@ def split_by_size(
             )
         else:
             # Optimize with Ghostscript to deduplicate resources (critical for size reduction)
+            if raw_size <= threshold_mb:
+                logger.info(
+                    "[split_by_size] Part %s under threshold (%.2fMB); optimizing to dedupe resources",
+                    i + 1,
+                    raw_size,
+                )
             success, opt_message = optimize_split_part(temp_part_path, part_path)
 
             if success and part_path.exists():

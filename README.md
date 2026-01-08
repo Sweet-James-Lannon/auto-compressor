@@ -172,6 +172,7 @@ These are the same settings you see in Azure App Settings.
 | MAX_PARALLEL_CHUNKS | Upper bound on chunk count |
 | MAX_PAGES_PER_CHUNK | Advisory page cap |
 | PARALLEL_MAX_WORKERS | Cap parallel workers |
+| PARALLEL_DEDUP_SPLIT_INFLATION_PCT | If split inflation exceeds this, force dedupe on split parts |
 | GS_NUM_RENDERING_THREADS | Threads per Ghostscript process |
 
 ### Ghostscript tuning

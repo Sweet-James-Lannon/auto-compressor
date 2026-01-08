@@ -350,7 +350,7 @@ def download_pdf(url: str, output_path: Path, max_download_size_bytes: int = MAX
 
         logger.info(
             f"Downloaded {downloaded:,} bytes "
-            f"({downloaded / 1_000_000:.1f}MB, {downloaded / (1024 * 1024):.1f}MiB) "
+            f"({downloaded / (1024 * 1024):.1f}MB) "
             f"to {output_path.name}"
         )
         if strict_length and expected_bytes is not None:

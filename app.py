@@ -3,6 +3,7 @@
 import base64
 import logging
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import threading
 import time
@@ -36,7 +37,8 @@ import utils
 # Config
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
@@ -237,6 +239,134 @@ def _build_download_links(output_paths: list[Path], name_hint: str | None) -> li
             display_name = f"{display_name}.pdf"
         links.append(f"/download/{path.name}?name={quote(display_name)}")
     return links
+
+
+def _log_job_header(job_id: str, source: str, input_path: Path, name_hint: str | None) -> None:
+    try:
+        size_mb = input_path.stat().st_size / (1024 * 1024)
+        size_label = f"{size_mb:.1f}MB"
+    except OSError:
+        size_label = "unknown"
+
+    attachment_limit_mb = ATTACHMENT_MAX_MB if ATTACHMENT_MAX_MB is not None else BASE_SPLIT_THRESHOLD_MB
+    attachment_source = "ATTACHMENT_MAX_MB" if ATTACHMENT_MAX_MB is not None else "SPLIT_THRESHOLD_MB"
+    name_label = _normalize_display_base(name_hint)
+
+    logger.info(
+        "[JOB] %s | source=%s | name=%s | file=%s | size=%s | split=%.1fMB | trigger=%.1fMB | "
+        "attach_limit=%.1fMB(%s) | overhead=%.0f%%+%.1fMB",
+        job_id,
+        source,
+        name_label,
+        input_path.name,
+        size_label,
+        SPLIT_THRESHOLD_MB,
+        SPLIT_TRIGGER_MB,
+        attachment_limit_mb,
+        attachment_source,
+        ATTACHMENT_OVERHEAD_PCT * 100,
+        ATTACHMENT_OVERHEAD_MB,
+    )
+
+
+def _log_job_result(job_id: str, result: dict, output_paths: list[Path]) -> None:
+    parts = result.get("total_parts") or len(output_paths)
+    sizes = []
+    for path in output_paths:
+        try:
+            sizes.append(f"{path.stat().st_size / (1024 * 1024):.1f}")
+        except OSError:
+            sizes.append("?")
+    size_label = ",".join(sizes) if sizes else "none"
+    page_count = result.get("page_count")
+    page_label = str(page_count) if page_count is not None else "unknown"
+
+    logger.info(
+        "[JOB_RESULT] %s | mode=%s | method=%s | pages=%s | in=%.1fMB | out=%.1fMB | "
+        "reduction=%.1f%% | parts=%s | part_sizes_mb=%s",
+        job_id,
+        result.get("compression_mode"),
+        result.get("compression_method"),
+        page_label,
+        result.get("original_size_mb", 0.0),
+        result.get("compressed_size_mb", 0.0),
+        result.get("reduction_percent", 0.0),
+        parts,
+        size_label,
+    )
+
+
+def _log_job_email(job_id: str, output_paths: list[Path]) -> None:
+    if not output_paths:
+        return
+
+    limit_mb = ATTACHMENT_MAX_MB if ATTACHMENT_MAX_MB is not None else BASE_SPLIT_THRESHOLD_MB
+    limit_source = "ATTACHMENT_MAX_MB" if ATTACHMENT_MAX_MB is not None else "SPLIT_THRESHOLD_MB"
+
+    max_part_mb = 0.0
+    max_email_mb = 0.0
+    over_limit = 0
+    counted = 0
+    for path in output_paths:
+        try:
+            size_mb = path.stat().st_size / (1024 * 1024)
+        except OSError:
+            continue
+        counted += 1
+        email_est_mb = size_mb * (1 + ATTACHMENT_OVERHEAD_PCT) + ATTACHMENT_OVERHEAD_MB
+        max_part_mb = max(max_part_mb, size_mb)
+        max_email_mb = max(max_email_mb, email_est_mb)
+        if email_est_mb > limit_mb:
+            over_limit += 1
+
+    if counted == 0:
+        return
+
+    logger.info(
+        "[JOB_EMAIL] %s | parts=%s | max_part=%.1fMB | max_email=%.1fMB | over=%s/%s | "
+        "limit=%.1fMB(%s) | overhead=%.0f%%+%.1fMB",
+        job_id,
+        len(output_paths),
+        max_part_mb,
+        max_email_mb,
+        over_limit,
+        len(output_paths),
+        limit_mb,
+        limit_source,
+        ATTACHMENT_OVERHEAD_PCT * 100,
+        ATTACHMENT_OVERHEAD_MB,
+    )
+
+
+def _log_job_parallel(job_id: str, result: dict) -> None:
+    if result.get("compression_method") != "ghostscript_parallel":
+        return
+
+    split_inflation = result.get("split_inflation")
+    split_label = "yes" if split_inflation else "no"
+    split_pct = result.get("split_inflation_pct")
+    if split_pct is None:
+        split_pct = 0.0
+
+    dedupe_parts = result.get("dedupe_parts")
+    dedupe_label = "yes" if dedupe_parts else "no"
+    merge_fallback = result.get("merge_fallback")
+    merge_label = "yes" if merge_fallback else "no"
+    merge_time = result.get("merge_fallback_time")
+    if merge_time is None:
+        merge_time = 0.0
+
+    logger.info(
+        "[JOB_PARALLEL] %s | chunks=%s | split_inflation=%s (%.1f%%) | dedupe_parts=%s | "
+        "merge_fallback=%s | merge_time=%.1fs",
+        job_id,
+        result.get("parallel_chunks", "unknown"),
+        split_label,
+        split_pct,
+        dedupe_label,
+        merge_label,
+        merge_time,
+    )
 
 
 def _log_output_page_counts(
@@ -840,6 +970,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             name_hint = task_data["download_url"]
 
         input_path: Path
+        source_label = "unknown"
 
         progress_callback(5, "uploading", "Receiving file...")
 
@@ -848,17 +979,20 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             input_path = Path(task_data['input_path'])
             if not input_path.exists():
                 raise FileNotFoundError(f"Input file not found: {input_path}")
+            source_label = "preloaded"
         else:
             input_path = UPLOAD_FOLDER / f"{job_id}_input.pdf"
             if 'pdf_bytes' in task_data:
                 pdf_bytes = task_data['pdf_bytes']
                 input_path.write_bytes(pdf_bytes)
+                source_label = "upload"
             elif 'download_url' in task_data:
                 job_queue.download_pdf(
                     task_data['download_url'],
                     input_path,
                     max_download_size_bytes=int(ASYNC_MAX_MB * 1024 * 1024),
                 )
+                source_label = "download"
             else:
                 raise ValueError("No PDF data provided")
 
@@ -967,6 +1101,8 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             input_path = subset_path
             track_file(input_path)
 
+        _log_job_header(job_id, source_label, input_path, name_hint)
+
         download_time = round(time.time() - start_time, 2)
 
         # Get quality warnings before compression
@@ -1009,6 +1145,9 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             track_file(path)
 
         _log_output_page_counts(output_paths, job_id, result.get("page_count"), input_path)
+        _log_job_result(job_id, result, output_paths)
+        _log_job_email(job_id, output_paths)
+        _log_job_parallel(job_id, result)
 
         progress_callback(98, "finalizing", "Preparing download links...")
 
