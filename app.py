@@ -2,6 +2,7 @@
 
 import base64
 import logging
+import math
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -335,6 +336,94 @@ def _log_job_email(job_id: str, output_paths: list[Path]) -> None:
         limit_source,
         ATTACHMENT_OVERHEAD_PCT * 100,
         ATTACHMENT_OVERHEAD_MB,
+    )
+
+
+def _log_job_flags(job_id: str, result: dict, output_paths: list[Path]) -> None:
+    if not output_paths:
+        return
+
+    part_sizes_mb = []
+    for path in output_paths:
+        try:
+            part_sizes_mb.append(path.stat().st_size / (1024 * 1024))
+        except OSError:
+            continue
+
+    if not part_sizes_mb:
+        return
+
+    total_parts = len(part_sizes_mb)
+    total_mb = sum(part_sizes_mb)
+    max_part_mb = max(part_sizes_mb)
+    min_part_mb = min(part_sizes_mb)
+    avg_part_mb = total_mb / total_parts if total_parts else 0.0
+
+    threshold_mb = SPLIT_THRESHOLD_MB
+    if threshold_mb > 0:
+        min_parts = max(1, math.ceil(total_mb / threshold_mb))
+        max_part_pct = (max_part_mb / threshold_mb) * 100
+        slack_mb = max(0.0, threshold_mb - max_part_mb)
+        slack_pct = (slack_mb / threshold_mb) * 100
+    else:
+        min_parts = total_parts
+        max_part_pct = 0.0
+        slack_mb = 0.0
+        slack_pct = 0.0
+
+    parts_over_min = total_parts - min_parts
+    method = result.get("compression_method")
+
+    split_inflation_pct = _safe_float(result.get("split_inflation_pct"))
+    split_inflation_label = f"{split_inflation_pct:.1f}%" if split_inflation_pct is not None else "n/a"
+
+    def _flag_label(value: Any) -> str:
+        if value is True:
+            return "yes"
+        if value is False:
+            return "no"
+        return "n/a"
+
+    dedupe_parts = result.get("dedupe_parts")
+    merge_fallback = result.get("merge_fallback")
+    dedupe_label = _flag_label(dedupe_parts)
+    merge_label = _flag_label(merge_fallback)
+    rebalance_attempted = result.get("rebalance_attempted")
+    rebalance_applied = result.get("rebalance_applied")
+    rebalance_attempted_label = _flag_label(rebalance_attempted)
+    rebalance_applied_label = _flag_label(rebalance_applied)
+
+    rebalance_candidate = False
+    if method == "ghostscript_parallel":
+        high_inflation = split_inflation_pct is not None and split_inflation_pct >= 40.0
+        if parts_over_min >= 2 and (high_inflation or dedupe_parts is True) and merge_fallback is not True:
+            rebalance_candidate = True
+
+    logger.info(
+        "[JOB_FLAGS] %s | method=%s | parts=%s | min_parts=%s | over_min=%s | "
+        "max_part=%.1fMB(%.0f%% of %.1fMB) | slack=%.1fMB(%.0f%%) | "
+        "part_range=%.1f-%.1fMB avg=%.1fMB | split_inflation=%s | "
+        "dedupe_parts=%s | merge_fallback=%s | rebalance_candidate=%s | "
+        "rebalance_attempted=%s | rebalance_applied=%s",
+        job_id,
+        method,
+        total_parts,
+        min_parts,
+        parts_over_min,
+        max_part_mb,
+        max_part_pct,
+        threshold_mb,
+        slack_mb,
+        slack_pct,
+        min_part_mb,
+        max_part_mb,
+        avg_part_mb,
+        split_inflation_label,
+        dedupe_label,
+        merge_label,
+        "yes" if rebalance_candidate else "no",
+        rebalance_attempted_label,
+        rebalance_applied_label,
     )
 
 
@@ -1153,6 +1242,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         _log_job_result(job_id, result, output_paths)
         _log_job_email(job_id, output_paths)
         _log_job_parallel(job_id, result)
+        _log_job_flags(job_id, result, output_paths)
 
         progress_callback(98, "finalizing", "Preparing download links...")
 
@@ -1782,6 +1872,7 @@ def compress_sync():
                         completed.get("page_count"),
                         input_path,
                     )
+                    _log_job_flags(f"sync-timeout:{file_id}", completed, output_paths)
                     download_links = _build_download_links(output_paths, name_hint)
                     files = [build_download_url(link) for link in download_links]
 
@@ -1848,6 +1939,7 @@ def compress_sync():
             result.get("page_count"),
             input_path,
         )
+        _log_job_flags(f"sync:{file_id}", result, output_paths)
         download_links = _build_download_links(output_paths, name_hint)
         files = [build_download_url(link) for link in download_links]
 

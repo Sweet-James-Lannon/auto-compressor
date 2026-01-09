@@ -48,6 +48,12 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+REBALANCE_SPLIT_ENABLED = _env_bool("REBALANCE_SPLIT_ENABLED", True)
+REBALANCE_MIN_PARTS_OVER_MIN = _env_int("REBALANCE_MIN_PARTS_OVER_MIN", 2)
+REBALANCE_SPLIT_INFLATION_PCT = float(os.environ.get("REBALANCE_SPLIT_INFLATION_PCT", "40"))
+REBALANCE_MAX_PART_PCT = float(os.environ.get("REBALANCE_MAX_PART_PCT", "0.85"))
+
+
 def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
     raw = (os.environ.get(name) or "").strip()
     return raw if raw in allowed else default
@@ -488,7 +494,7 @@ def compress_parallel(
         Dict with output_path(s), sizes, reduction_percent, etc.
     """
     # Import here to avoid circular imports
-    from split_pdf import split_by_pages, merge_pdfs, split_for_delivery, split_by_size
+    from split_pdf import split_by_pages, merge_pdfs, split_for_delivery, split_by_size, split_pdf
     from utils import get_file_size_mb
 
     input_path = Path(input_path)
@@ -911,6 +917,105 @@ def compress_parallel(
             except Exception as exc:
                 logger.warning("[PARALLEL] Merge fallback failed: %s", exc)
 
+    rebalance_attempted = False
+    rebalance_applied = False
+    rebalance_reason = None
+    rebalance_parts_before = len(verified_parts)
+    rebalance_parts_after = None
+    rebalance_size_before_mb = round(combined_mb, 2)
+    rebalance_size_after_mb = None
+    rebalance_time = 0.0
+
+    if REBALANCE_SPLIT_ENABLED and split_threshold_mb > 0 and rebalance_parts_before > 1:
+        part_sizes_mb = [p.stat().st_size / (1024 * 1024) for p in verified_parts]
+        max_part_mb = max(part_sizes_mb) if part_sizes_mb else 0.0
+        min_parts = max(1, math.ceil(combined_mb / split_threshold_mb))
+        parts_over_min = rebalance_parts_before - min_parts
+        split_inflation_pct = round((split_inflation_ratio - 1) * 100, 1)
+        high_inflation = split_inflation_pct >= REBALANCE_SPLIT_INFLATION_PCT
+        slack_ok = max_part_mb <= split_threshold_mb * REBALANCE_MAX_PART_PCT
+
+        candidate = (
+            parts_over_min >= REBALANCE_MIN_PARTS_OVER_MIN
+            and (high_inflation or force_split_dedup)
+            and not merge_fallback_used
+            and slack_ok
+        )
+
+        if candidate:
+            rebalance_attempted = True
+            rebalance_reason = (
+                f"over_min={parts_over_min} inflation={split_inflation_pct:.1f}% "
+                f"dedupe_parts={'yes' if force_split_dedup else 'no'} max_part={max_part_mb:.1f}MB"
+            )
+            rebalance_tag = str(uuid.uuid4())[:8]
+            rebalance_base = f"{input_path.stem}_rebalance_{rebalance_tag}"
+            merged_path = working_dir / f"{rebalance_base}.pdf"
+            rebalance_start = time.time()
+            try:
+                merge_pdfs(verified_parts, merged_path)
+                if merged_path.exists():
+                    rebalance_parts = split_pdf(
+                        merged_path,
+                        working_dir,
+                        rebalance_base,
+                        split_threshold_mb,
+                        skip_optimization_under_threshold=True,
+                    )
+                    rebalance_parts_after = len(rebalance_parts)
+                    rebalance_size_after_mb = sum(
+                        p.stat().st_size for p in rebalance_parts
+                    ) / (1024 * 1024)
+                    if rebalance_parts_after < rebalance_parts_before:
+                        for part in verified_parts:
+                            part.unlink(missing_ok=True)
+                        verified_parts = rebalance_parts
+                        combined_bytes = sum(p.stat().st_size for p in verified_parts)
+                        combined_mb = combined_bytes / (1024 * 1024)
+                        reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
+                        rebalance_applied = True
+                    else:
+                        for part in rebalance_parts:
+                            part.unlink(missing_ok=True)
+                else:
+                    logger.warning("[REBALSPLIT] merged file missing; skipping")
+            except Exception as exc:
+                logger.warning("[REBALSPLIT] failed: %s", exc)
+                for part in working_dir.glob(f"{rebalance_base}_part*.pdf"):
+                    part.unlink(missing_ok=True)
+            finally:
+                merged_path.unlink(missing_ok=True)
+                rebalance_time = time.time() - rebalance_start
+                rebalance_parts_after = rebalance_parts_after or rebalance_parts_before
+                size_after = rebalance_size_after_mb or rebalance_size_before_mb
+                logger.info(
+                    "[REBALSPLIT] triggered=yes kept=%s reason=%s parts_before=%s parts_after=%s "
+                    "size_before=%.1fMB size_after=%.1fMB time=%.1fs",
+                    "yes" if rebalance_applied else "no",
+                    rebalance_reason,
+                    rebalance_parts_before,
+                    rebalance_parts_after,
+                    rebalance_size_before_mb,
+                    size_after,
+                    rebalance_time,
+                )
+        elif (
+            parts_over_min >= REBALANCE_MIN_PARTS_OVER_MIN
+            and (high_inflation or force_split_dedup)
+            and not merge_fallback_used
+        ):
+            rebalance_reason = (
+                f"over_min={parts_over_min} inflation={split_inflation_pct:.1f}% "
+                f"dedupe_parts={'yes' if force_split_dedup else 'no'} max_part={max_part_mb:.1f}MB "
+                f"slack_ok={'yes' if slack_ok else 'no'}"
+            )
+            logger.info(
+                "[REBALSPLIT] triggered=no reason=%s parts_before=%s size_before=%.1fMB",
+                rebalance_reason,
+                rebalance_parts_before,
+                rebalance_size_before_mb,
+            )
+
     logger.info(
         "[PARALLEL] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s, compressed=%s, skipped=%s, "
         "used_original=%s, split_inflation=%s, dedupe_parts=%s, merge_fallback=%s",
@@ -954,4 +1059,12 @@ def compress_parallel(
         "dedupe_parts": force_split_dedup,
         "merge_fallback": merge_fallback_used,
         "merge_fallback_time": round(merge_fallback_time, 2),
+        "rebalance_attempted": rebalance_attempted,
+        "rebalance_applied": rebalance_applied,
+        "rebalance_reason": rebalance_reason,
+        "rebalance_parts_before": rebalance_parts_before,
+        "rebalance_parts_after": rebalance_parts_after,
+        "rebalance_size_before_mb": rebalance_size_before_mb,
+        "rebalance_size_after_mb": None if rebalance_size_after_mb is None else round(rebalance_size_after_mb, 2),
+        "rebalance_time": round(rebalance_time, 2),
     }
