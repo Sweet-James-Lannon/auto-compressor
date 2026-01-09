@@ -887,16 +887,23 @@ def compress_parallel(
                 merge_pdfs(verified_parts, merged_path)
                 if merged_path.exists():
                     if force_split_dedup:
-                        logger.info("[PARALLEL] Merge fallback: keeping dedupe optimization on split parts")
+                        logger.info("[PARALLEL] Merge fallback: dedupe optimization on split parts (forced)")
                     else:
-                        logger.info("[PARALLEL] Merge fallback: forcing dedupe optimization on split parts")
-                    logger.info("[PARALLEL] Merge fallback: fast split (skip per-part optimization, no ultra)")
+                        logger.info("[PARALLEL] Merge fallback: fast split (skip per-part optimization)")
+                    split_policy = "optimize_parts" if force_split_dedup else "skip_opt"
+                    logger.info(
+                        "[PARALLEL] Merge fallback split policy: %s (split_inflation=%.1f%%, threshold=%.1f%%)",
+                        split_policy,
+                        (split_inflation_ratio - 1) * 100,
+                        PARALLEL_DEDUP_SPLIT_INFLATION_PCT * 100,
+                    )
+                    logger.info("[PARALLEL] Merge fallback: size-based split (no ultra)")
                     fallback_parts = split_by_size(
                         merged_path,
                         working_dir,
                         f"{input_path.stem}_merged",
                         split_threshold_mb,
-                        skip_optimization_under_threshold=True,
+                        skip_optimization_under_threshold=not force_split_dedup,
                     )
                     for part in verified_parts:
                         part.unlink(missing_ok=True)
@@ -1018,7 +1025,7 @@ def compress_parallel(
 
     logger.info(
         "[PARALLEL] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s, compressed=%s, skipped=%s, "
-        "used_original=%s, split_inflation=%s, dedupe_parts=%s, merge_fallback=%s",
+        "used_original=%s, split_inflation=%s (%.1f%%), dedupe_parts=%s, merge_fallback=%s",
         original_size_mb,
         combined_mb,
         reduction_percent,
@@ -1027,6 +1034,7 @@ def compress_parallel(
         skipped_chunks,
         len(failed_chunks),
         "yes" if split_inflation else "no",
+        (split_inflation_ratio - 1) * 100,
         "yes" if force_split_dedup else "no",
         "yes" if merge_fallback_used else "no",
     )
