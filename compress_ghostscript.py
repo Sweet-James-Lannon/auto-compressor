@@ -488,7 +488,7 @@ def compress_parallel(
         Dict with output_path(s), sizes, reduction_percent, etc.
     """
     # Import here to avoid circular imports
-    from split_pdf import split_by_pages, merge_pdfs, split_for_delivery
+    from split_pdf import split_by_pages, merge_pdfs, split_for_delivery, split_by_size
     from utils import get_file_size_mb
 
     input_path = Path(input_path)
@@ -658,7 +658,7 @@ def compress_parallel(
     if split_inflation_ratio > (1 + PARALLEL_DEDUP_SPLIT_INFLATION_PCT):
         force_split_dedup = True
         logger.warning(
-            "[PARALLEL] High split inflation %.1f%% (threshold %.1f%%); forcing dedupe on split parts",
+            "[PARALLEL] High split inflation %.1f%% (threshold %.1f%%); forcing dedupe on split parts (no skip)",
             (split_inflation_ratio - 1) * 100,
             PARALLEL_DEDUP_SPLIT_INFLATION_PCT * 100,
         )
@@ -668,7 +668,7 @@ def compress_parallel(
 
     compress_fn = compress_pdf_lossless if compression_mode == "lossless" else compress_pdf_with_ghostscript
 
-    def compress_single_chunk(chunk_path: Path) -> Tuple[Path, bool, str]:
+    def compress_single_chunk(chunk_path: Path, force_dedup: bool = False) -> Tuple[Path, bool, str]:
         """Compress a single chunk and return result."""
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
@@ -678,7 +678,7 @@ def compress_parallel(
             chunk_mb = get_file_size_mb(chunk_path)
         except Exception:
             chunk_mb = None
-        if chunk_mb is not None and chunk_mb <= MIN_CHUNK_MB:
+        if not force_dedup and chunk_mb is not None and chunk_mb <= MIN_CHUNK_MB:
             return chunk_path, True, f"SKIPPED: {chunk_mb:.1f}MB < {MIN_CHUNK_MB:.1f}MB"
 
         success, message = compress_fn(chunk_path, compressed_path, num_threads=gs_threads)
@@ -740,7 +740,7 @@ def compress_parallel(
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         # Submit all compression jobs
         futures = {
-            executor.submit(compress_single_chunk, chunk): (i, chunk)
+            executor.submit(compress_single_chunk, chunk, force_split_dedup): (i, chunk)
             for i, chunk in enumerate(chunk_paths)
         }
 
@@ -837,7 +837,7 @@ def compress_parallel(
 
     split_total = time.time() - split_start
     logger.info("[PERF] Direct split time: %.1fs", split_total)
-    report_progress(100, "complete", f"Complete: {len(final_parts)} parts")
+    report_progress(100, "finalizing", f"Finalizing {len(final_parts)} parts...")
 
     # Verify parts exist and sizes
     verified_parts: List[Path] = []
@@ -876,6 +876,7 @@ def compress_parallel(
             )
             merged_path = working_dir / f"{input_path.stem}_merged_dedup.pdf"
             try:
+                report_progress(95, "finalizing", "Deduplicating output (merge fallback)...")
                 merge_start = time.time()
                 merge_pdfs(verified_parts, merged_path)
                 if merged_path.exists():
@@ -883,13 +884,13 @@ def compress_parallel(
                         logger.info("[PARALLEL] Merge fallback: keeping dedupe optimization on split parts")
                     else:
                         logger.info("[PARALLEL] Merge fallback: forcing dedupe optimization on split parts")
-                    fallback_parts = split_for_delivery(
+                    logger.info("[PARALLEL] Merge fallback: fast split (skip per-part optimization, no ultra)")
+                    fallback_parts = split_by_size(
                         merged_path,
                         working_dir,
                         f"{input_path.stem}_merged",
                         split_threshold_mb,
-                        progress_callback=None,
-                        skip_optimization_under_threshold=False,
+                        skip_optimization_under_threshold=True,
                     )
                     for part in verified_parts:
                         part.unlink(missing_ok=True)
