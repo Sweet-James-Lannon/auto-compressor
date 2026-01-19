@@ -34,6 +34,7 @@ from exceptions import (
 )
 import job_queue
 import utils
+from utils import MAX_DOWNLOAD_SIZE
 
 # Config
 logging.basicConfig(
@@ -46,7 +47,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__, template_folder='dashboard')
 
 # Constants
-MAX_CONTENT_LENGTH = 314572800  # 300 MB
+MAX_CONTENT_LENGTH = MAX_DOWNLOAD_SIZE
 HARD_SYNC_LIMIT_MB = 300.0  # Absolute ceiling for sync endpoint
 HARD_ASYNC_LIMIT_MB = 600.0  # Absolute ceiling for async jobs
 
@@ -242,7 +243,14 @@ def _build_download_links(output_paths: list[Path], name_hint: str | None) -> li
     return links
 
 
-def _log_job_header(job_id: str, source: str, input_path: Path, name_hint: str | None) -> None:
+def _log_job_header(
+    job_id: str,
+    source: str,
+    input_path: Path,
+    name_hint: str | None,
+    split_threshold_mb: float | None = None,
+    split_trigger_mb: float | None = None,
+) -> None:
     try:
         size_mb = input_path.stat().st_size / (1024 * 1024)
         size_label = f"{size_mb:.1f}MB"
@@ -253,6 +261,9 @@ def _log_job_header(job_id: str, source: str, input_path: Path, name_hint: str |
     attachment_source = "ATTACHMENT_MAX_MB" if ATTACHMENT_MAX_MB is not None else "SPLIT_THRESHOLD_MB"
     name_label = _normalize_display_base(name_hint)
 
+    threshold_mb = SPLIT_THRESHOLD_MB if split_threshold_mb is None else split_threshold_mb
+    trigger_mb = SPLIT_TRIGGER_MB if split_trigger_mb is None else split_trigger_mb
+
     logger.info(
         "[JOB] %s | source=%s | name=%s | file=%s | size=%s | split=%.1fMB | trigger=%.1fMB | "
         "attach_limit=%.1fMB(%s) | overhead=%.0f%%+%.1fMB",
@@ -261,8 +272,8 @@ def _log_job_header(job_id: str, source: str, input_path: Path, name_hint: str |
         name_label,
         input_path.name,
         size_label,
-        SPLIT_THRESHOLD_MB,
-        SPLIT_TRIGGER_MB,
+        threshold_mb,
+        trigger_mb,
         attachment_limit_mb,
         attachment_source,
         ATTACHMENT_OVERHEAD_PCT * 100,
@@ -339,7 +350,12 @@ def _log_job_email(job_id: str, output_paths: list[Path]) -> None:
     )
 
 
-def _log_job_flags(job_id: str, result: dict, output_paths: list[Path]) -> None:
+def _log_job_flags(
+    job_id: str,
+    result: dict,
+    output_paths: list[Path],
+    split_threshold_mb: float | None = None,
+) -> None:
     if not output_paths:
         return
 
@@ -359,7 +375,7 @@ def _log_job_flags(job_id: str, result: dict, output_paths: list[Path]) -> None:
     min_part_mb = min(part_sizes_mb)
     avg_part_mb = total_mb / total_parts if total_parts else 0.0
 
-    threshold_mb = SPLIT_THRESHOLD_MB
+    threshold_mb = SPLIT_THRESHOLD_MB if split_threshold_mb is None else split_threshold_mb
     if threshold_mb > 0:
         min_parts = max(1, math.ceil(total_mb / threshold_mb))
         max_part_pct = (max_part_mb / threshold_mb) * 100
@@ -599,34 +615,7 @@ def spawn_callback(callback_url: str, payload: dict, job_id: str) -> None:
     thread.start()
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in ("1", "true", "yes")
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-LOG_PART_PAGE_COUNTS = _env_bool("LOG_PART_PAGE_COUNTS", True)
+LOG_PART_PAGE_COUNTS = utils.env_bool("LOG_PART_PAGE_COUNTS", True)
 
 DASHBOARD_FILE_MAP = [
     {
@@ -716,6 +705,21 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _resolve_split_threshold_mb(raw_value: Any) -> float | None:
+    if raw_value is None:
+        return None
+    value = _safe_float(raw_value)
+    if value is None:
+        return None
+    min_mb = 5.0
+    max_mb = 50.0
+    if ATTACHMENT_MAX_MB is not None:
+        max_mb = min(max_mb, ATTACHMENT_MAX_MB)
+    if max_mb < min_mb:
+        return None
+    return max(min_mb, min(value, max_mb))
 
 
 def _extract_display_names(download_links: list[str]) -> list[str]:
@@ -836,7 +840,7 @@ def build_health_snapshot() -> Dict[str, Any]:
     effective_cpu = utils.get_effective_cpu_count()
     recent_jobs = []
     try:
-        recent_limit = _env_int("DASHBOARD_RECENT_JOBS", 8)
+        recent_limit = utils.env_int("DASHBOARD_RECENT_JOBS", 8)
         recent_jobs = _format_recent_jobs(job_queue.get_recent_jobs(recent_limit))
     except Exception:
         recent_jobs = []
@@ -868,12 +872,12 @@ def build_health_snapshot() -> Dict[str, Any]:
         },
         "compression": {
             "mode": os.environ.get("COMPRESSION_MODE", "aggressive"),
-            "allow_lossy": _env_bool("ALLOW_LOSSY_COMPRESSION", True),
-            "scanned_confidence_for_aggressive": _env_float("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", 70.0),
-            "serial_fallback": _env_bool("PARALLEL_SERIAL_FALLBACK", True),
-            "gs_fast_web_view": _env_bool("GS_FAST_WEB_VIEW", True),
-            "gs_band_height": _env_int("GS_BAND_HEIGHT", 100),
-            "gs_band_buffer_space_mb": _env_int("GS_BAND_BUFFER_SPACE_MB", 500),
+            "allow_lossy": utils.env_bool("ALLOW_LOSSY_COMPRESSION", True),
+            "scanned_confidence_for_aggressive": utils.env_float("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", 70.0),
+            "serial_fallback": utils.env_bool("PARALLEL_SERIAL_FALLBACK", True),
+            "gs_fast_web_view": utils.env_bool("GS_FAST_WEB_VIEW", True),
+            "gs_band_height": utils.env_int("GS_BAND_HEIGHT", 100),
+            "gs_band_buffer_space_mb": utils.env_int("GS_BAND_BUFFER_SPACE_MB", 500),
             "gs_color_downsample_type": os.environ.get("GS_COLOR_DOWNSAMPLE_TYPE", "/Bicubic"),
             "gs_gray_downsample_type": os.environ.get("GS_GRAY_DOWNSAMPLE_TYPE", "/Bicubic"),
         },
@@ -882,19 +886,19 @@ def build_health_snapshot() -> Dict[str, Any]:
             "trigger_mb": SPLIT_TRIGGER_MB,
             "base_threshold_mb": BASE_SPLIT_THRESHOLD_MB,
             "attachment_max_mb": os.environ.get("ATTACHMENT_MAX_MB", "unset"),
-            "safety_buffer_mb": _env_float("SPLIT_SAFETY_BUFFER_MB", 0.0),
-            "minimize_parts": _env_bool("SPLIT_MINIMIZE_PARTS", True),
-            "ultra_jpegq": _env_int("SPLIT_ULTRA_JPEGQ", 50),
-            "ultra_gap_pct": _env_float("SPLIT_ULTRA_GAP_PCT", 0.12),
+            "safety_buffer_mb": utils.env_float("SPLIT_SAFETY_BUFFER_MB", 0.0),
+            "minimize_parts": utils.env_bool("SPLIT_MINIMIZE_PARTS", True),
+            "ultra_jpegq": utils.env_int("SPLIT_ULTRA_JPEGQ", 50),
+            "ultra_gap_pct": utils.env_float("SPLIT_ULTRA_GAP_PCT", 0.12),
         },
         "parallel": {
             "threshold_mb": PARALLEL_THRESHOLD_MB,
             "parallel_max_workers": os.environ.get("PARALLEL_MAX_WORKERS", "auto"),
             "async_workers": ASYNC_WORKERS,
-            "max_parallel_chunks": _env_int("MAX_PARALLEL_CHUNKS", 16),
-            "target_chunk_mb": _env_float("TARGET_CHUNK_MB", 40.0),
-            "max_chunk_mb": _env_float("MAX_CHUNK_MB", 60.0),
-            "max_pages_per_chunk": _env_int("MAX_PAGES_PER_CHUNK", 200),
+            "max_parallel_chunks": utils.env_int("MAX_PARALLEL_CHUNKS", 16),
+            "target_chunk_mb": utils.env_float("TARGET_CHUNK_MB", 40.0),
+            "max_chunk_mb": utils.env_float("MAX_CHUNK_MB", 60.0),
+            "max_pages_per_chunk": utils.env_int("MAX_PAGES_PER_CHUNK", 200),
             "gs_num_rendering_threads": os.environ.get("GS_NUM_RENDERING_THREADS", "auto"),
         },
     }
@@ -1063,6 +1067,14 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         elif isinstance(task_data.get("download_url"), str):
             name_hint = task_data["download_url"]
 
+        split_override = _resolve_split_threshold_mb(task_data.get("split_threshold_mb"))
+        if split_override is not None:
+            split_threshold_mb = split_override
+            split_trigger_mb = split_override
+        else:
+            split_threshold_mb = SPLIT_THRESHOLD_MB
+            split_trigger_mb = SPLIT_TRIGGER_MB
+
         input_path: Path
         source_label = "unknown"
 
@@ -1195,7 +1207,14 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             input_path = subset_path
             track_file(input_path)
 
-        _log_job_header(job_id, source_label, input_path, name_hint)
+        _log_job_header(
+            job_id,
+            source_label,
+            input_path,
+            name_hint,
+            split_threshold_mb=split_threshold_mb,
+            split_trigger_mb=split_trigger_mb,
+        )
 
         download_time = round(time.time() - start_time, 2)
 
@@ -1209,8 +1228,8 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         result = compress_pdf(
             str(input_path),
             working_dir=UPLOAD_FOLDER,
-            split_threshold_mb=SPLIT_THRESHOLD_MB,
-            split_trigger_mb=SPLIT_TRIGGER_MB,
+            split_threshold_mb=split_threshold_mb,
+            split_trigger_mb=split_trigger_mb,
             progress_callback=progress_callback
         )
 
@@ -1242,7 +1261,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         _log_job_result(job_id, result, output_paths)
         _log_job_email(job_id, output_paths)
         _log_job_parallel(job_id, result)
-        _log_job_flags(job_id, result, output_paths)
+        _log_job_flags(job_id, result, output_paths, split_threshold_mb=split_threshold_mb)
 
         progress_callback(98, "finalizing", "Preparing download links...")
 
@@ -1273,8 +1292,8 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             result['compressed_size_mb'],
             result['reduction_percent'],
             result.get('total_parts') or len(output_paths),
-            SPLIT_THRESHOLD_MB,
-            SPLIT_TRIGGER_MB,
+            split_threshold_mb,
+            split_trigger_mb,
             timings.get("download_seconds", 0.0),
             timings.get("compression_seconds", 0.0),
             timings.get("total_seconds", 0.0),
@@ -1433,6 +1452,9 @@ def compress():
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "Empty request body"}), 400
+        split_override = _resolve_split_threshold_mb(data.get("split_threshold_mb"))
+        if split_override is not None:
+            task_data["split_threshold_mb"] = split_override
 
         # Option 1: URL to download PDF
         download_url = data.get('file_download_link') or data.get('url')
@@ -1647,6 +1669,9 @@ def compress_sync():
     file_id = str(uuid.uuid4()).replace('-', '')[:16]
     input_path = UPLOAD_FOLDER / f"{file_id}_input.pdf"
     name_hint: str | None = None
+    split_override: float | None = None
+    split_threshold_mb = SPLIT_THRESHOLD_MB
+    split_trigger_mb = SPLIT_TRIGGER_MB
 
     try:
         # Dual input handling - JSON (Salesforce) or form-data (Dashboard)
@@ -1660,6 +1685,10 @@ def compress_sync():
                     "error_type": "InvalidJSON",
                     "error_message": "Invalid JSON body"
                 }), 400
+            split_override = _resolve_split_threshold_mb(data.get("split_threshold_mb"))
+            if split_override is not None:
+                split_threshold_mb = split_override
+                split_trigger_mb = split_override
             file_url = data.get('file_download_link') or data.get('file_url')
             if isinstance(data.get("name"), str):
                 name_hint = data["name"]
@@ -1689,6 +1718,8 @@ def compress_sync():
                     "callback_url": callback_url,
                     "base_url": base_url_hint,
                 }
+                if split_override is not None:
+                    task_data["split_threshold_mb"] = split_override
                 if not name_hint:
                     name_hint = file_url
                 if name_hint:
@@ -1736,7 +1767,7 @@ def compress_sync():
             downloaded_mb = input_path.stat().st_size / (1024 * 1024)
             logger.info(
                 f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB "
-                f"(will split if > {SPLIT_TRIGGER_MB}MB into {SPLIT_THRESHOLD_MB}MB parts)"
+                f"(will split if > {split_trigger_mb}MB into {split_threshold_mb}MB parts)"
             )
 
         elif request.files and 'file' in request.files:
@@ -1797,6 +1828,8 @@ def compress_sync():
             task_data = {
                 "input_path": str(input_path),
             }
+            if split_override is not None:
+                task_data["split_threshold_mb"] = split_override
             try:
                 job_queue.enqueue(job_id, task_data)
             except Exception as e:
@@ -1827,8 +1860,8 @@ def compress_sync():
             return compress_pdf(
                 str(input_path),
                 working_dir=UPLOAD_FOLDER,
-                split_threshold_mb=SPLIT_THRESHOLD_MB,
-                split_trigger_mb=SPLIT_TRIGGER_MB
+                split_threshold_mb=split_threshold_mb,
+                split_trigger_mb=split_trigger_mb
             )
 
         def _verify_output_files(result_data: Dict[str, Any], label: str):
@@ -1872,7 +1905,12 @@ def compress_sync():
                         completed.get("page_count"),
                         input_path,
                     )
-                    _log_job_flags(f"sync-timeout:{file_id}", completed, output_paths)
+                    _log_job_flags(
+                        f"sync-timeout:{file_id}",
+                        completed,
+                        output_paths,
+                        split_threshold_mb=split_threshold_mb,
+                    )
                     download_links = _build_download_links(output_paths, name_hint)
                     files = [build_download_url(link) for link in download_links]
 
@@ -1939,7 +1977,12 @@ def compress_sync():
             result.get("page_count"),
             input_path,
         )
-        _log_job_flags(f"sync:{file_id}", result, output_paths)
+        _log_job_flags(
+            f"sync:{file_id}",
+            result,
+            output_paths,
+            split_threshold_mb=split_threshold_mb,
+        )
         download_links = _build_download_links(output_paths, name_hint)
         files = [build_download_url(link) for link in download_links]
 

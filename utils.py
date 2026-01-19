@@ -23,6 +23,38 @@ MAX_DOWNLOAD_SIZE: int = 314572800  # 300 MB max
 logger = logging.getLogger(__name__)
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    raw = (os.environ.get(name) or "").strip()
+    return raw if raw in allowed else default
+
+
 def get_file_size_mb(path: Path) -> float:
     """Get file size in megabytes.
 

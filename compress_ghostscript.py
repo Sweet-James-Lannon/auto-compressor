@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from exceptions import SplitError
-from utils import get_effective_cpu_count
+from utils import get_effective_cpu_count, env_bool, env_int, env_choice
 
 logger = logging.getLogger(__name__)
 
@@ -31,48 +31,25 @@ PARALLEL_SPLIT_INFLATION_PCT = 0.02
 PARALLEL_DEDUP_SPLIT_INFLATION_PCT = float(os.environ.get("PARALLEL_DEDUP_SPLIT_INFLATION_PCT", "0.12"))
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in ("1", "true", "yes")
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-REBALANCE_SPLIT_ENABLED = _env_bool("REBALANCE_SPLIT_ENABLED", True)
-REBALANCE_MIN_PARTS_OVER_MIN = _env_int("REBALANCE_MIN_PARTS_OVER_MIN", 2)
+REBALANCE_SPLIT_ENABLED = env_bool("REBALANCE_SPLIT_ENABLED", True)
+REBALANCE_MIN_PARTS_OVER_MIN = env_int("REBALANCE_MIN_PARTS_OVER_MIN", 2)
 REBALANCE_SPLIT_INFLATION_PCT = float(os.environ.get("REBALANCE_SPLIT_INFLATION_PCT", "40"))
 REBALANCE_MAX_PART_PCT = float(os.environ.get("REBALANCE_MAX_PART_PCT", "0.85"))
 
-
-def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
-    raw = (os.environ.get(name) or "").strip()
-    return raw if raw in allowed else default
-
-
-GS_FAST_WEB_VIEW = _env_bool("GS_FAST_WEB_VIEW", True)
-GS_COLOR_DOWNSAMPLE_TYPE = _env_choice(
+GS_FAST_WEB_VIEW = env_bool("GS_FAST_WEB_VIEW", True)
+GS_COLOR_DOWNSAMPLE_TYPE = env_choice(
     "GS_COLOR_DOWNSAMPLE_TYPE",
     "/Bicubic",
     ("/Subsample", "/Average", "/Bicubic"),
 )
-GS_GRAY_DOWNSAMPLE_TYPE = _env_choice(
+GS_GRAY_DOWNSAMPLE_TYPE = env_choice(
     "GS_GRAY_DOWNSAMPLE_TYPE",
     "/Bicubic",
     ("/Subsample", "/Average", "/Bicubic"),
 )
-GS_BAND_HEIGHT = _env_int("GS_BAND_HEIGHT", 100)
-GS_BAND_BUFFER_SPACE_MB = _env_int("GS_BAND_BUFFER_SPACE_MB", 500)
-PARALLEL_SERIAL_FALLBACK = _env_bool("PARALLEL_SERIAL_FALLBACK", True)
+GS_BAND_HEIGHT = env_int("GS_BAND_HEIGHT", 100)
+GS_BAND_BUFFER_SPACE_MB = env_int("GS_BAND_BUFFER_SPACE_MB", 500)
+PARALLEL_SERIAL_FALLBACK = env_bool("PARALLEL_SERIAL_FALLBACK", True)
 
 
 def _resolve_gs_threads(num_threads: Optional[int]) -> int:
