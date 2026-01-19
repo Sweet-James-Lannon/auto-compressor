@@ -1,6 +1,7 @@
 """Flask API for PDF compression with async processing and auto-split."""
 
 import base64
+import contextlib
 import logging
 import math
 import os
@@ -133,11 +134,14 @@ BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
 SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "540"))
 # Auto-switch large sync requests to async to avoid HTTP timeouts.
 SYNC_AUTO_ASYNC_MB = float(os.environ.get("SYNC_AUTO_ASYNC_MB", "120"))
-_DEFAULT_ASYNC_WORKERS = max(1, min(2, utils.get_effective_cpu_count()))
+_EFFECTIVE_CPU = utils.get_effective_cpu_count()
+_DEFAULT_ASYNC_WORKERS = max(1, min(2, _EFFECTIVE_CPU))
 try:
     ASYNC_WORKERS = max(1, int(os.environ.get("ASYNC_WORKERS", str(_DEFAULT_ASYNC_WORKERS))))
 except ValueError:
     ASYNC_WORKERS = _DEFAULT_ASYNC_WORKERS
+MAX_ACTIVE_COMPRESSIONS = max(1, _EFFECTIVE_CPU // 2)
+COMPRESSION_SEMAPHORE = threading.Semaphore(MAX_ACTIVE_COMPRESSIONS)
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -707,6 +711,20 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+@contextlib.contextmanager
+def _compression_slot(job_id: str | None = None):
+    label = job_id or "sync"
+    start = time.time()
+    COMPRESSION_SEMAPHORE.acquire()
+    waited = time.time() - start
+    if waited >= 1:
+        logger.info("[%s] Waited %.1fs for compression slot", label, waited)
+    try:
+        yield
+    finally:
+        COMPRESSION_SEMAPHORE.release()
+
+
 def _resolve_split_threshold_mb(raw_value: Any) -> float | None:
     if raw_value is None:
         return None
@@ -895,6 +913,7 @@ def build_health_snapshot() -> Dict[str, Any]:
             "threshold_mb": PARALLEL_THRESHOLD_MB,
             "parallel_max_workers": os.environ.get("PARALLEL_MAX_WORKERS", "auto"),
             "async_workers": ASYNC_WORKERS,
+            "max_active_compressions": MAX_ACTIVE_COMPRESSIONS,
             "max_parallel_chunks": utils.env_int("MAX_PARALLEL_CHUNKS", 16),
             "target_chunk_mb": utils.env_float("TARGET_CHUNK_MB", 40.0),
             "max_chunk_mb": utils.env_float("MAX_CHUNK_MB", 60.0),
@@ -1221,19 +1240,21 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         # Get quality warnings before compression
         warnings = get_quality_warnings(str(input_path))
 
-        compress_start = time.time()
-        progress_callback(10, "compressing", "Starting compression...")
+        progress_callback(8, "queued", "Waiting for compression slot...")
+        with _compression_slot(job_id):
+            compress_start = time.time()
+            progress_callback(10, "compressing", "Starting compression...")
 
-        # Compress with splitting enabled
-        result = compress_pdf(
-            str(input_path),
-            working_dir=UPLOAD_FOLDER,
-            split_threshold_mb=split_threshold_mb,
-            split_trigger_mb=split_trigger_mb,
-            progress_callback=progress_callback
-        )
+            # Compress with splitting enabled
+            result = compress_pdf(
+                str(input_path),
+                working_dir=UPLOAD_FOLDER,
+                split_threshold_mb=split_threshold_mb,
+                split_trigger_mb=split_trigger_mb,
+                progress_callback=progress_callback
+            )
 
-        compress_time = round(time.time() - compress_start, 2)
+            compress_time = round(time.time() - compress_start, 2)
 
         output_paths = [Path(p) for p in result.get("output_paths", [])]
         if not output_paths and result.get("output_path"):
@@ -1549,6 +1570,15 @@ def get_status(job_id: str):
     if not job:
         return jsonify({"success": False, "error": "Job not found"}), 404
 
+    if job.status == "queued":
+        response = {
+            "success": True,
+            "status": "queued",
+        }
+        if job.progress:
+            response["progress"] = job.progress
+        return jsonify(response)
+
     if job.status == "processing":
         response = {
             "success": True,
@@ -1628,6 +1658,7 @@ def job_check_pdfco():
         return jsonify({"jobId": job_id, "status": "unknown"}), 200
 
     status_map = {
+        "queued": "working",
         "processing": "working",
         "completed": "success",
         "failed": "failed",
@@ -1857,12 +1888,13 @@ def compress_sync():
 
         # Run compression with a timeout to avoid gateway kills
         def run_compress():
-            return compress_pdf(
-                str(input_path),
-                working_dir=UPLOAD_FOLDER,
-                split_threshold_mb=split_threshold_mb,
-                split_trigger_mb=split_trigger_mb
-            )
+            with _compression_slot(f"sync:{file_id}"):
+                return compress_pdf(
+                    str(input_path),
+                    working_dir=UPLOAD_FOLDER,
+                    split_threshold_mb=split_threshold_mb,
+                    split_trigger_mb=split_trigger_mb
+                )
 
         def _verify_output_files(result_data: Dict[str, Any], label: str):
             output = result_data.get('output_paths', [result_data['output_path']])

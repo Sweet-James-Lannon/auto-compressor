@@ -28,7 +28,7 @@ class Job:
     """Represents an async processing job."""
 
     job_id: str
-    status: str  # "processing", "completed", "failed"
+    status: str  # "queued", "processing", "completed", "failed"
     created_at: float = field(default_factory=time.time)
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
@@ -51,7 +51,15 @@ def create_job() -> str:
         The unique job ID (16 characters for sufficient entropy).
     """
     job_id = str(uuid.uuid4()).replace('-', '')[:16]
-    job = Job(job_id=job_id, status="processing")
+    job = Job(
+        job_id=job_id,
+        status="queued",
+        progress={
+            "percent": 0,
+            "stage": "queued",
+            "message": "Waiting for worker",
+        },
+    )
 
     with _job_lock:
         _jobs[job_id] = job
@@ -84,7 +92,7 @@ def update_job(
 
     Args:
         job_id: The job identifier.
-        status: New status ("processing", "completed", "failed").
+        status: New status ("queued", "processing", "completed", "failed").
         result: Optional result data for completed jobs.
         error: Optional error message for failed jobs.
         progress: Optional progress data (percent, stage, message).
@@ -132,7 +140,7 @@ def get_stats() -> Dict[str, Any]:
     """Return lightweight queue and job stats for health/debug endpoints."""
     with _job_lock:
         total_jobs = len(_jobs)
-        status_counts = {"processing": 0, "completed": 0, "failed": 0}
+        status_counts = {"queued": 0, "processing": 0, "completed": 0, "failed": 0}
         for job in _jobs.values():
             status_counts[job.status] = status_counts.get(job.status, 0) + 1
 
@@ -140,6 +148,7 @@ def get_stats() -> Dict[str, Any]:
         "queue_size": _work_queue.qsize(),
         "queue_max": MAX_QUEUE_SIZE,
         "total_jobs": total_jobs,
+        "queued": status_counts.get("queued", 0),
         "processing": status_counts.get("processing", 0),
         "completed": status_counts.get("completed", 0),
         "failed": status_counts.get("failed", 0),
@@ -174,6 +183,11 @@ def _worker() -> None:
     while True:
         try:
             job_id, task_data = _work_queue.get()
+            update_job(job_id, "processing", progress={
+                "percent": 1,
+                "stage": "starting",
+                "message": "Starting worker",
+            })
             logger.info(f"[{job_id}] Processing started")
 
             if _processor is None:
