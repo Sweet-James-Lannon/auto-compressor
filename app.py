@@ -140,7 +140,7 @@ try:
     ASYNC_WORKERS = max(1, int(os.environ.get("ASYNC_WORKERS", str(_DEFAULT_ASYNC_WORKERS))))
 except ValueError:
     ASYNC_WORKERS = _DEFAULT_ASYNC_WORKERS
-MAX_ACTIVE_COMPRESSIONS = max(1, _EFFECTIVE_CPU // 2)
+MAX_ACTIVE_COMPRESSIONS = max(1, min(2, _EFFECTIVE_CPU))
 COMPRESSION_SEMAPHORE = threading.Semaphore(MAX_ACTIVE_COMPRESSIONS)
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
@@ -1473,7 +1473,10 @@ def compress():
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "Empty request body"}), 400
-        split_override = _resolve_split_threshold_mb(data.get("split_threshold_mb"))
+        split_override_raw = data.get("split_threshold_mb")
+        if split_override_raw is None:
+            split_override_raw = data.get("splitSizeMB")
+        split_override = _resolve_split_threshold_mb(split_override_raw)
         if split_override is not None:
             task_data["split_threshold_mb"] = split_override
 
@@ -1716,7 +1719,10 @@ def compress_sync():
                     "error_type": "InvalidJSON",
                     "error_message": "Invalid JSON body"
                 }), 400
-            split_override = _resolve_split_threshold_mb(data.get("split_threshold_mb"))
+            split_override_raw = data.get("split_threshold_mb")
+            if split_override_raw is None:
+                split_override_raw = data.get("splitSizeMB")
+            split_override = _resolve_split_threshold_mb(split_override_raw)
             if split_override is not None:
                 split_threshold_mb = split_override
                 split_trigger_mb = split_override

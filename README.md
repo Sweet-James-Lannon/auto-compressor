@@ -44,20 +44,20 @@ python app.py
 - Input: JSON with one of:
   - `file_download_link` (URL)
   - `file_content_base64`
-- Optional: `name`, `pages`, `password`, `callbackUrl`, `split_threshold_mb`
+- Optional: `name`, `pages`, `password`, `callbackUrl`, `split_threshold_mb` (alias `splitSizeMB`)
 - Returns: `job_id`
 - Poll: `GET /status/<job_id>`
 
 ### POST /compress-sync (blocking)
 
 - Input: JSON with `file_download_link` or a multipart upload
-- Optional: `name`, `split_threshold_mb`
+- Optional: `name`, `split_threshold_mb` (alias `splitSizeMB`)
 - Used by: dashboard/manual testing and a few legacy callers that expect a single request/response
 - Not used by: Salesforce long-running flows (timeouts). For Salesforce, use async with `matterId`.
 - If `matterId` is present, it switches to async callback flow (returns 202)
 - This endpoint is retained for backward compatibility and local testing
-- `split_threshold_mb` is per-request (MB). Clamped to 5-50 and capped by `ATTACHMENT_MAX_MB`.
-  When provided, split trigger equals the threshold.
+- `split_threshold_mb` (alias `splitSizeMB`) is per-request (MB). Clamped to 5-50 and capped by `ATTACHMENT_MAX_MB`.
+  When provided, split trigger equals the threshold. Values are raw file size (email overhead not included).
 
 ### GET /download/<filename>
 
