@@ -435,7 +435,7 @@ def compress_parallel(
     input_path: Path,
     working_dir: Path,
     base_name: str,
-    split_threshold_mb: float = 25.0,
+    split_threshold_mb: Optional[float] = None,
     split_trigger_mb: Optional[float] = None,
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     max_workers: int = 6,
@@ -450,7 +450,7 @@ def compress_parallel(
     1. Split input PDF into N chunks by page count (fast, no Ghostscript)
     2. Compress each chunk in parallel using ThreadPoolExecutor
     3. Merge compressed chunks back into one PDF
-    4. Final split by 25MB threshold for email
+    4. Final split by threshold (if requested)
 
     This is 3-4x faster than serial compression for large files because
     each Ghostscript process uses its own CPU core.
@@ -459,7 +459,7 @@ def compress_parallel(
         input_path: Path to input PDF.
         working_dir: Directory for temp and output files.
         base_name: Base filename for output.
-        split_threshold_mb: Max size per final part (default 25MB).
+        split_threshold_mb: Max size per final part (None disables splitting).
         split_trigger_mb: Size that triggers splitting (defaults to split_threshold_mb).
         progress_callback: Optional callback(percent, stage, message).
         max_workers: Max parallel compression workers (default 6).
@@ -769,48 +769,63 @@ def compress_parallel(
     compress_time = time.time() - start_ts - split_time
     logger.info("[PERF] Compress: %.1fs", compress_time)
 
-    # Step 4: If all chunks are already under split threshold, skip merge and return them.
-    # Otherwise, split each compressed chunk directly to <= threshold and return parts in order.
-    all_under_threshold = all(get_file_size_mb(p) <= split_threshold_mb for p in ordered_paths)
+    # Step 4: If splitting is disabled, merge chunks into one output and return.
+    # If enabled, split chunks directly to <= threshold and return parts in order.
+    split_enabled = split_threshold_mb is not None and split_threshold_mb > 0
 
     split_start = time.time()
-    if all_under_threshold:
-        final_parts = []
-        for idx, chunk_path in enumerate(ordered_paths, start=1):
-            dest = working_dir / f"{chunk_path.stem}_part{idx}.pdf"
-            dest.unlink(missing_ok=True)
-            chunk_path.rename(dest)
-            final_parts.append(dest)
-        logger.info(f"[PARALLEL] All chunks <= {split_threshold_mb}MB; skipping merge and returning chunks")
+    if not split_enabled:
+        report_progress(75, "merging", "Merging compressed chunks...")
+        merged_path = working_dir / f"{base_name}_compressed.pdf"
+        merged_path.unlink(missing_ok=True)
+        merge_pdfs(ordered_paths, merged_path)
+        if not merged_path.exists() or merged_path.stat().st_size == 0:
+            raise SplitError(f"Merged output missing or empty: {merged_path.name}")
+        final_parts = [merged_path]
+        logger.info(
+            "[PARALLEL] Split disabled; merged %s chunk(s) into %s",
+            len(ordered_paths),
+            merged_path.name,
+        )
     else:
-        report_progress(75, "splitting", f"Splitting compressed chunks into parts <= {split_threshold_mb}MB")
-        final_parts: List[Path] = []
-        for idx, chunk_path in enumerate(ordered_paths):
-            chunk_size = get_file_size_mb(chunk_path)
-            if chunk_size <= split_threshold_mb:
-                dest = working_dir / f"{chunk_path.stem}_part1.pdf"
+        all_under_threshold = all(get_file_size_mb(p) <= split_threshold_mb for p in ordered_paths)
+        if all_under_threshold:
+            final_parts = []
+            for idx, chunk_path in enumerate(ordered_paths, start=1):
+                dest = working_dir / f"{chunk_path.stem}_part{idx}.pdf"
                 dest.unlink(missing_ok=True)
                 chunk_path.rename(dest)
                 final_parts.append(dest)
-                continue
+            logger.info(f"[PARALLEL] All chunks <= {split_threshold_mb}MB; skipping merge and returning chunks")
+        else:
+            report_progress(75, "splitting", f"Splitting compressed chunks into parts <= {split_threshold_mb}MB")
+            final_parts = []
+            for idx, chunk_path in enumerate(ordered_paths):
+                chunk_size = get_file_size_mb(chunk_path)
+                if chunk_size <= split_threshold_mb:
+                    dest = working_dir / f"{chunk_path.stem}_part1.pdf"
+                    dest.unlink(missing_ok=True)
+                    chunk_path.rename(dest)
+                    final_parts.append(dest)
+                    continue
 
-            # Split oversized chunk by size
-            chunk_parts = split_for_delivery(
-                chunk_path,
-                working_dir,
-                f"{chunk_path.stem}",
+                # Split oversized chunk by size
+                chunk_parts = split_for_delivery(
+                    chunk_path,
+                    working_dir,
+                    f"{chunk_path.stem}",
+                    split_threshold_mb,
+                    progress_callback=progress_callback,
+                    skip_optimization_under_threshold=not force_split_dedup,
+                )
+                final_parts.extend(chunk_parts)
+
+            logger.info(
+                "[PARALLEL] Split compressed chunks into %s part(s) without global merge (threshold=%.1fMB, chunks=%s)",
+                len(final_parts),
                 split_threshold_mb,
-                progress_callback=progress_callback,
-                skip_optimization_under_threshold=not force_split_dedup,
+                len(ordered_paths),
             )
-            final_parts.extend(chunk_parts)
-
-        logger.info(
-            "[PARALLEL] Split compressed chunks into %s part(s) without global merge (threshold=%.1fMB, chunks=%s)",
-            len(final_parts),
-            split_threshold_mb,
-            len(ordered_paths),
-        )
 
     # Cleanup original chunk files
     for chunk in chunk_paths:
@@ -847,7 +862,7 @@ def compress_parallel(
 
     merge_fallback_used = False
     merge_fallback_time = 0.0
-    if PARALLEL_MERGE_ON_BLOAT and original_size_mb > 0:
+    if split_enabled and PARALLEL_MERGE_ON_BLOAT and original_size_mb > 0:
         bloat_ratio = (combined_mb / original_size_mb) - 1
         if bloat_ratio > PARALLEL_BLOAT_PCT:
             bloat_pct = bloat_ratio * 100
@@ -910,7 +925,7 @@ def compress_parallel(
     rebalance_size_after_mb = None
     rebalance_time = 0.0
 
-    if REBALANCE_SPLIT_ENABLED and split_threshold_mb > 0 and rebalance_parts_before > 1:
+    if split_enabled and REBALANCE_SPLIT_ENABLED and split_threshold_mb > 0 and rebalance_parts_before > 1:
         part_sizes_mb = [p.stat().st_size / (1024 * 1024) for p in verified_parts]
         max_part_mb = max(part_sizes_mb) if part_sizes_mb else 0.0
         min_parts = max(1, math.ceil(combined_mb / split_threshold_mb))

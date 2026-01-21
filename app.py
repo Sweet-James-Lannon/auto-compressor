@@ -1,4 +1,4 @@
-"""Flask API for PDF compression with async processing and auto-split."""
+"""Flask API for PDF compression with async processing and optional splitting."""
 
 import base64
 import contextlib
@@ -141,7 +141,11 @@ try:
 except ValueError:
     ASYNC_WORKERS = _DEFAULT_ASYNC_WORKERS
 MAX_ACTIVE_COMPRESSIONS = max(1, min(2, _EFFECTIVE_CPU))
-COMPRESSION_SEMAPHORE = threading.Semaphore(MAX_ACTIVE_COMPRESSIONS)
+SMALL_JOB_THRESHOLD_MB = 50.0
+SMALL_JOB_RESERVED_SLOTS = 1 if MAX_ACTIVE_COMPRESSIONS > 1 else 0
+GENERAL_COMPRESSION_SLOTS = max(1, MAX_ACTIVE_COMPRESSIONS - SMALL_JOB_RESERVED_SLOTS)
+COMPRESSION_SEMAPHORE = threading.Semaphore(GENERAL_COMPRESSION_SLOTS)
+SMALL_JOB_SEMAPHORE = threading.Semaphore(SMALL_JOB_RESERVED_SLOTS) if SMALL_JOB_RESERVED_SLOTS else None
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -267,17 +271,19 @@ def _log_job_header(
 
     threshold_mb = SPLIT_THRESHOLD_MB if split_threshold_mb is None else split_threshold_mb
     trigger_mb = SPLIT_TRIGGER_MB if split_trigger_mb is None else split_trigger_mb
+    split_label = "off" if split_threshold_mb is None else f"{threshold_mb:.1f}MB"
+    trigger_label = "off" if split_trigger_mb is None else f"{trigger_mb:.1f}MB"
 
     logger.info(
-        "[JOB] %s | source=%s | name=%s | file=%s | size=%s | split=%.1fMB | trigger=%.1fMB | "
+        "[JOB] %s | source=%s | name=%s | file=%s | size=%s | split=%s | trigger=%s | "
         "attach_limit=%.1fMB(%s) | overhead=%.0f%%+%.1fMB",
         job_id,
         source,
         name_label,
         input_path.name,
         size_label,
-        threshold_mb,
-        trigger_mb,
+        split_label,
+        trigger_label,
         attachment_limit_mb,
         attachment_source,
         ATTACHMENT_OVERHEAD_PCT * 100,
@@ -378,6 +384,17 @@ def _log_job_flags(
     max_part_mb = max(part_sizes_mb)
     min_part_mb = min(part_sizes_mb)
     avg_part_mb = total_mb / total_parts if total_parts else 0.0
+
+    if split_threshold_mb is None:
+        logger.info(
+            "[JOB_FLAGS] %s | split=off | parts=%s | part_range=%.1f-%.1fMB avg=%.1fMB",
+            job_id,
+            total_parts,
+            min_part_mb,
+            max_part_mb,
+            avg_part_mb,
+        )
+        return
 
     threshold_mb = SPLIT_THRESHOLD_MB if split_threshold_mb is None else split_threshold_mb
     if threshold_mb > 0:
@@ -712,17 +729,31 @@ def _safe_float(value: Any) -> float | None:
 
 
 @contextlib.contextmanager
-def _compression_slot(job_id: str | None = None):
+def _compression_slot(job_id: str | None = None, input_size_mb: float | None = None):
     label = job_id or "sync"
+    is_small = input_size_mb is not None and input_size_mb < SMALL_JOB_THRESHOLD_MB
     start = time.time()
-    COMPRESSION_SEMAPHORE.acquire()
+    semaphore = COMPRESSION_SEMAPHORE
+
+    if is_small and SMALL_JOB_SEMAPHORE:
+        acquired_small = SMALL_JOB_SEMAPHORE.acquire(blocking=False)
+        if acquired_small:
+            semaphore = SMALL_JOB_SEMAPHORE
+        else:
+            COMPRESSION_SEMAPHORE.acquire()
+            semaphore = COMPRESSION_SEMAPHORE
+    else:
+        COMPRESSION_SEMAPHORE.acquire()
+        semaphore = COMPRESSION_SEMAPHORE
+
     waited = time.time() - start
     if waited >= 1:
-        logger.info("[%s] Waited %.1fs for compression slot", label, waited)
+        slot_label = "small" if semaphore is SMALL_JOB_SEMAPHORE else "general"
+        logger.info("[%s] Waited %.1fs for %s compression slot", label, waited, slot_label)
     try:
         yield
     finally:
-        COMPRESSION_SEMAPHORE.release()
+        semaphore.release()
 
 
 def _resolve_split_threshold_mb(raw_value: Any) -> float | None:
@@ -731,13 +762,9 @@ def _resolve_split_threshold_mb(raw_value: Any) -> float | None:
     value = _safe_float(raw_value)
     if value is None:
         return None
-    min_mb = 5.0
-    max_mb = 50.0
-    if ATTACHMENT_MAX_MB is not None:
-        max_mb = min(max_mb, ATTACHMENT_MAX_MB)
-    if max_mb < min_mb:
+    if value <= 0:
         return None
-    return max(min_mb, min(value, max_mb))
+    return max(1.0, value)
 
 
 def _extract_display_names(download_links: list[str]) -> list[str]:
@@ -1091,8 +1118,8 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             split_threshold_mb = split_override
             split_trigger_mb = split_override
         else:
-            split_threshold_mb = SPLIT_THRESHOLD_MB
-            split_trigger_mb = SPLIT_TRIGGER_MB
+            split_threshold_mb = None
+            split_trigger_mb = None
 
         input_path: Path
         source_label = "unknown"
@@ -1240,8 +1267,9 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         # Get quality warnings before compression
         warnings = get_quality_warnings(str(input_path))
 
+        input_size_mb = input_path.stat().st_size / (1024 * 1024)
         progress_callback(8, "queued", "Waiting for compression slot...")
-        with _compression_slot(job_id):
+        with _compression_slot(job_id, input_size_mb=input_size_mb):
             compress_start = time.time()
             progress_callback(10, "compressing", "Starting compression...")
 
@@ -1305,16 +1333,18 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         )
 
         # Debug summary for performance/part count investigations
+        threshold_label = f"{split_threshold_mb:.1f}MB" if split_threshold_mb is not None else "off"
+        trigger_label = f"{split_trigger_mb:.1f}MB" if split_trigger_mb is not None else "off"
         logger.info(
-            "[%s] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s (threshold=%.1fMB trigger=%.1fMB), "
+            "[%s] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s (threshold=%s trigger=%s), "
             "timings: download=%.2fs compress=%.2fs total=%.2fs",
             job_id,
             result['original_size_mb'],
             result['compressed_size_mb'],
             result['reduction_percent'],
             result.get('total_parts') or len(output_paths),
-            split_threshold_mb,
-            split_trigger_mb,
+            threshold_label,
+            trigger_label,
             timings.get("download_seconds", 0.0),
             timings.get("compression_seconds", 0.0),
             timings.get("total_seconds", 0.0),
@@ -1704,8 +1734,8 @@ def compress_sync():
     input_path = UPLOAD_FOLDER / f"{file_id}_input.pdf"
     name_hint: str | None = None
     split_override: float | None = None
-    split_threshold_mb = SPLIT_THRESHOLD_MB
-    split_trigger_mb = SPLIT_TRIGGER_MB
+    split_threshold_mb = None
+    split_trigger_mb = None
 
     try:
         # Dual input handling - JSON (Salesforce) or form-data (Dashboard)
@@ -1802,10 +1832,13 @@ def compress_sync():
                     "error_message": "Downloaded file is not a valid PDF"
                 }), 400
             downloaded_mb = input_path.stat().st_size / (1024 * 1024)
-            logger.info(
-                f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB "
-                f"(will split if > {split_trigger_mb}MB into {split_threshold_mb}MB parts)"
-            )
+            if split_threshold_mb is not None:
+                logger.info(
+                    f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB "
+                    f"(will split if > {split_trigger_mb}MB into {split_threshold_mb}MB parts)"
+                )
+            else:
+                logger.info(f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB (split=off)")
 
         elif request.files and 'file' in request.files:
             # Dashboard flow - direct file upload
@@ -1894,7 +1927,7 @@ def compress_sync():
 
         # Run compression with a timeout to avoid gateway kills
         def run_compress():
-            with _compression_slot(f"sync:{file_id}"):
+            with _compression_slot(f"sync:{file_id}", input_size_mb=file_size_mb):
                 return compress_pdf(
                     str(input_path),
                     working_dir=UPLOAD_FOLDER,

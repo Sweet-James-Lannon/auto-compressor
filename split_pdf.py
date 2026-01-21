@@ -278,8 +278,18 @@ def split_by_size(
     # Always round up (e.g., 79MB with 25MB threshold -> 4 parts).
     num_parts = max(2, math.ceil(file_size_mb / threshold_mb))
 
-    # Cap at reasonable number - no more than 10 parts
-    num_parts = min(num_parts, 10)
+    if num_parts > 10:
+        logger.info(
+            "[split_by_size] Expected %s parts; switching to size-based splitter...",
+            num_parts,
+        )
+        return split_pdf(
+            pdf_path,
+            output_dir,
+            base_name,
+            threshold_mb,
+            skip_optimization_under_threshold=skip_optimization_under_threshold,
+        )
 
     # Ensure at least 1 page per part
     num_parts = min(num_parts, total_pages)
@@ -474,7 +484,12 @@ def split_for_delivery(
 
     file_size_mb = get_file_size_mb(pdf_path)
     min_parts = max(1, math.ceil(file_size_mb / threshold_mb))
-    should_try_ultra = len(parts) > min_parts
+    should_try_ultra = len(parts) > min_parts and _should_try_ultra(
+        file_size_mb,
+        threshold_mb,
+        len(parts),
+        SPLIT_ULTRA_GAP_PCT,
+    )
 
     if not should_try_ultra:
         return parts
@@ -553,7 +568,7 @@ def split_pdf(
         FileNotFoundError: If source PDF doesn't exist.
         EncryptionError: If PDF is password-protected.
         StructureError: If PDF is corrupted or malformed.
-        SplitError: If PDF cannot be split into parts under threshold.
+        SplitError: If PDF cannot be split due to write or structural errors.
     """
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
@@ -621,7 +636,7 @@ def split_pdf(
             # Estimate how much optimization shrinks PyPDF2 output to avoid over-splitting.
             size_ratio = 1.0
             ratio_samples: List[float] = []
-            if total_pages >= 2 and file_size_mb > threshold_mb:
+            if total_pages >= 2 and file_size_mb > threshold_mb and not skip_optimization_under_threshold:
                 sample_pages = min(20, total_pages)
                 sample_starts = [0]
                 if total_pages > sample_pages * 2:
@@ -732,13 +747,13 @@ def split_pdf(
                             f"(over target {target_size:.1f}MB, under limit {threshold_mb:.1f}MB)."
                         )
                     else:
-                        hint = ""
-                        if not ALLOW_LOSSY_COMPRESSION:
-                            hint = " Lossy compression is disabled; enable ALLOW_LOSSY_COMPRESSION=1 to allow downsampling."
-                        raise SplitError(
-                            f"Cannot split {pdf_path.name}: page {start_page + 1} alone is "
-                            f"{single_page_size:.1f}MB, exceeding the {threshold_mb:.1f}MB limit.{hint}"
+                        logger.warning(
+                            "Page %s alone is %.1fMB (> limit %.1fMB). Keeping oversize part.",
+                            start_page + 1,
+                            single_page_size,
+                            threshold_mb,
                         )
+                        best_end = start_page + 1
 
                 page_ranges.append((start_page, best_end))
                 logger.info(f"Split point {len(page_ranges)}: pages {start_page + 1}-{best_end}")
@@ -863,10 +878,11 @@ def split_pdf(
 
             if oversize:
                 details = ", ".join([f"part {i}={s:.1f}MB" for i, _, s in oversize])
-                for p in output_paths:
-                    p.unlink(missing_ok=True)
-                raise SplitError(
-                    f"Split produced oversized parts for {pdf_path.name}: {details} (limit {threshold_mb:.1f}MB)."
+                logger.warning(
+                    "Split produced oversized parts for %s: %s (limit %.1fMB). Keeping output.",
+                    pdf_path.name,
+                    details,
+                    threshold_mb,
                 )
 
             # Return the parts

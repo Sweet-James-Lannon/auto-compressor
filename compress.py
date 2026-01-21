@@ -30,6 +30,9 @@ PARALLEL_THRESHOLD_MB = 30.0
 # Files at or below this size stay on the serial path to avoid over-splitting (keeps mid-size PDFs to fewer parts).
 PARALLEL_SERIAL_CUTOFF_MB = 100.0
 
+# Force parallel compression for very high page counts, even when file size is modest.
+PARALLEL_PAGE_THRESHOLD = 600
+
 # Cap workers to env or available CPU to avoid thrash on small instances
 def _resolve_parallel_workers(effective_cpu: Optional[int] = None) -> Tuple[int, Optional[int]]:
     """Resolve max parallel worker count at call time to respect dynamic CPU limits."""
@@ -44,6 +47,9 @@ def _resolve_parallel_workers(effective_cpu: Optional[int] = None) -> Tuple[int,
         except ValueError:
             logger.warning("[compress] Invalid PARALLEL_MAX_WORKERS=%s; using effective CPU", env_value)
             env_workers = None
+
+    if env_workers is not None:
+        return max(1, env_workers), env_workers
 
     max_workers = env_workers if env_workers is not None else effective_cpu
     return max(1, min(max_workers, effective_cpu)), env_workers
@@ -210,17 +216,33 @@ def compress_pdf(
     # Mid-size files (<~100MB or only 1–2 chunks) stay serial to avoid extra parts
     # =========================================================================
     est_chunks = math.ceil(original_size / DEFAULT_TARGET_CHUNK_MB) if DEFAULT_TARGET_CHUNK_MB > 0 else 3
+    force_parallel_by_pages = page_count is not None and page_count >= PARALLEL_PAGE_THRESHOLD
     use_parallel = (
-        original_size > PARALLEL_THRESHOLD_MB
-        and original_size > PARALLEL_SERIAL_CUTOFF_MB
-        and est_chunks > 2
+        force_parallel_by_pages
+        or (
+            original_size > PARALLEL_THRESHOLD_MB
+            and original_size > PARALLEL_SERIAL_CUTOFF_MB
+            and est_chunks > 2
+        )
     )
 
     if use_parallel:
-        logger.info(
-            f"[PARALLEL] File {original_size:.1f}MB > {PARALLEL_THRESHOLD_MB}MB threshold "
-            f"and > {PARALLEL_SERIAL_CUTOFF_MB}MB cutoff, using parallel compression (est_chunks={est_chunks})"
-        )
+        if force_parallel_by_pages:
+            logger.info(
+                "[PARALLEL] Page count %s >= %s; forcing parallel compression",
+                page_count,
+                PARALLEL_PAGE_THRESHOLD,
+            )
+            logger.info(
+                "[PARALLEL] Using parallel compression for %.1fMB file (est_chunks=%s)",
+                original_size,
+                est_chunks,
+            )
+        else:
+            logger.info(
+                f"[PARALLEL] File {original_size:.1f}MB > {PARALLEL_THRESHOLD_MB}MB threshold "
+                f"and > {PARALLEL_SERIAL_CUTOFF_MB}MB cutoff, using parallel compression (est_chunks={est_chunks})"
+            )
         effective_cpu = get_effective_cpu_count()
         max_workers, env_workers = _resolve_parallel_workers(effective_cpu)
         env_label = env_workers if env_workers is not None else "unset"
@@ -250,7 +272,7 @@ def compress_pdf(
             input_path=input_path,
             working_dir=working_dir,
             base_name=input_path.stem,
-            split_threshold_mb=split_threshold_mb or 25.0,
+            split_threshold_mb=split_threshold_mb,
             split_trigger_mb=effective_split_trigger,
             progress_callback=progress_callback,
             max_workers=max_workers,
