@@ -24,7 +24,7 @@ MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
 MIN_CHUNK_MB = 20.0
 # Guardrail: only trigger merge fallback when output is meaningfully larger than input.
 PARALLEL_BLOAT_PCT = 0.08
-PARALLEL_MERGE_ON_BLOAT = True
+PARALLEL_MERGE_ON_BLOAT = env_bool("PARALLEL_MERGE_ON_BLOAT", True)
 # Log-only signal when chunking inflates total size (PyPDF2 duplicates resources).
 PARALLEL_SPLIT_INFLATION_PCT = 0.02
 # If split inflation is high, force dedupe on split parts (targeted slow path).
@@ -49,6 +49,9 @@ GS_GRAY_DOWNSAMPLE_TYPE = env_choice(
 )
 GS_BAND_HEIGHT = env_int("GS_BAND_HEIGHT", 100)
 GS_BAND_BUFFER_SPACE_MB = env_int("GS_BAND_BUFFER_SPACE_MB", 500)
+GS_COLOR_IMAGE_RESOLUTION = max(1, env_int("GS_COLOR_IMAGE_RESOLUTION", 72))
+GS_GRAY_IMAGE_RESOLUTION = max(1, env_int("GS_GRAY_IMAGE_RESOLUTION", 72))
+GS_MONO_IMAGE_RESOLUTION = max(1, env_int("GS_MONO_IMAGE_RESOLUTION", 150))
 PARALLEL_SERIAL_FALLBACK = env_bool("PARALLEL_SERIAL_FALLBACK", True)
 
 
@@ -268,15 +271,15 @@ def compress_pdf_with_ghostscript(
         # Downsample all images to 72 DPI for maximum compression
         "-dDownsampleColorImages=true",
         f"-dColorImageDownsampleType={GS_COLOR_DOWNSAMPLE_TYPE}",
-        "-dColorImageResolution=72",
+        f"-dColorImageResolution={GS_COLOR_IMAGE_RESOLUTION}",
         "-dColorImageDownsampleThreshold=1.0",
         "-dDownsampleGrayImages=true",
         f"-dGrayImageDownsampleType={GS_GRAY_DOWNSAMPLE_TYPE}",
-        "-dGrayImageResolution=72",
+        f"-dGrayImageResolution={GS_GRAY_IMAGE_RESOLUTION}",
         "-dGrayImageDownsampleThreshold=1.0",
         "-dDownsampleMonoImages=true",
         "-dMonoImageDownsampleType=/Subsample",  # Faster for 1-bit images
-        "-dMonoImageResolution=150",  # Raised for readable scanned text
+        f"-dMonoImageResolution={GS_MONO_IMAGE_RESOLUTION}",  # Raised for readable scanned text
         "-dMonoImageDownsampleThreshold=1.0",
         # Optimization
         "-dDetectDuplicateImages=true",
@@ -368,15 +371,15 @@ def compress_ultra_aggressive(
         # Downsample images (72 DPI baseline)
         "-dDownsampleColorImages=true",
         f"-dColorImageDownsampleType={GS_COLOR_DOWNSAMPLE_TYPE}",
-        "-dColorImageResolution=72",
+        f"-dColorImageResolution={GS_COLOR_IMAGE_RESOLUTION}",
         "-dColorImageDownsampleThreshold=1.0",
         "-dDownsampleGrayImages=true",
         f"-dGrayImageDownsampleType={GS_GRAY_DOWNSAMPLE_TYPE}",
-        "-dGrayImageResolution=72",
+        f"-dGrayImageResolution={GS_GRAY_IMAGE_RESOLUTION}",
         "-dGrayImageDownsampleThreshold=1.0",
         "-dDownsampleMonoImages=true",
         "-dMonoImageDownsampleType=/Subsample",
-        "-dMonoImageResolution=150",
+        f"-dMonoImageResolution={GS_MONO_IMAGE_RESOLUTION}",
         "-dMonoImageDownsampleThreshold=1.0",
         # Optimization
         "-dDetectDuplicateImages=true",
@@ -442,6 +445,7 @@ def compress_parallel(
     compression_mode: str = "lossless",
     target_chunk_mb: Optional[float] = None,
     max_chunk_mb: Optional[float] = None,
+    input_page_count: Optional[int] = None,
 ) -> Dict:
     """
     Parallel compression strategy for large PDFs.
@@ -523,13 +527,15 @@ def compress_parallel(
     # This keeps each Ghostscript run shorter on very large files (300MB), reducing timeouts.
     num_chunks_by_size = math.ceil(original_size_mb / target_chunk_mb)
 
-    try:
-        from PyPDF2 import PdfReader
+    total_pages = input_page_count
+    if total_pages is None:
+        try:
+            from PyPDF2 import PdfReader
 
-        with open(input_path, "rb") as f:
-            total_pages = len(PdfReader(f, strict=False).pages)
-    except Exception:
-        total_pages = None
+            with open(input_path, "rb") as f:
+                total_pages = len(PdfReader(f, strict=False).pages)
+        except Exception:
+            total_pages = None
 
     num_chunks_by_pages = 1
     if total_pages and max_pages_per_chunk > 0:

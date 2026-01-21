@@ -1,21 +1,30 @@
 #!/bin/bash
 # Azure App Service startup script
-# Installs Ghostscript for PDF compression, then starts gunicorn
+# Installs Ghostscript if needed, then starts gunicorn
 
-set -e
+set -euo pipefail
 
 echo "=== PDF Compressor Startup Script ==="
 
-# Install system dependencies for PDF compression
-echo "Installing system dependencies..."
-apt-get update
-apt-get install -y ghostscript
+if ! command -v gs >/dev/null 2>&1; then
+  echo "Installing system dependencies..."
+  apt-get update -qq
+  apt-get install -y --no-install-recommends ghostscript
+  rm -rf /var/lib/apt/lists/*
+fi
 
-# Verify installations
 echo "Verifying installations..."
 gs --version && echo "Ghostscript installed successfully" || echo "WARNING: Ghostscript installation failed"
 
-# Start gunicorn with production settings
-# Using single worker with threads to maintain shared memory for job queue
-echo "Starting gunicorn..."
-gunicorn --bind=0.0.0.0:8000 --timeout=1800 --workers=1 --threads=8 app:app
+PORT="${PORT:-8000}"
+GUNICORN_TIMEOUT="${GUNICORN_TIMEOUT:-1200}"
+GUNICORN_THREADS="${GUNICORN_THREADS:-4}"
+
+# Start gunicorn with production settings.
+# Use a single worker to keep the in-memory job queue consistent.
+echo "Starting gunicorn on port ${PORT}..."
+exec gunicorn --bind "0.0.0.0:${PORT}" \
+  --timeout "${GUNICORN_TIMEOUT}" \
+  --workers 1 \
+  --threads "${GUNICORN_THREADS}" \
+  app:app

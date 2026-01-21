@@ -17,7 +17,7 @@ from exceptions import (
     MetadataCorruptionError,
     SplitError,
 )
-from utils import get_file_size_mb, get_effective_cpu_count
+from utils import env_bool, env_float, env_int, get_file_size_mb, get_effective_cpu_count
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,9 @@ PARALLEL_THRESHOLD_MB = 30.0
 PARALLEL_SERIAL_CUTOFF_MB = 100.0
 
 # Force parallel compression for very high page counts, even when file size is modest.
-PARALLEL_PAGE_THRESHOLD = 600
+PARALLEL_PAGE_THRESHOLD = env_int("PARALLEL_PAGE_THRESHOLD", 600)
+PARALLEL_PAGE_MIN_MB = env_float("PARALLEL_PAGE_MIN_MB", 0.0)
+PDF_PRECHECK_ENABLED = env_bool("PDF_PRECHECK_ENABLED", True)
 
 # Cap workers to env or available CPU to avoid thrash on small instances
 def _resolve_parallel_workers(effective_cpu: Optional[int] = None) -> Tuple[int, Optional[int]]:
@@ -141,21 +143,24 @@ def compress_pdf(
 
     # Validate PDF before processing - catch encrypted files early
     page_count = None
-    try:
-        with open(input_path, 'rb') as f:
-            reader = PdfReader(f, strict=False)
-            # Do not block on "encrypted" flag; attempt to read pages regardless.
-            if reader.is_encrypted:
-                try:
-                    reader.decrypt("")
-                    logger.info(f"{input_path.name} flagged encrypted; attempted empty password and continuing.")
-                except Exception as de:
-                    logger.warning(f"{input_path.name} flagged encrypted; decrypt attempt failed ({de}), continuing anyway.")
+    if PDF_PRECHECK_ENABLED:
+        try:
+            with open(input_path, 'rb') as f:
+                reader = PdfReader(f, strict=False)
+                # Do not block on "encrypted" flag; attempt to read pages regardless.
+                if reader.is_encrypted:
+                    try:
+                        reader.decrypt("")
+                        logger.info(f"{input_path.name} flagged encrypted; attempted empty password and continuing.")
+                    except Exception as de:
+                        logger.warning(
+                            f"{input_path.name} flagged encrypted; decrypt attempt failed ({de}), continuing anyway."
+                        )
 
-            page_count = len(reader.pages)
-    except Exception as e:
-        # Let Ghostscript try - it might handle edge cases
-        logger.warning(f"PDF pre-validation warning (will continue): {e}")
+                page_count = len(reader.pages)
+        except Exception as e:
+            # Let Ghostscript try - it might handle edge cases
+            logger.warning(f"PDF pre-validation warning (will continue): {e}")
 
     working_dir = working_dir or input_path.parent
     original_size = get_file_size_mb(input_path)
@@ -216,7 +221,12 @@ def compress_pdf(
     # Mid-size files (<~100MB or only 1–2 chunks) stay serial to avoid extra parts
     # =========================================================================
     est_chunks = math.ceil(original_size / DEFAULT_TARGET_CHUNK_MB) if DEFAULT_TARGET_CHUNK_MB > 0 else 3
-    force_parallel_by_pages = page_count is not None and page_count >= PARALLEL_PAGE_THRESHOLD
+    force_parallel_by_pages = (
+        page_count is not None
+        and PARALLEL_PAGE_THRESHOLD > 0
+        and page_count >= PARALLEL_PAGE_THRESHOLD
+        and original_size >= PARALLEL_PAGE_MIN_MB
+    )
     use_parallel = (
         force_parallel_by_pages
         or (
@@ -279,6 +289,7 @@ def compress_pdf(
             compression_mode=compression_mode,
             target_chunk_mb=target_chunk_mb,
             max_chunk_mb=max_chunk_mb,
+            input_page_count=page_count,
         )
         return result
 

@@ -637,6 +637,7 @@ def spawn_callback(callback_url: str, payload: dict, job_id: str) -> None:
 
 
 LOG_PART_PAGE_COUNTS = utils.env_bool("LOG_PART_PAGE_COUNTS", True)
+ENABLE_QUALITY_WARNINGS = utils.env_bool("ENABLE_QUALITY_WARNINGS", True)
 
 DASHBOARD_FILE_MAP = [
     {
@@ -920,11 +921,16 @@ def build_health_snapshot() -> Dict[str, Any]:
             "allow_lossy": utils.env_bool("ALLOW_LOSSY_COMPRESSION", True),
             "scanned_confidence_for_aggressive": utils.env_float("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", 70.0),
             "serial_fallback": utils.env_bool("PARALLEL_SERIAL_FALLBACK", True),
+            "pdf_precheck_enabled": utils.env_bool("PDF_PRECHECK_ENABLED", True),
+            "quality_warnings_enabled": utils.env_bool("ENABLE_QUALITY_WARNINGS", True),
             "gs_fast_web_view": utils.env_bool("GS_FAST_WEB_VIEW", True),
             "gs_band_height": utils.env_int("GS_BAND_HEIGHT", 100),
             "gs_band_buffer_space_mb": utils.env_int("GS_BAND_BUFFER_SPACE_MB", 500),
             "gs_color_downsample_type": os.environ.get("GS_COLOR_DOWNSAMPLE_TYPE", "/Bicubic"),
             "gs_gray_downsample_type": os.environ.get("GS_GRAY_DOWNSAMPLE_TYPE", "/Bicubic"),
+            "gs_color_image_resolution": utils.env_int("GS_COLOR_IMAGE_RESOLUTION", 72),
+            "gs_gray_image_resolution": utils.env_int("GS_GRAY_IMAGE_RESOLUTION", 72),
+            "gs_mono_image_resolution": utils.env_int("GS_MONO_IMAGE_RESOLUTION", 150),
         },
         "split": {
             "threshold_mb": SPLIT_THRESHOLD_MB,
@@ -938,6 +944,8 @@ def build_health_snapshot() -> Dict[str, Any]:
         },
         "parallel": {
             "threshold_mb": PARALLEL_THRESHOLD_MB,
+            "page_threshold": utils.env_int("PARALLEL_PAGE_THRESHOLD", 600),
+            "page_min_mb": utils.env_float("PARALLEL_PAGE_MIN_MB", 0.0),
             "parallel_max_workers": os.environ.get("PARALLEL_MAX_WORKERS", "auto"),
             "async_workers": ASYNC_WORKERS,
             "max_active_compressions": MAX_ACTIVE_COMPRESSIONS,
@@ -946,6 +954,7 @@ def build_health_snapshot() -> Dict[str, Any]:
             "max_chunk_mb": utils.env_float("MAX_CHUNK_MB", 60.0),
             "max_pages_per_chunk": utils.env_int("MAX_PAGES_PER_CHUNK", 200),
             "gs_num_rendering_threads": os.environ.get("GS_NUM_RENDERING_THREADS", "auto"),
+            "merge_on_bloat": utils.env_bool("PARALLEL_MERGE_ON_BLOAT", True),
         },
     }
 
@@ -1265,7 +1274,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         download_time = round(time.time() - start_time, 2)
 
         # Get quality warnings before compression
-        warnings = get_quality_warnings(str(input_path))
+        warnings = get_quality_warnings(input_path) if ENABLE_QUALITY_WARNINGS else []
 
         input_size_mb = input_path.stat().st_size / (1024 * 1024)
         progress_callback(8, "queued", "Waiting for compression slot...")
@@ -1546,6 +1555,11 @@ def compress():
             task_data["name"] = data["name"]
         if not task_data.get("name") and task_data.get("download_url"):
             task_data["name"] = task_data["download_url"]
+        matter_id = data.get("matterId")
+        if matter_id is None:
+            matter_id = data.get("matter_id")
+        if matter_id is not None:
+            task_data["matter_id"] = matter_id
         if isinstance(data.get("callbackUrl"), str):
             task_data["callbackUrl"] = data["callbackUrl"]
         if data.get("async") is True:
