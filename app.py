@@ -937,9 +937,9 @@ def build_health_snapshot() -> Dict[str, Any]:
             "gs_band_buffer_space_mb": utils.env_int("GS_BAND_BUFFER_SPACE_MB", 500),
             "gs_color_downsample_type": os.environ.get("GS_COLOR_DOWNSAMPLE_TYPE", "/Bicubic"),
             "gs_gray_downsample_type": os.environ.get("GS_GRAY_DOWNSAMPLE_TYPE", "/Bicubic"),
-            "gs_color_image_resolution": utils.env_int("GS_COLOR_IMAGE_RESOLUTION", 72),
-            "gs_gray_image_resolution": utils.env_int("GS_GRAY_IMAGE_RESOLUTION", 72),
-            "gs_mono_image_resolution": utils.env_int("GS_MONO_IMAGE_RESOLUTION", 150),
+            "gs_color_image_resolution": utils.env_int("GS_COLOR_IMAGE_RESOLUTION", 60),
+            "gs_gray_image_resolution": utils.env_int("GS_GRAY_IMAGE_RESOLUTION", 60),
+            "gs_mono_image_resolution": utils.env_int("GS_MONO_IMAGE_RESOLUTION", 120),
         },
         "split": {
             "threshold_mb": SPLIT_THRESHOLD_MB,
