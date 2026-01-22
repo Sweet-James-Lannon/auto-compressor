@@ -294,8 +294,11 @@ def compress_pdf(
         )
 
     if split_requested and use_parallel:
-        return run_parallel()
-    if not split_requested and use_parallel:
+        logger.info(
+            "[compress] Split requested; using serial compression for maximum savings "
+            "and falling back to parallel on timeout",
+        )
+    elif use_parallel:
         logger.info("[compress] Split not requested; using serial compression to avoid chunk/merge overhead")
 
     # =========================================================================

@@ -1,7 +1,7 @@
 """PDF splitting module for large file handling.
 
 This module provides functionality to split PDFs that exceed
-the size threshold into smaller parts for email attachment limits.
+the size threshold into smaller parts for delivery constraints.
 """
 
 import logging
@@ -25,9 +25,8 @@ from compress_ghostscript import (
 from exceptions import EncryptionError, StructureError, SplitError
 from utils import get_file_size_mb
 
-# Constants - Email attachment sizing
-# Outlook/Exchange has ~25MB limit but this includes email headers/body overhead
-# Target slightly under 25MB to leave room for email overhead
+# Constants - Size threshold defaults
+# Default kept for backward compatibility; override via SPLIT_THRESHOLD_MB.
 DEFAULT_THRESHOLD_MB: float = 25.0
 _safety_buffer = float(os.environ.get("SPLIT_SAFETY_BUFFER_MB", "0"))
 SAFETY_BUFFER_MB: float = max(0.0, _safety_buffer)
@@ -356,7 +355,7 @@ def split_by_size(
             if success and part_path.exists():
                 part_size = get_file_size_mb(part_path)
 
-                # If optimization made it bigger, keep the raw part (email size limit matters most).
+                # If optimization made it bigger, keep the raw part (size limit matters most).
                 if part_size > raw_size:
                     logger.warning(
                         f"[split_by_size] Optimization increased size for part {i+1}: "

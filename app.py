@@ -85,41 +85,10 @@ FILE_RETENTION_SECONDS = int(os.environ.get('FILE_RETENTION_SECONDS', '86400')) 
 MIN_FILE_RETENTION_SECONDS = int(os.environ.get('MIN_FILE_RETENTION_SECONDS', '3600'))  # 1 hour minimum
 EFFECTIVE_FILE_RETENTION_SECONDS = max(FILE_RETENTION_SECONDS, MIN_FILE_RETENTION_SECONDS)
 BASE_SPLIT_THRESHOLD_MB = float(os.environ.get('SPLIT_THRESHOLD_MB', '25'))
-_attachment_limit = os.environ.get("ATTACHMENT_MAX_MB")
-ATTACHMENT_MAX_MB: float | None = None
-ATTACHMENT_OVERHEAD_PCT = float(os.environ.get("ATTACHMENT_OVERHEAD_PCT", "0.35"))
-ATTACHMENT_OVERHEAD_MB = float(os.environ.get("ATTACHMENT_OVERHEAD_MB", "0.5"))
-EFFECTIVE_SPLIT_THRESHOLD_MB = BASE_SPLIT_THRESHOLD_MB
-
-if _attachment_limit:
-    try:
-        attachment_limit_mb = float(_attachment_limit)
-        ATTACHMENT_MAX_MB = attachment_limit_mb
-        safe_mb = (attachment_limit_mb - ATTACHMENT_OVERHEAD_MB) / (1 + ATTACHMENT_OVERHEAD_PCT)
-        if safe_mb > 0:
-            EFFECTIVE_SPLIT_THRESHOLD_MB = min(BASE_SPLIT_THRESHOLD_MB, safe_mb)
-            logger.info(
-                "Attachment limit %sMB with overhead yields split threshold %.2fMB (base %.2fMB)",
-                attachment_limit_mb,
-                EFFECTIVE_SPLIT_THRESHOLD_MB,
-                BASE_SPLIT_THRESHOLD_MB,
-            )
-        else:
-            logger.warning(
-                "ATTACHMENT_MAX_MB=%s too low after overhead; using SPLIT_THRESHOLD_MB=%s",
-                attachment_limit_mb,
-                BASE_SPLIT_THRESHOLD_MB,
-            )
-    except ValueError:
-        logger.warning("Invalid ATTACHMENT_MAX_MB=%s; using SPLIT_THRESHOLD_MB=%s", _attachment_limit, BASE_SPLIT_THRESHOLD_MB)
-
-SPLIT_THRESHOLD_MB = EFFECTIVE_SPLIT_THRESHOLD_MB
+SPLIT_THRESHOLD_MB = BASE_SPLIT_THRESHOLD_MB
 # Split only when output exceeds this size, but keep parts under SPLIT_THRESHOLD_MB.
-_split_trigger = float(os.environ.get("SPLIT_TRIGGER_MB", "30"))
-if _attachment_limit:
-    SPLIT_TRIGGER_MB = SPLIT_THRESHOLD_MB
-else:
-    SPLIT_TRIGGER_MB = max(SPLIT_THRESHOLD_MB, _split_trigger)
+_split_trigger = float(os.environ.get("SPLIT_TRIGGER_MB", str(SPLIT_THRESHOLD_MB)))
+SPLIT_TRIGGER_MB = max(SPLIT_THRESHOLD_MB, _split_trigger)
 # Async jobs can be large, but still need a hard ceiling to protect the instance.
 ASYNC_MAX_MB = min(float(os.environ.get("ASYNC_MAX_MB", "450")), HARD_ASYNC_LIMIT_MB)
 API_TOKEN = os.environ.get('API_TOKEN')
@@ -256,8 +225,6 @@ def _log_job_header(
     except OSError:
         size_label = "unknown"
 
-    attachment_limit_mb = ATTACHMENT_MAX_MB if ATTACHMENT_MAX_MB is not None else BASE_SPLIT_THRESHOLD_MB
-    attachment_source = "ATTACHMENT_MAX_MB" if ATTACHMENT_MAX_MB is not None else "SPLIT_THRESHOLD_MB"
     name_label = _normalize_display_base(name_hint)
 
     threshold_mb = SPLIT_THRESHOLD_MB if split_threshold_mb is None else split_threshold_mb
@@ -266,8 +233,7 @@ def _log_job_header(
     trigger_label = "off" if split_trigger_mb is None else f"{trigger_mb:.1f}MB"
 
     logger.info(
-        "[JOB] %s | source=%s | name=%s | file=%s | size=%s | split=%s | trigger=%s | "
-        "attach_limit=%.1fMB(%s) | overhead=%.0f%%+%.1fMB",
+        "[JOB] %s | source=%s | name=%s | file=%s | size=%s | split=%s | trigger=%s",
         job_id,
         source,
         name_label,
@@ -275,10 +241,6 @@ def _log_job_header(
         size_label,
         split_label,
         trigger_label,
-        attachment_limit_mb,
-        attachment_source,
-        ATTACHMENT_OVERHEAD_PCT * 100,
-        ATTACHMENT_OVERHEAD_MB,
     )
 
 
@@ -319,48 +281,6 @@ def _log_job_result(job_id: str, result: dict, output_paths: list[Path]) -> None
         bloat_label,
         bloat_pct_label,
         bloat_action,
-    )
-
-
-def _log_job_email(job_id: str, output_paths: list[Path]) -> None:
-    if not output_paths:
-        return
-
-    limit_mb = ATTACHMENT_MAX_MB if ATTACHMENT_MAX_MB is not None else BASE_SPLIT_THRESHOLD_MB
-    limit_source = "ATTACHMENT_MAX_MB" if ATTACHMENT_MAX_MB is not None else "SPLIT_THRESHOLD_MB"
-
-    max_part_mb = 0.0
-    max_email_mb = 0.0
-    over_limit = 0
-    counted = 0
-    for path in output_paths:
-        try:
-            size_mb = path.stat().st_size / (1024 * 1024)
-        except OSError:
-            continue
-        counted += 1
-        email_est_mb = size_mb * (1 + ATTACHMENT_OVERHEAD_PCT) + ATTACHMENT_OVERHEAD_MB
-        max_part_mb = max(max_part_mb, size_mb)
-        max_email_mb = max(max_email_mb, email_est_mb)
-        if email_est_mb > limit_mb:
-            over_limit += 1
-
-    if counted == 0:
-        return
-
-    logger.info(
-        "[JOB_EMAIL] %s | parts=%s | max_part=%.1fMB | max_email=%.1fMB | over=%s/%s | "
-        "limit=%.1fMB(%s) | overhead=%.0f%%+%.1fMB",
-        job_id,
-        len(output_paths),
-        max_part_mb,
-        max_email_mb,
-        over_limit,
-        len(output_paths),
-        limit_mb,
-        limit_source,
-        ATTACHMENT_OVERHEAD_PCT * 100,
-        ATTACHMENT_OVERHEAD_MB,
     )
 
 
@@ -549,17 +469,6 @@ def _log_output_page_counts(
             audit_bits.append(f"page_labels={'yes' if page_labels_present else 'no'}")
         logger.info("[%s] Input audit: %s", label, ", ".join(audit_bits))
 
-    email_limit_mb = ATTACHMENT_MAX_MB if ATTACHMENT_MAX_MB is not None else BASE_SPLIT_THRESHOLD_MB
-    email_limit_source = "ATTACHMENT_MAX_MB" if ATTACHMENT_MAX_MB is not None else "SPLIT_THRESHOLD_MB"
-    logger.info(
-        "[%s] Email size check: limit=%.1fMB (%s, overhead=%.0f%%+%.1fMB)",
-        label,
-        email_limit_mb,
-        email_limit_source,
-        ATTACHMENT_OVERHEAD_PCT * 100,
-        ATTACHMENT_OVERHEAD_MB,
-    )
-
     total_pages = 0
     total_size_mb = 0.0
     for idx, path in enumerate(output_paths, start=1):
@@ -568,19 +477,15 @@ def _log_output_page_counts(
                 count = len(PdfReader(f, strict=False).pages)
             size_bytes = path.stat().st_size
             size_mb = size_bytes / (1024 * 1024)
-            email_est_mb = size_mb * (1 + ATTACHMENT_OVERHEAD_PCT) + ATTACHMENT_OVERHEAD_MB
-            email_status = "OK" if email_est_mb <= email_limit_mb else "OVER"
             total_pages += count
             total_size_mb += size_mb
             logger.info(
-                "[%s] Output pages part %s: %s = %s pages (%.1fMB, email~%.1fMB %s)",
+                "[%s] Output pages part %s: %s = %s pages (%.1fMB)",
                 label,
                 idx,
                 path.name,
                 count,
                 size_mb,
-                email_est_mb,
-                email_status,
             )
         except Exception as exc:
             logger.warning("[%s] Output page count failed for %s: %s", label, path.name, exc)
@@ -945,7 +850,6 @@ def build_health_snapshot() -> Dict[str, Any]:
             "threshold_mb": SPLIT_THRESHOLD_MB,
             "trigger_mb": SPLIT_TRIGGER_MB,
             "base_threshold_mb": BASE_SPLIT_THRESHOLD_MB,
-            "attachment_max_mb": os.environ.get("ATTACHMENT_MAX_MB", "unset"),
             "safety_buffer_mb": utils.env_float("SPLIT_SAFETY_BUFFER_MB", 0.0),
             "minimize_parts": utils.env_bool("SPLIT_MINIMIZE_PARTS", True),
             "ultra_jpegq": utils.env_int("SPLIT_ULTRA_JPEGQ", 50),
@@ -1328,8 +1232,6 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         if should_log_parts:
             _log_output_page_counts(output_paths, job_id, result.get("page_count"), input_path)
         _log_job_result(job_id, result, output_paths)
-        if should_log_parts:
-            _log_job_email(job_id, output_paths)
         _log_job_parallel(job_id, result)
         _log_job_flags(job_id, result, output_paths, split_threshold_mb=split_threshold_mb)
 

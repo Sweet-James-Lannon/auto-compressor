@@ -290,7 +290,7 @@ def compress_pdf_with_ghostscript(
         "-dDetectDuplicateImages=true",
         "-dCompressFonts=true",
         "-dSubsetFonts=true",
-        # Strip metadata that might confuse email clients
+        # Strip metadata for cleaner output
         "-dPrinted=false",
         # Speed optimizations (NO effect on compression ratio)
         f"-dNumRenderingThreads={threads}",
@@ -793,63 +793,55 @@ def compress_parallel(
     compress_time = time.time() - start_ts - split_time
     logger.info("[PERF] Compress: %.1fs", compress_time)
 
-    # Step 4: If splitting is disabled, merge chunks into one output and return.
-    # If enabled, split chunks directly to <= threshold and return parts in order.
+    # Step 4: Merge compressed chunks for consistent results, then split if required.
     split_enabled = split_threshold_mb is not None and split_threshold_mb > 0
+    effective_split_trigger_mb = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
 
     split_start = time.time()
-    if not split_enabled:
-        report_progress(75, "merging", "Merging compressed chunks...")
-        merged_path = working_dir / f"{base_name}_compressed.pdf"
-        merged_path.unlink(missing_ok=True)
+    report_progress(75, "merging", "Merging compressed chunks...")
+    merged_path = working_dir / f"{base_name}_compressed.pdf"
+    merged_path.unlink(missing_ok=True)
+
+    if len(ordered_paths) == 1:
+        ordered_paths[0].rename(merged_path)
+    else:
         merge_pdfs(ordered_paths, merged_path)
-        if not merged_path.exists() or merged_path.stat().st_size == 0:
-            raise SplitError(f"Merged output missing or empty: {merged_path.name}")
-        final_parts = [merged_path]
+
+    if not merged_path.exists() or merged_path.stat().st_size == 0:
+        raise SplitError(f"Merged output missing or empty: {merged_path.name}")
+
+    final_parts = [merged_path]
+    merged_mb = get_file_size_mb(merged_path)
+
+    if split_enabled and effective_split_trigger_mb is not None:
+        logger.info(
+            "[PARALLEL] Split check: merged=%.1fMB trigger=%.1fMB threshold=%.1fMB",
+            merged_mb,
+            effective_split_trigger_mb,
+            split_threshold_mb,
+        )
+        if merged_mb > effective_split_trigger_mb:
+            report_progress(80, "splitting", "Splitting merged output...")
+            final_parts = split_for_delivery(
+                merged_path,
+                working_dir,
+                f"{base_name}_merged",
+                split_threshold_mb,
+                progress_callback=progress_callback,
+                skip_optimization_under_threshold=not force_split_dedup,
+            )
+            merged_path.unlink(missing_ok=True)
+            logger.info("[PARALLEL] Split merged output into %s part(s)", len(final_parts))
+        else:
+            logger.info(
+                "[PARALLEL] Split not required; merged output kept as a single file",
+            )
+    else:
         logger.info(
             "[PARALLEL] Split disabled; merged %s chunk(s) into %s",
             len(ordered_paths),
             merged_path.name,
         )
-    else:
-        all_under_threshold = all(get_file_size_mb(p) <= split_threshold_mb for p in ordered_paths)
-        if all_under_threshold:
-            final_parts = []
-            for idx, chunk_path in enumerate(ordered_paths, start=1):
-                dest = working_dir / f"{chunk_path.stem}_part{idx}.pdf"
-                dest.unlink(missing_ok=True)
-                chunk_path.rename(dest)
-                final_parts.append(dest)
-            logger.info(f"[PARALLEL] All chunks <= {split_threshold_mb}MB; skipping merge and returning chunks")
-        else:
-            report_progress(75, "splitting", f"Splitting compressed chunks into parts <= {split_threshold_mb}MB")
-            final_parts = []
-            for idx, chunk_path in enumerate(ordered_paths):
-                chunk_size = get_file_size_mb(chunk_path)
-                if chunk_size <= split_threshold_mb:
-                    dest = working_dir / f"{chunk_path.stem}_part1.pdf"
-                    dest.unlink(missing_ok=True)
-                    chunk_path.rename(dest)
-                    final_parts.append(dest)
-                    continue
-
-                # Split oversized chunk by size
-                chunk_parts = split_for_delivery(
-                    chunk_path,
-                    working_dir,
-                    f"{chunk_path.stem}",
-                    split_threshold_mb,
-                    progress_callback=progress_callback,
-                    skip_optimization_under_threshold=not force_split_dedup,
-                )
-                final_parts.extend(chunk_parts)
-
-            logger.info(
-                "[PARALLEL] Split compressed chunks into %s part(s) without global merge (threshold=%.1fMB, chunks=%s)",
-                len(final_parts),
-                split_threshold_mb,
-                len(ordered_paths),
-            )
 
     # Cleanup original chunk files
     for chunk in chunk_paths:
