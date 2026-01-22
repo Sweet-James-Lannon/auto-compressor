@@ -22,6 +22,11 @@ MAX_PARALLEL_CHUNKS = int(os.environ.get("MAX_PARALLEL_CHUNKS", "16"))
 MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
 # Minimum chunk size to avoid spawning tiny Ghostscript jobs that add overhead.
 MIN_CHUNK_MB = 20.0
+# Large-file tuning defaults (used only when chunk env vars are not set).
+LARGE_FILE_TUNE_MIN_MB = 200.0
+LARGE_FILE_TARGET_CHUNK_MB = 60.0
+LARGE_FILE_MAX_CHUNK_MB = 90.0
+LARGE_FILE_MAX_PARALLEL_CHUNKS = 12
 # Guardrail: only trigger merge fallback when output is meaningfully larger than input.
 PARALLEL_BLOAT_PCT = 0.08
 PARALLEL_MERGE_ON_BLOAT = env_bool("PARALLEL_MERGE_ON_BLOAT", True)
@@ -504,22 +509,23 @@ def compress_parallel(
     tuned_max_chunks = max(2, MAX_PARALLEL_CHUNKS)
     tuned_max_pages = MAX_PAGES_PER_CHUNK
 
-    if original_size_mb >= 200 and compression_mode == "aggressive":
-        if max_workers <= 1:
-            tuned_target = max(tuned_target, 60.0)
-            tuned_max_chunk = max(tuned_max_chunk, tuned_target * 1.5)
-            tuned_max_chunks = min(tuned_max_chunks, 10)
+    has_chunk_env = "TARGET_CHUNK_MB" in os.environ or "MAX_CHUNK_MB" in os.environ
+    if original_size_mb >= LARGE_FILE_TUNE_MIN_MB and compression_mode == "aggressive":
+        if not has_chunk_env:
+            tuned_target = max(tuned_target, LARGE_FILE_TARGET_CHUNK_MB)
+            tuned_max_chunk = max(tuned_max_chunk, max(LARGE_FILE_MAX_CHUNK_MB, tuned_target * 1.5))
+            tuned_max_chunks = min(tuned_max_chunks, LARGE_FILE_MAX_PARALLEL_CHUNKS)
             tuned_max_pages = max(tuned_max_pages, 400)
             logger.info(
-                "[PARALLEL] Large file serial tuning (workers=%s): target %.1fMB, max pages/chunk %s",
+                "[PARALLEL] Large file tuning (workers=%s): target %.1fMB, max %.1fMB, max pages/chunk %s",
                 max_workers,
                 tuned_target,
+                tuned_max_chunk,
                 tuned_max_pages,
             )
         else:
             logger.info(
-                "[PARALLEL] Large file parallel tuning (workers=%s): keeping env chunk sizes",
-                max_workers,
+                "[PARALLEL] Large file tuning skipped; explicit chunk env override present",
             )
 
     target_chunk_mb = max(MIN_CHUNK_MB, tuned_target)
