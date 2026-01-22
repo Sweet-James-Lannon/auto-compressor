@@ -505,10 +505,22 @@ def compress_parallel(
     tuned_max_pages = MAX_PAGES_PER_CHUNK
 
     if original_size_mb >= 200 and compression_mode == "aggressive":
-        tuned_target = max(tuned_target, 60.0)
-        tuned_max_chunk = max(tuned_max_chunk, tuned_target * 1.5)
-        tuned_max_chunks = min(tuned_max_chunks, 10)
-        tuned_max_pages = max(tuned_max_pages, 400)
+        if max_workers <= 1:
+            tuned_target = max(tuned_target, 60.0)
+            tuned_max_chunk = max(tuned_max_chunk, tuned_target * 1.5)
+            tuned_max_chunks = min(tuned_max_chunks, 10)
+            tuned_max_pages = max(tuned_max_pages, 400)
+            logger.info(
+                "[PARALLEL] Large file serial tuning (workers=%s): target %.1fMB, max pages/chunk %s",
+                max_workers,
+                tuned_target,
+                tuned_max_pages,
+            )
+        else:
+            logger.info(
+                "[PARALLEL] Large file parallel tuning (workers=%s): keeping env chunk sizes",
+                max_workers,
+            )
 
     target_chunk_mb = max(MIN_CHUNK_MB, tuned_target)
     max_chunk_mb = max(target_chunk_mb, tuned_max_chunk)

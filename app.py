@@ -133,7 +133,7 @@ except ValueError:
     ASYNC_WORKERS = _DEFAULT_ASYNC_WORKERS
 MAX_ACTIVE_COMPRESSIONS = max(1, min(2, _EFFECTIVE_CPU))
 SMALL_JOB_THRESHOLD_MB = 50.0
-SMALL_JOB_RESERVED_SLOTS = 1 if MAX_ACTIVE_COMPRESSIONS > 1 else 0
+SMALL_JOB_RESERVED_SLOTS = 0
 GENERAL_COMPRESSION_SLOTS = max(1, MAX_ACTIVE_COMPRESSIONS - SMALL_JOB_RESERVED_SLOTS)
 COMPRESSION_SEMAPHORE = threading.Semaphore(GENERAL_COMPRESSION_SLOTS)
 SMALL_JOB_SEMAPHORE = threading.Semaphore(SMALL_JOB_RESERVED_SLOTS) if SMALL_JOB_RESERVED_SLOTS else None
@@ -762,6 +762,16 @@ def _compression_slot(job_id: str | None = None, input_size_mb: float | None = N
 def _resolve_split_threshold_mb(raw_value: Any) -> float | None:
     if raw_value is None:
         return None
+    if isinstance(raw_value, str):
+        cleaned = raw_value.strip()
+        if not cleaned:
+            return None
+        lowered = cleaned.lower()
+        if lowered in ("off", "none", "false", "no"):
+            return None
+        if lowered.endswith("mb"):
+            cleaned = cleaned[:-2].strip()
+        raw_value = cleaned
     value = _safe_float(raw_value)
     if value is None:
         return None
@@ -1599,6 +1609,13 @@ def compress_async():
 
     # Option 3: Multipart form upload
     else:
+        split_override_raw = request.form.get("split_threshold_mb")
+        if split_override_raw is None:
+            split_override_raw = request.form.get("splitSizeMB")
+        split_override = _resolve_split_threshold_mb(split_override_raw)
+        if split_override is not None:
+            task_data["split_threshold_mb"] = split_override
+
         upload = request.files.get('pdf') or request.files.get('file')
         if not upload:
             return _request_error("Missing 'pdf' field")
