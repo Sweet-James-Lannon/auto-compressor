@@ -131,7 +131,7 @@ try:
     ASYNC_WORKERS = max(1, int(os.environ.get("ASYNC_WORKERS", str(_DEFAULT_ASYNC_WORKERS))))
 except ValueError:
     ASYNC_WORKERS = _DEFAULT_ASYNC_WORKERS
-MAX_ACTIVE_COMPRESSIONS = max(1, min(2, _EFFECTIVE_CPU))
+MAX_ACTIVE_COMPRESSIONS = max(1, min(ASYNC_WORKERS, _EFFECTIVE_CPU))
 SMALL_JOB_THRESHOLD_MB = 20.0
 SMALL_JOB_RESERVED_SLOTS = 1 if MAX_ACTIVE_COMPRESSIONS > 1 else 0
 GENERAL_COMPRESSION_SLOTS = max(1, MAX_ACTIVE_COMPRESSIONS - SMALL_JOB_RESERVED_SLOTS)
@@ -1324,9 +1324,12 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         for path in output_paths:
             track_file(path)
 
-        _log_output_page_counts(output_paths, job_id, result.get("page_count"), input_path)
+        should_log_parts = split_threshold_mb is not None or len(output_paths) > 1
+        if should_log_parts:
+            _log_output_page_counts(output_paths, job_id, result.get("page_count"), input_path)
         _log_job_result(job_id, result, output_paths)
-        _log_job_email(job_id, output_paths)
+        if should_log_parts:
+            _log_job_email(job_id, output_paths)
         _log_job_parallel(job_id, result)
         _log_job_flags(job_id, result, output_paths, split_threshold_mb=split_threshold_mb)
 

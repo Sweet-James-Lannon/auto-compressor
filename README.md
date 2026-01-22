@@ -48,3 +48,23 @@ python app.py
 3) Restart the service to pick up any config changes.
 4) Clear `uploads/` if you want clean disk usage and cleaner timing comparisons.
 5) Verify logs show the expected worker cap and that each job logs `split=off` or the threshold you set.
+
+## Benchmark script
+Use `scripts/benchmark_compress.py` to measure wall time, CPU time, throughput, and optional page-count checks.
+
+Example (single file, no split):
+```bash
+python scripts/benchmark_compress.py /path/to/file.pdf --working-dir ./benchmarks --verify-pages
+```
+
+Example (force split + write summaries):
+```bash
+python scripts/benchmark_compress.py /path/to/pdfs --recursive \\
+  --split-threshold-mb 25 --split-trigger-mb 25 \\
+  --working-dir ./benchmarks --verify-pages \\
+  --json-out bench.json --csv-out bench.csv
+```
+
+Notes:
+- Omit `--split-threshold-mb` to keep a single output and avoid chunk/merge overhead.
+- Use `--cleanup` to delete outputs after each run.

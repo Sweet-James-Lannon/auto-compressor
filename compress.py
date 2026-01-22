@@ -168,6 +168,7 @@ def compress_pdf(
     compression_mode = resolve_compression_mode(input_path)
     logger.info(f"[compress] Compression mode: {compression_mode} (allow_lossy={ALLOW_LOSSY_COMPRESSION})")
     effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
+    split_requested = split_threshold_mb is not None and split_threshold_mb > 0
 
     # Skip compression for very small files - usually already optimized
     if original_size < MIN_COMPRESSION_SIZE_MB:
@@ -236,7 +237,7 @@ def compress_pdf(
         )
     )
 
-    if use_parallel:
+    def run_parallel() -> Dict:
         if force_parallel_by_pages:
             logger.info(
                 "[PARALLEL] Page count %s >= %s; forcing parallel compression",
@@ -278,7 +279,7 @@ def compress_pdf(
                 target_chunk_mb,
                 max_chunk_mb,
             )
-        result = compress_ghostscript.compress_parallel(
+        return compress_ghostscript.compress_parallel(
             input_path=input_path,
             working_dir=working_dir,
             base_name=input_path.stem,
@@ -291,7 +292,11 @@ def compress_pdf(
             max_chunk_mb=max_chunk_mb,
             input_page_count=page_count,
         )
-        return result
+
+    if split_requested and use_parallel:
+        return run_parallel()
+    if not split_requested and use_parallel:
+        logger.info("[compress] Split not requested; using serial compression to avoid chunk/merge overhead")
 
     # =========================================================================
     # ROUTE: Small files use serial compression (existing logic)
@@ -310,8 +315,15 @@ def compress_pdf(
     success, message = compress_fn(input_path, output_path)
 
     if not success:
-        # Map error message to specific exception type
         msg_lower = message.lower()
+        timed_out = "timeout" in msg_lower
+        if timed_out and not split_requested and use_parallel:
+            logger.warning(
+                "[compress] Serial compression timed out; falling back to parallel for %s",
+                input_path.name,
+            )
+            return run_parallel()
+        # Map error message to specific exception type
         if 'password' in msg_lower or 'encrypt' in msg_lower or 'locked' in msg_lower:
             raise EncryptionError.for_file(input_path.name)
         elif 'corrupted' in msg_lower or 'damaged' in msg_lower or 'structure' in msg_lower:
