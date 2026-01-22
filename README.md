@@ -12,10 +12,9 @@ a lightweight dashboard for manual testing.
 - Outputs: download links; async requests can callback to Salesforce.
 
 ## Endpoints (summary)
-- `POST /compress` (async): JSON with `file_download_link` or `file_content_base64`.
+- `POST /compress-async` (async): JSON with `file_download_link`/`file_content_base64`/`file_url` or multipart upload.
   Optional: `name`, `pages`, `password`, `callbackUrl`, `split_threshold_mb` (`splitSizeMB`), `matterId`.
-- `POST /compress-sync` (blocking): JSON with `file_download_link` or multipart upload.
-  Optional: `name`, `split_threshold_mb` (`splitSizeMB`). If `matterId` is present it switches to async.
+- `POST /compress-sync` (legacy alias): Same async behavior as `/compress-async` for backward compatibility.
 - `GET /status/<job_id>`
 - `GET /download/<filename>`
 - `POST /job/check`
@@ -41,7 +40,6 @@ python app.py
 - `PARALLEL_MAX_WORKERS`
 - `TARGET_CHUNK_MB`, `MAX_CHUNK_MB`, `MAX_PAGES_PER_CHUNK`
 - `FILE_RETENTION_SECONDS`
-- `SYNC_MAX_MB`, `SYNC_AUTO_ASYNC_MB` (only if using `/compress-sync` for large files)
 
 ## Before running MB tests
 1) Decide split behavior per test: omit `split_threshold_mb` to keep a single output; provide it to force splitting.

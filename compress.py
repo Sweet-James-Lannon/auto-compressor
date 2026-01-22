@@ -334,7 +334,13 @@ def compress_pdf(
 
     # If compression made it bigger, return original
     if compressed_size >= original_size:
-        logger.warning(f"Compression increased size, returning original")
+        bloat_pct = ((compressed_size - original_size) / original_size) * 100 if original_size > 0 else 0.0
+        logger.warning(
+            "Compression increased size (%.2fMB -> %.2fMB, +%.1f%%), returning original",
+            original_size,
+            compressed_size,
+            bloat_pct,
+        )
         output_path.unlink()
         shutil.copy2(input_path, output_path)
         compressed_size = original_size
@@ -361,7 +367,10 @@ def compress_pdf(
                 "success": True,
                 "note": "Already optimized, split for size",
                 "page_count": page_count,
-                "part_sizes": [p.stat().st_size for p in output_paths]
+                "part_sizes": [p.stat().st_size for p in output_paths],
+                "bloat_detected": True,
+                "bloat_pct": round(bloat_pct, 1),
+                "bloat_action": "return_original",
             }
 
         single_size = output_path.stat().st_size
@@ -378,7 +387,10 @@ def compress_pdf(
             "success": True,
             "note": "Already optimized",
             "page_count": page_count,
-            "part_sizes": [single_size]
+            "part_sizes": [single_size],
+            "bloat_detected": True,
+            "bloat_pct": round(bloat_pct, 1),
+            "bloat_action": "return_original",
         }
 
     reduction = ((original_size - compressed_size) / original_size) * 100

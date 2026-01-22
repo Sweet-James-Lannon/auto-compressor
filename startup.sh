@@ -17,8 +17,8 @@ echo "Verifying installations..."
 gs --version && echo "Ghostscript installed successfully" || echo "WARNING: Ghostscript installation failed"
 
 PORT="${PORT:-8000}"
-GUNICORN_TIMEOUT="${GUNICORN_TIMEOUT:-1200}"
-GUNICORN_THREADS="${GUNICORN_THREADS:-4}"
+GUNICORN_TIMEOUT="${GUNICORN_TIMEOUT:-900}"
+GUNICORN_THREADS="${GUNICORN_THREADS:-6}"
 
 # Start gunicorn with production settings.
 # Use a single worker to keep the in-memory job queue consistent.

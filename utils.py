@@ -18,7 +18,7 @@ from exceptions import DownloadError
 
 # Constants for PDF download
 DOWNLOAD_TIMEOUT: int = 300  # 5 minute timeout
-MAX_DOWNLOAD_SIZE: int = 314572800  # 300 MB max
+MAX_DOWNLOAD_SIZE: int = 524288000  # 500 MB max
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +281,7 @@ def _is_safe_url(url: str) -> bool:
 def download_pdf(url: str, output_path: Path, max_download_size_bytes: int = MAX_DOWNLOAD_SIZE) -> None:
     """Download a PDF from a URL.
 
-    Used by /compress-sync to fetch PDFs from Salesforce/Docrio URLs.
+    Used by async endpoints to fetch PDFs from Salesforce/Docrio URLs.
 
     Args:
         url: The URL to download from.

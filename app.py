@@ -6,10 +6,8 @@ import logging
 import math
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import threading
 import time
-import uuid
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -49,7 +47,6 @@ app = Flask(__name__, template_folder='dashboard')
 
 # Constants
 MAX_CONTENT_LENGTH = MAX_DOWNLOAD_SIZE
-HARD_SYNC_LIMIT_MB = 300.0  # Absolute ceiling for sync endpoint
 HARD_ASYNC_LIMIT_MB = 600.0  # Absolute ceiling for async jobs
 
 
@@ -123,17 +120,11 @@ if _attachment_limit:
     SPLIT_TRIGGER_MB = SPLIT_THRESHOLD_MB
 else:
     SPLIT_TRIGGER_MB = max(SPLIT_THRESHOLD_MB, _split_trigger)
-# Cap SYNC_MAX_MB at the hard ceiling even if env is higher
-SYNC_MAX_MB = min(float(os.environ.get("SYNC_MAX_MB", str(HARD_SYNC_LIMIT_MB))), HARD_SYNC_LIMIT_MB)
-# Async jobs can be larger than sync, but still need a hard ceiling to protect the instance.
+# Async jobs can be large, but still need a hard ceiling to protect the instance.
 ASYNC_MAX_MB = min(float(os.environ.get("ASYNC_MAX_MB", "450")), HARD_ASYNC_LIMIT_MB)
 API_TOKEN = os.environ.get('API_TOKEN')
 # Public base URL for download links (e.g., https://yourapp.azurewebsites.net)
 BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
-# Raised default to 540s to align with gunicorn timeout and avoid 499/504s on large files.
-SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "540"))
-# Auto-switch large sync requests to async to avoid HTTP timeouts.
-SYNC_AUTO_ASYNC_MB = float(os.environ.get("SYNC_AUTO_ASYNC_MB", "120"))
 _EFFECTIVE_CPU = utils.get_effective_cpu_count()
 _DEFAULT_ASYNC_WORKERS = max(1, min(2, _EFFECTIVE_CPU))
 try:
@@ -302,10 +293,20 @@ def _log_job_result(job_id: str, result: dict, output_paths: list[Path]) -> None
     size_label = ",".join(sizes) if sizes else "none"
     page_count = result.get("page_count")
     page_label = str(page_count) if page_count is not None else "unknown"
+    bloat_detected = result.get("bloat_detected")
+    if bloat_detected is True:
+        bloat_label = "yes"
+    elif bloat_detected is False:
+        bloat_label = "no"
+    else:
+        bloat_label = "n/a"
+    bloat_pct = result.get("bloat_pct")
+    bloat_pct_label = f"{bloat_pct:.1f}%" if isinstance(bloat_pct, (int, float)) else "n/a"
+    bloat_action = result.get("bloat_action") or "n/a"
 
     logger.info(
         "[JOB_RESULT] %s | mode=%s | method=%s | pages=%s | in=%.1fMB | out=%.1fMB | "
-        "reduction=%.1f%% | parts=%s | part_sizes_mb=%s",
+        "reduction=%.1f%% | parts=%s | part_sizes_mb=%s | bloat=%s (%s) action=%s",
         job_id,
         result.get("compression_mode"),
         result.get("compression_method"),
@@ -315,6 +316,9 @@ def _log_job_result(job_id: str, result: dict, output_paths: list[Path]) -> None
         result.get("reduction_percent", 0.0),
         parts,
         size_label,
+        bloat_label,
+        bloat_pct_label,
+        bloat_action,
     )
 
 
@@ -645,14 +649,12 @@ DASHBOARD_FILE_MAP = [
         "file": "app.py",
         "summary": "Entry + finalize: API, request parsing, queue, callbacks, download naming",
         "functions": [
-            "compress",
-            "compress_sync",
+            "compress_async",
             "process_compression_job",
             "_build_download_links",
             "send_salesforce_callback",
         ],
         "variables": [
-            "SYNC_MAX_MB",
             "ASYNC_MAX_MB",
             "SPLIT_THRESHOLD_MB",
         ],
@@ -731,7 +733,7 @@ def _safe_float(value: Any) -> float | None:
 
 @contextlib.contextmanager
 def _compression_slot(job_id: str | None = None, input_size_mb: float | None = None):
-    label = job_id or "sync"
+    label = job_id or "job"
     is_small = input_size_mb is not None and input_size_mb < SMALL_JOB_THRESHOLD_MB
     start = time.time()
     semaphore = COMPRESSION_SEMAPHORE
@@ -911,10 +913,7 @@ def build_health_snapshot() -> Dict[str, Any]:
         },
         "queue": queue_stats,
         "limits": {
-            "sync_max_mb": SYNC_MAX_MB,
             "async_max_mb": ASYNC_MAX_MB,
-            "sync_auto_async_mb": SYNC_AUTO_ASYNC_MB,
-            "sync_timeout_seconds": SYNC_TIMEOUT_SECONDS,
         },
         "compression": {
             "mode": os.environ.get("COMPRESSION_MODE", "aggressive"),
@@ -1430,7 +1429,9 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             payload = {
                 "matterId": matter_id,
                 "compressedLinks": [],
-                "error": e.message or str(e)
+                "error": e.message or str(e),
+                "error_type": e.error_type,
+                "error_message": e.message or str(e),
             }
             spawn_callback(callback_url, payload, job_id)
     except Exception as e:
@@ -1446,7 +1447,9 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             payload = {
                 "matterId": matter_id,
                 "compressedLinks": [],
-                "error": str(e)
+                "error": str(e),
+                "error_type": "UnknownError",
+                "error_message": str(e),
             }
             spawn_callback(callback_url, payload, job_id)
 
@@ -1459,7 +1462,14 @@ job_queue.start_workers(ASYNC_WORKERS)
 # Error handlers
 @app.errorhandler(RequestEntityTooLarge)
 def handle_large_file(e):
-    return jsonify({"success": False, "error": "File too large (max 300MB)"}), 413
+    max_mb = int(MAX_CONTENT_LENGTH / (1024 * 1024))
+    message = f"File too large (max {max_mb}MB)"
+    return jsonify({
+        "success": False,
+        "error": message,
+        "error_type": "FileTooLarge",
+        "error_message": message,
+    }), 413
 
 
 @app.errorhandler(HTTPException)
@@ -1492,26 +1502,41 @@ def health():
     return jsonify(snapshot)
 
 
-@app.route('/compress', methods=['POST'])
+@app.route('/compress-async', methods=['POST'])
+@app.route('/compress-sync', methods=['POST'])
 @require_auth
-def compress():
+def compress_async():
     """
     Compress a PDF file asynchronously.
 
     Accepts:
     - application/json with 'file_download_link' (URL to download PDF)
     - application/json with 'file_content_base64' (base64-encoded PDF)
-    - multipart/form-data with 'pdf' field
+    - multipart/form-data with 'pdf' or 'file' field
 
     Returns job_id for polling status. Poll /status/<job_id> for results.
     """
     task_data: Dict[str, Any] = {}
+    matter_id = None
+    callback_url = None
+
+    def _request_error(message: str, status: int = 400, error_type: str = "InvalidRequest"):
+        return jsonify({
+            "success": False,
+            "error": message,
+            "error_type": error_type,
+            "error_message": message,
+        }), status
+
+    max_upload_bytes = int(ASYNC_MAX_MB * 1024 * 1024)
 
     # Parse input
     if request.is_json:
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _request_error("Invalid JSON body")
         if not data:
-            return jsonify({"success": False, "error": "Empty request body"}), 400
+            return _request_error("Empty request body")
         split_override_raw = data.get("split_threshold_mb")
         if split_override_raw is None:
             split_override_raw = data.get("splitSizeMB")
@@ -1520,10 +1545,10 @@ def compress():
             task_data["split_threshold_mb"] = split_override
 
         # Option 1: URL to download PDF
-        download_url = data.get('file_download_link') or data.get('url')
+        download_url = data.get('file_download_link') or data.get('url') or data.get('file_url')
         if download_url:
             if not download_url or not isinstance(download_url, str):
-                return jsonify({"success": False, "error": "Invalid file_download_link"}), 400
+                return _request_error("Invalid file_download_link")
             task_data['download_url'] = download_url
             logger.info("Compress request with URL: %s", utils.redact_url_for_log(download_url, max_len=120))
 
@@ -1532,19 +1557,24 @@ def compress():
             try:
                 pdf_bytes = base64.b64decode(data['file_content_base64'])
             except Exception:
-                return jsonify({"success": False, "error": "Invalid base64"}), 400
+                return _request_error("Invalid base64")
+
+            if len(pdf_bytes) > max_upload_bytes:
+                return _request_error(
+                    f"File too large: {len(pdf_bytes) / (1024 * 1024):.1f}MB "
+                    f"(limit {ASYNC_MAX_MB:.0f}MB)",
+                    status=413,
+                    error_type="FileTooLarge",
+                )
 
             if not pdf_bytes[:5] == b'%PDF-':
-                return jsonify({"success": False, "error": "Invalid PDF file"}), 400
+                return _request_error("Invalid PDF file")
 
             task_data['pdf_bytes'] = pdf_bytes
             logger.info(f"Compress request with base64: {len(pdf_bytes) / (1024*1024):.1f}MB")
 
         else:
-            return jsonify({
-                "success": False,
-                "error": "Missing file_download_link or file_content_base64"
-            }), 400
+            return _request_error("Missing file_download_link or file_content_base64")
 
         # Optional PDF.co-style fields (no-ops when absent)
         if isinstance(data.get("pages"), str):
@@ -1561,25 +1591,45 @@ def compress():
         if matter_id is not None:
             task_data["matter_id"] = matter_id
         if isinstance(data.get("callbackUrl"), str):
-            task_data["callbackUrl"] = data["callbackUrl"]
+            callback_url = data["callbackUrl"]
+        if callback_url is None and isinstance(data.get("callback"), str):
+            callback_url = data["callback"]
         if data.get("async") is True:
             task_data["force_async"] = True  # retained for compatibility; processing is async already
 
     # Option 3: Multipart form upload
     else:
-        if 'pdf' not in request.files:
-            return jsonify({"success": False, "error": "Missing 'pdf' field"}), 400
-        f = request.files['pdf']
-        if not f.filename:
-            return jsonify({"success": False, "error": "No file selected"}), 400
+        upload = request.files.get('pdf') or request.files.get('file')
+        if not upload:
+            return _request_error("Missing 'pdf' field")
+        if not upload.filename:
+            return _request_error("No file selected")
 
-        pdf_bytes = f.read()
+        pdf_bytes = upload.read()
+        if len(pdf_bytes) > max_upload_bytes:
+            return _request_error(
+                f"File too large: {len(pdf_bytes) / (1024 * 1024):.1f}MB "
+                f"(limit {ASYNC_MAX_MB:.0f}MB)",
+                status=413,
+                error_type="FileTooLarge",
+            )
         if not pdf_bytes[:5] == b'%PDF-':
-            return jsonify({"success": False, "error": "Invalid PDF file"}), 400
+            return _request_error("Invalid PDF file")
 
         task_data['pdf_bytes'] = pdf_bytes
-        task_data["name"] = f.filename
+        task_data["name"] = upload.filename
         logger.info(f"Compress request with upload: {len(pdf_bytes) / (1024*1024):.1f}MB")
+
+    if matter_id and not callback_url:
+        callback_url = os.environ.get("SALESFORCE_CALLBACK_URL")
+        if not callback_url:
+            return _request_error("SALESFORCE_CALLBACK_URL not configured", status=500, error_type="ConfigError")
+
+    if callback_url:
+        task_data["callback_url"] = callback_url
+        base_url_hint = (BASE_URL or request.url_root.rstrip('/')).rstrip('/')
+        if base_url_hint:
+            task_data["base_url"] = base_url_hint
 
     # Create job and enqueue for processing
     job_id = job_queue.create_job()
@@ -1590,14 +1640,19 @@ def compress():
         return jsonify({
             "success": False,
             "error": "Server is busy. Please retry shortly.",
-            "error_type": "ServerBusy"
+            "error_type": "ServerBusy",
+            "error_message": "Server is busy. Please retry shortly.",
         }), 503
 
-    return jsonify({
+    response = {
         "success": True,
         "job_id": job_id,
         "status_url": f"/status/{job_id}"
-    }), 202
+    }
+    if matter_id:
+        response["matterId"] = matter_id
+        response["message"] = "Processing started"
+    return jsonify(response), 202
 
 
 @app.route('/status/<job_id>', methods=['GET'])
@@ -1607,7 +1662,7 @@ def get_status(job_id: str):
     Get the status of a compression job.
 
     Args:
-        job_id: The job identifier from /compress response.
+        job_id: The job identifier from /compress-async response.
 
     Returns:
         Job status and results when completed.
@@ -1716,6 +1771,11 @@ def job_check_pdfco():
 
     if job.status == "failed":
         payload["error"] = job.error or "Job failed"
+        if job.result and isinstance(job.result, dict):
+            if "error_type" in job.result:
+                payload["error_type"] = job.result["error_type"]
+            if "error_message" in job.result:
+                payload["error_message"] = job.result["error_message"]
     if job.status == "completed" and job.result:
         # Return download links when available for parity.
         links = job.result.get("download_links") or job.result.get("files") or []
@@ -1729,368 +1789,6 @@ def job_check_pdfco():
     return jsonify(payload), 200
 
 
-@app.route('/compress-sync', methods=['POST'])
-@require_auth
-def compress_sync():
-    """
-    Synchronous compression endpoint - handles both Salesforce and dashboard requests.
-    Blocks until complete, returns download URLs directly.
-
-    Accepts two input methods:
-    1. JSON body: {"file_download_link": "https://..."} - for Salesforce/API calls
-    2. Form-data: file field with PDF upload - for dashboard testing
-
-    Response: {"success": true, "files": ["/download/part1.pdf", ...]}
-    Large files may be auto-queued and return 202 + job_id for polling.
-    """
-    # Generate unique ID for this request (supports concurrent users)
-    file_id = str(uuid.uuid4()).replace('-', '')[:16]
-    input_path = UPLOAD_FOLDER / f"{file_id}_input.pdf"
-    name_hint: str | None = None
-    split_override: float | None = None
-    split_threshold_mb = None
-    split_trigger_mb = None
-
-    try:
-        # Dual input handling - JSON (Salesforce) or form-data (Dashboard)
-        if request.is_json:
-            # Salesforce/API flow - download PDF from URL
-            data = request.get_json(silent=True)
-            if not isinstance(data, dict):
-                return jsonify({
-                    "success": False,
-                    "error": "Invalid JSON body",
-                    "error_type": "InvalidJSON",
-                    "error_message": "Invalid JSON body"
-                }), 400
-            split_override_raw = data.get("split_threshold_mb")
-            if split_override_raw is None:
-                split_override_raw = data.get("splitSizeMB")
-            split_override = _resolve_split_threshold_mb(split_override_raw)
-            if split_override is not None:
-                split_threshold_mb = split_override
-                split_trigger_mb = split_override
-            file_url = data.get('file_download_link') or data.get('file_url')
-            if isinstance(data.get("name"), str):
-                name_hint = data["name"]
-            matter_id = data.get('matterId')  # Salesforce sends camelCase
-            if not file_url:
-                return jsonify({
-                    "success": False,
-                    "error": "Missing file_download_link",
-                    "error_type": "MissingParameter",
-                    "error_message": "Missing file_download_link"
-                }), 400
-
-            # If matterId is provided, switch to async callback flow to avoid Salesforce timeout
-            if matter_id:
-                callback_url = os.environ.get("SALESFORCE_CALLBACK_URL")
-                if not callback_url:
-                    return jsonify({
-                        "success": False,
-                        "error": "SALESFORCE_CALLBACK_URL not configured"
-                    }), 500
-
-                base_url_hint = BASE_URL or request.url_root.rstrip('/')
-                job_id = job_queue.create_job()
-                task_data = {
-                    "download_url": file_url,
-                    "matter_id": matter_id,
-                    "callback_url": callback_url,
-                    "base_url": base_url_hint,
-                }
-                if split_override is not None:
-                    task_data["split_threshold_mb"] = split_override
-                if not name_hint:
-                    name_hint = file_url
-                if name_hint:
-                    task_data["name"] = name_hint
-                try:
-                    job_queue.enqueue(job_id, task_data)
-                except Exception as e:
-                    logger.warning(f"[{job_id}] Queue full or enqueue failed: {e}")
-                    return jsonify({
-                        "success": False,
-                        "error": "Server is busy. Please retry shortly.",
-                        "error_type": "ServerBusy"
-                    }), 503
-
-                logger.info(f"[{job_id}] Async callback flow started for matterId={matter_id}")
-                return jsonify({
-                    "success": True,
-                    "message": "Processing started",
-                    "matterId": matter_id,
-                    "job_id": job_id
-                }), 202
-
-            parsed = urlparse(file_url)
-            host_hint = parsed.hostname or "unknown-host"
-            path_hint = (parsed.path or "")[:50]
-            logger.info(f"[sync:{file_id}] Downloading from host={host_hint} path={path_hint}...")
-            if not name_hint:
-                name_hint = file_url
-            utils.download_pdf(
-                file_url,
-                input_path,
-                max_download_size_bytes=int(SYNC_MAX_MB * 1024 * 1024),
-            )
-            # Validate downloaded file is actually a PDF
-            with open(input_path, 'rb') as f:
-                header = f.read(5)
-            if header != b'%PDF-':
-                input_path.unlink(missing_ok=True)
-                return jsonify({
-                    "success": False,
-                    "error": "Downloaded file is not a valid PDF",
-                    "error_type": "InvalidPDF",
-                    "error_message": "Downloaded file is not a valid PDF"
-                }), 400
-            downloaded_mb = input_path.stat().st_size / (1024 * 1024)
-            if split_threshold_mb is not None:
-                logger.info(
-                    f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB "
-                    f"(will split if > {split_trigger_mb}MB into {split_threshold_mb}MB parts)"
-                )
-            else:
-                logger.info(f"[sync:{file_id}] Downloaded: {downloaded_mb:.1f}MB (split=off)")
-
-        elif request.files and 'file' in request.files:
-            # Dashboard flow - direct file upload
-            f = request.files['file']
-            if not f.filename:
-                return jsonify({
-                    "success": False,
-                    "error": "No file selected",
-                    "error_type": "MissingFile",
-                    "error_message": "No file selected"
-                }), 400
-            pdf_bytes = f.read()
-            if len(pdf_bytes) < 5 or pdf_bytes[:5] != b'%PDF-':
-                return jsonify({
-                    "success": False,
-                    "error": "Invalid PDF file",
-                    "error_type": "InvalidPDF",
-                    "error_message": "Invalid PDF file"
-                }), 400
-            input_path.write_bytes(pdf_bytes)
-            name_hint = f.filename
-            logger.info(f"[sync:{file_id}] Received upload: {f.filename} ({len(pdf_bytes) / (1024*1024):.1f}MB)")
-
-        else:
-            msg = "No file or URL provided. Send JSON with file_download_link or form-data with file field."
-            return jsonify({
-                "success": False,
-                "error": msg,
-                "error_type": "MissingFile",
-                "error_message": msg
-            }), 400
-
-        track_file(input_path)
-
-        # Check file size - reject files over configured or hard limit for sync endpoint
-        file_size_mb = input_path.stat().st_size / (1024 * 1024)
-
-        if file_size_mb > SYNC_MAX_MB:
-            logger.warning(
-                f"[sync:{file_id}] File too large for sync: {file_size_mb:.1f}MB > {SYNC_MAX_MB:.1f}MB limit "
-                f"(hard cap {HARD_SYNC_LIMIT_MB:.0f}MB, Azure HTTP timeout is ~230s)"
-            )
-            input_path.unlink(missing_ok=True)
-            with file_lock:
-                tracked_files.pop(str(input_path), None)
-            return jsonify({
-                "success": False,
-                "error": f"File too large for sync ({file_size_mb:.1f}MB). Max allowed: {SYNC_MAX_MB:.0f}MB.",
-                "error_type": "FileTooLarge",
-                "error_message": f"File exceeds sync processing limit. Azure HTTP timeout is ~230s; split the file and retry.",
-                "recommendation": "Pre-split the file into smaller parts before upload or use the async endpoint"
-            }), 413
-
-        auto_async_mb = min(SYNC_AUTO_ASYNC_MB, SYNC_MAX_MB)
-        if file_size_mb > auto_async_mb:
-            job_id = job_queue.create_job()
-            task_data = {
-                "input_path": str(input_path),
-            }
-            if split_override is not None:
-                task_data["split_threshold_mb"] = split_override
-            try:
-                job_queue.enqueue(job_id, task_data)
-            except Exception as e:
-                logger.warning(f"[{job_id}] Queue full or enqueue failed: {e}")
-                input_path.unlink(missing_ok=True)
-                with file_lock:
-                    tracked_files.pop(str(input_path), None)
-                return jsonify({
-                    "success": False,
-                    "error": "Server is busy. Please retry shortly.",
-                    "error_type": "ServerBusy"
-                }), 503
-
-            logger.info(
-                f"[sync:{file_id}] Auto-async for {file_size_mb:.1f}MB (> {auto_async_mb:.1f}MB). "
-                f"Job queued as {job_id}."
-            )
-            return jsonify({
-                "success": True,
-                "status": "processing",
-                "job_id": job_id,
-                "status_url": f"/status/{job_id}",
-                "message": "Large file queued for async processing. Poll status_url for results."
-            }), 202
-
-        # Run compression with a timeout to avoid gateway kills
-        def run_compress():
-            with _compression_slot(f"sync:{file_id}", input_size_mb=file_size_mb):
-                return compress_pdf(
-                    str(input_path),
-                    working_dir=UPLOAD_FOLDER,
-                    split_threshold_mb=split_threshold_mb,
-                    split_trigger_mb=split_trigger_mb
-                )
-
-        def _verify_output_files(result_data: Dict[str, Any], label: str):
-            output = result_data.get('output_paths', [result_data['output_path']])
-            output = [Path(p) for p in output]
-            logger.info("[%s] Verifying %s output files...", label, len(output))
-
-            for path in output:
-                logger.info("[%s] Checking: %s (absolute: %s)", label, path, path.resolve())
-                if not path.exists():
-                    logger.error("[%s] Output file missing: %s", label, path)
-                    logger.error("[%s] UPLOAD_FOLDER is: %s", label, UPLOAD_FOLDER.resolve())
-                    raise FileNotFoundError("Compression failed - output file not created")
-                if path.stat().st_size == 0:
-                    logger.error("[%s] Output file is empty: %s", label, path)
-                    raise ValueError("Compression failed - output file is empty")
-                track_file(path)
-
-            sizes = result_data.get('part_sizes')
-            if not sizes:
-                sizes = [p.stat().st_size for p in output]
-            return output, sizes
-
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(run_compress)
-        timed_out = False
-        try:
-            result = future.result(timeout=SYNC_TIMEOUT_SECONDS)
-        except FuturesTimeoutError:
-            timed_out = True
-            job_id = job_queue.create_job()
-            logger.error(f"[sync:{file_id}] Timed out after {SYNC_TIMEOUT_SECONDS}s; continuing as async job {job_id}")
-
-            def _finalize_timeout_job(fut):
-                try:
-                    completed = fut.result()
-                    output_paths, part_sizes = _verify_output_files(completed, f"sync-timeout:{file_id}")
-                    _log_output_page_counts(
-                        output_paths,
-                        f"sync-timeout:{file_id}",
-                        completed.get("page_count"),
-                        input_path,
-                    )
-                    _log_job_flags(
-                        f"sync-timeout:{file_id}",
-                        completed,
-                        output_paths,
-                        split_threshold_mb=split_threshold_mb,
-                    )
-                    download_links = _build_download_links(output_paths, name_hint)
-                    files = [build_download_url(link) for link in download_links]
-
-                    job_queue.update_job(job_id, "completed", result={
-                        "was_split": completed.get('was_split', False),
-                        "total_parts": completed.get('total_parts', 1),
-                        "download_links": download_links,
-                        "files": files,
-                        "original_mb": completed.get('original_size_mb'),
-                        "compressed_mb": completed.get('compressed_size_mb'),
-                        "reduction_percent": completed.get('reduction_percent'),
-                        "compression_method": completed.get('compression_method'),
-                        "compression_mode": completed.get('compression_mode'),
-                        "request_id": job_id,
-                        "page_count": completed.get('page_count'),
-                        "part_sizes": part_sizes,
-                    })
-                    logger.info("[%s] Timeout job completed: %s file(s)", job_id, len(download_links))
-                except Exception as exc:
-                    logger.exception("[%s] Timeout job failed: %s", job_id, exc)
-                    job_queue.update_job(job_id, "failed", error=str(exc), result={
-                        "error_type": "UnknownError",
-                        "error_message": str(exc),
-                    })
-
-            future.add_done_callback(_finalize_timeout_job)
-            executor.shutdown(wait=False)
-            return jsonify({
-                "success": True,
-                "status": "processing",
-                "job_id": job_id,
-                "status_url": f"/status/{job_id}",
-                "message": "Processing exceeded sync timeout; poll status_url for results."
-            }), 202
-        finally:
-            if not timed_out:
-                executor.shutdown(wait=True)
-
-        # =====================================================================
-        # CRITICAL: Verify all output files exist before returning download URLs
-        # This prevents 404 errors when files weren't created properly
-        # =====================================================================
-        try:
-            output_paths, part_sizes = _verify_output_files(result, f"sync:{file_id}")
-        except FileNotFoundError:
-            return jsonify({
-                "success": False,
-                "error": "Compression failed - output file not created",
-                "error_type": "OutputMissing",
-                "error_message": "Compression failed - output file not created"
-            }), 500
-        except ValueError:
-            return jsonify({
-                "success": False,
-                "error": "Compression failed - output file is empty",
-                "error_type": "OutputMissing",
-                "error_message": "Compression failed - output file is empty"
-            }), 500
-
-        # Always return part sizes for Salesforce verification
-        _log_output_page_counts(
-            output_paths,
-            f"sync:{file_id}",
-            result.get("page_count"),
-            input_path,
-        )
-        _log_job_flags(
-            f"sync:{file_id}",
-            result,
-            output_paths,
-            split_threshold_mb=split_threshold_mb,
-        )
-        download_links = _build_download_links(output_paths, name_hint)
-        files = [build_download_url(link) for link in download_links]
-
-        logger.info(f"[sync:{file_id}] Complete: {len(files)} file(s), {result['original_size_mb']:.1f}MB → {result['compressed_size_mb']:.1f}MB")
-        logger.info(f"[sync:{file_id}] Download URLs: {files}")
-        return jsonify({
-            "success": True,
-            "files": files,
-            "download_links": files,
-            "original_mb": result['original_size_mb'],
-            "compressed_mb": result['compressed_size_mb'],
-            "was_split": result.get('was_split', False),
-            "total_parts": result.get('total_parts', 1),
-            "part_sizes": part_sizes,  # Individual file sizes in bytes for verification
-            "compression_mode": result.get("compression_mode"),
-        })
-
-    except DownloadError as e:
-        logger.warning(f"[sync:{file_id}] Download error: {e}")
-        return create_error_response(e, get_error_status_code(e))
-    except Exception as e:
-        logger.exception(f"[sync:{file_id}] Failed: {e}")
-        return create_error_response(e, get_error_status_code(e))
 
 
 @app.route('/download/<filename>')
@@ -2159,7 +1857,7 @@ def diagnose(job_id: str):
     and quality warnings. Useful for debugging size discrepancies.
 
     Args:
-        job_id: The job identifier from /compress response.
+        job_id: The job identifier from /compress-async response.
 
     Returns:
         Diagnostic report with file analyses and size verification.

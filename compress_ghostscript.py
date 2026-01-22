@@ -1021,9 +1021,62 @@ def compress_parallel(
                 rebalance_size_before_mb,
             )
 
+    bloat_detected = False
+    bloat_action = None
+    bloat_pct = 0.0
+    if original_size_mb > 0 and combined_mb >= original_size_mb:
+        bloat_detected = True
+        bloat_pct = round(((combined_mb / original_size_mb) - 1) * 100, 1)
+        if split_enabled:
+            logger.warning(
+                "[PARALLEL] Output larger than input (%.1fMB -> %.1fMB, +%.1f%%); splitting original instead",
+                original_size_mb,
+                combined_mb,
+                bloat_pct,
+            )
+            for part in verified_parts:
+                part.unlink(missing_ok=True)
+            try:
+                verified_parts = split_for_delivery(
+                    input_path,
+                    working_dir,
+                    f"{input_path.stem}_original",
+                    split_threshold_mb,
+                    progress_callback=progress_callback,
+                    prefer_binary=True,
+                    skip_optimization_under_threshold=True,
+                )
+                combined_bytes = sum(p.stat().st_size for p in verified_parts)
+                combined_mb = combined_bytes / (1024 * 1024)
+                reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
+                bloat_action = "split_original"
+                bloat_pct = round(((combined_mb / original_size_mb) - 1) * 100, 1)
+            except Exception as exc:
+                logger.warning(
+                    "[PARALLEL] Fallback split of original failed: %s; keeping compressed output",
+                    exc,
+                )
+        else:
+            logger.warning(
+                "[PARALLEL] Output larger than input (%.1fMB -> %.1fMB, +%.1f%%); returning original",
+                original_size_mb,
+                combined_mb,
+                bloat_pct,
+            )
+            merged_path = verified_parts[0] if verified_parts else (working_dir / f"{input_path.stem}_compressed.pdf")
+            if merged_path.resolve() != input_path.resolve():
+                merged_path.unlink(missing_ok=True)
+                shutil.copy2(input_path, merged_path)
+            verified_parts = [merged_path]
+            combined_mb = original_size_mb
+            reduction_percent = 0.0
+            bloat_action = "return_original"
+            bloat_pct = 0.0
+
     logger.info(
         "[PARALLEL] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s, compressed=%s, skipped=%s, "
-        "used_original=%s, split_inflation=%s (%.1f%%), dedupe_parts=%s, merge_fallback=%s",
+        "used_original=%s, split_inflation=%s (%.1f%%), dedupe_parts=%s, merge_fallback=%s, "
+        "bloat_detected=%s, bloat_action=%s, bloat_pct=%.1f%%",
         original_size_mb,
         combined_mb,
         reduction_percent,
@@ -1035,6 +1088,9 @@ def compress_parallel(
         (split_inflation_ratio - 1) * 100,
         "yes" if force_split_dedup else "no",
         "yes" if merge_fallback_used else "no",
+        "yes" if bloat_detected else "no",
+        bloat_action or "none",
+        bloat_pct,
     )
     total_time = time.time() - start_ts
     logger.info(
@@ -1073,4 +1129,7 @@ def compress_parallel(
         "rebalance_size_before_mb": rebalance_size_before_mb,
         "rebalance_size_after_mb": None if rebalance_size_after_mb is None else round(rebalance_size_after_mb, 2),
         "rebalance_time": round(rebalance_time, 2),
+        "bloat_detected": bloat_detected,
+        "bloat_pct": bloat_pct,
+        "bloat_action": bloat_action,
     }
