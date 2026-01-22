@@ -317,12 +317,38 @@ def compress_pdf(
     if not success:
         msg_lower = message.lower()
         timed_out = "timeout" in msg_lower
+        if timed_out and split_requested:
+            logger.warning(
+                "[compress] Serial compression timed out; retrying in parallel for %s",
+                input_path.name,
+            )
+            result = run_parallel()
+            parts = result.get("total_parts") or len(result.get("output_paths", []))
+            out_mb = result.get("compressed_size_mb", 0.0)
+            method = result.get("compression_method", "unknown")
+            logger.info(
+                "[compress] Parallel retry complete: method=%s parts=%s out=%.1fMB",
+                method,
+                parts,
+                out_mb,
+            )
+            return result
         if timed_out and not split_requested and use_parallel:
             logger.warning(
                 "[compress] Serial compression timed out; falling back to parallel for %s",
                 input_path.name,
             )
-            return run_parallel()
+            result = run_parallel()
+            parts = result.get("total_parts") or len(result.get("output_paths", []))
+            out_mb = result.get("compressed_size_mb", 0.0)
+            method = result.get("compression_method", "unknown")
+            logger.info(
+                "[compress] Parallel fallback complete: method=%s parts=%s out=%.1fMB",
+                method,
+                parts,
+                out_mb,
+            )
+            return result
         # Map error message to specific exception type
         if 'password' in msg_lower or 'encrypt' in msg_lower or 'locked' in msg_lower:
             raise EncryptionError.for_file(input_path.name)
