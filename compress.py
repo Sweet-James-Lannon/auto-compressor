@@ -32,7 +32,7 @@ PARALLEL_SERIAL_CUTOFF_MB = 100.0
 
 # Force parallel compression for very high page counts, even when file size is modest.
 PARALLEL_PAGE_THRESHOLD = env_int("PARALLEL_PAGE_THRESHOLD", 600)
-PARALLEL_PAGE_MIN_MB = env_float("PARALLEL_PAGE_MIN_MB", 0.0)
+PARALLEL_PAGE_MIN_MB = env_float("PARALLEL_PAGE_MIN_MB", 50.0)
 PDF_PRECHECK_ENABLED = env_bool("PDF_PRECHECK_ENABLED", True)
 
 # Cap workers to env or available CPU to avoid thrash on small instances

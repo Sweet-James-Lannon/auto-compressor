@@ -132,7 +132,7 @@ try:
 except ValueError:
     ASYNC_WORKERS = _DEFAULT_ASYNC_WORKERS
 MAX_ACTIVE_COMPRESSIONS = max(1, min(2, _EFFECTIVE_CPU))
-SMALL_JOB_THRESHOLD_MB = 50.0
+SMALL_JOB_THRESHOLD_MB = 20.0
 SMALL_JOB_RESERVED_SLOTS = 1 if MAX_ACTIVE_COMPRESSIONS > 1 else 0
 GENERAL_COMPRESSION_SLOTS = max(1, MAX_ACTIVE_COMPRESSIONS - SMALL_JOB_RESERVED_SLOTS)
 COMPRESSION_SEMAPHORE = threading.Semaphore(GENERAL_COMPRESSION_SLOTS)
@@ -937,9 +937,9 @@ def build_health_snapshot() -> Dict[str, Any]:
             "gs_band_buffer_space_mb": utils.env_int("GS_BAND_BUFFER_SPACE_MB", 500),
             "gs_color_downsample_type": os.environ.get("GS_COLOR_DOWNSAMPLE_TYPE", "/Bicubic"),
             "gs_gray_downsample_type": os.environ.get("GS_GRAY_DOWNSAMPLE_TYPE", "/Bicubic"),
-            "gs_color_image_resolution": utils.env_int("GS_COLOR_IMAGE_RESOLUTION", 60),
-            "gs_gray_image_resolution": utils.env_int("GS_GRAY_IMAGE_RESOLUTION", 60),
-            "gs_mono_image_resolution": utils.env_int("GS_MONO_IMAGE_RESOLUTION", 120),
+            "gs_color_image_resolution": utils.env_int("GS_COLOR_IMAGE_RESOLUTION", 50),
+            "gs_gray_image_resolution": utils.env_int("GS_GRAY_IMAGE_RESOLUTION", 50),
+            "gs_mono_image_resolution": utils.env_int("GS_MONO_IMAGE_RESOLUTION", 100),
         },
         "split": {
             "threshold_mb": SPLIT_THRESHOLD_MB,
