@@ -741,16 +741,28 @@ def split_for_delivery(
     skip_optimization_under_threshold: bool = False,
 ) -> List[Path]:
     """Split with optional ultra compression to minimize part count when close to a lower split."""
-    quick_parts = split_by_size_quick(
-        pdf_path,
-        output_dir,
-        base_name,
-        threshold_mb=threshold_mb,
-        skip_optimization_under_threshold=skip_optimization_under_threshold,
-        progress_callback=progress_callback,
+    file_size_mb = get_file_size_mb(pdf_path)
+    try:
+        with open(pdf_path, "rb") as f:
+            total_pages = len(PdfReader(f, strict=False).pages)
+    except Exception:
+        total_pages = None
+
+    quick_allowed = (
+        (file_size_mb > 80 or (total_pages is not None and total_pages > 400))
     )
-    if quick_parts:
-        return quick_parts
+
+    if quick_allowed:
+        quick_parts = split_by_size_quick(
+            pdf_path,
+            output_dir,
+            base_name,
+            threshold_mb=threshold_mb,
+            skip_optimization_under_threshold=skip_optimization_under_threshold,
+            progress_callback=progress_callback,
+        )
+        if quick_parts:
+            return quick_parts
 
     if prefer_binary:
         parts = split_pdf(
