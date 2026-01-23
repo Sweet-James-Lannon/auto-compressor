@@ -562,8 +562,8 @@ def compress_parallel(
         num_chunks_by_pages = math.ceil(total_pages / max_pages_per_chunk)
 
     if original_size_mb >= 200:
-        num_chunks = max(2, min(max_parallel_chunks, num_chunks_by_size))
-        logger.info(f"[PARALLEL] Large file mode: size-based chunks={num_chunks}")
+        num_chunks = max(2, min(max_parallel_chunks, max(num_chunks_by_size, num_chunks_by_pages)))
+        logger.info(f"[PARALLEL] Large file mode: size/page-based chunks={num_chunks}")
     else:
         num_chunks = max(2, min(max_parallel_chunks, max(num_chunks_by_size, num_chunks_by_pages)))
     if total_pages:
@@ -692,6 +692,19 @@ def compress_parallel(
 
         success, message = compress_fn(chunk_path, compressed_path, num_threads=gs_threads)
 
+        # If Ghostscript times out, try an ultra-aggressive retry on the chunk to avoid
+        # returning uncompressed data (common for dense, small PDFs).
+        if not success and isinstance(message, str) and "timeout" in message.lower():
+            logger.warning("[PARALLEL] Chunk %s timed out; retrying ultra-aggressive", chunk_path.name)
+            compressed_path.unlink(missing_ok=True)
+            ultra_path = compressed_path.with_name(f"{compressed_path.stem}_ultra.pdf")
+            ultra_ok, ultra_msg = compress_ultra_aggressive(chunk_path, ultra_path, num_threads=gs_threads)
+            if ultra_ok and ultra_path.exists():
+                return ultra_path, True, f"ULTRA_RETRY: {ultra_msg}"
+            ultra_path.unlink(missing_ok=True)
+            # Fall back to original timeout message if ultra fails
+            return chunk_path, False, message
+
         # If Ghostscript "compression" makes this chunk larger, keep the original chunk.
         # This is common for vector/text-heavy PDFs where re-encoding can bloat output.
         try:
@@ -794,6 +807,88 @@ def compress_parallel(
     )
     compress_time = time.time() - start_ts - split_time
     logger.info("[PERF] Compress: %.1fs", compress_time)
+
+    # Hard fallback: if every chunk timed out/failed, retry whole file with ultra-aggressive
+    # settings so we never return an uncompressed result for dense PDFs.
+    if compressed_ok == 0:
+        logger.warning("[PARALLEL] No chunks compressed successfully; running ultra-aggressive fallback")
+        fallback_path = working_dir / f"{input_path.stem}_ultra_fallback.pdf"
+        ultra_ok, ultra_msg = compress_ultra_aggressive(input_path, fallback_path, num_threads=gs_threads)
+        if ultra_ok and fallback_path.exists():
+            logger.info("[PARALLEL] Ultra fallback succeeded: %s", ultra_msg)
+            for chunk in chunk_paths:
+                chunk.unlink(missing_ok=True)
+            for _, compressed in compressed_chunks:
+                compressed.unlink(missing_ok=True)
+            # Apply splitting if requested
+            if split_enabled and split_threshold_mb and fallback_path.exists():
+                final_parts = split_for_delivery(
+                    fallback_path,
+                    working_dir,
+                    f"{base_name}_ultra",
+                    split_threshold_mb,
+                    progress_callback=progress_callback,
+                    prefer_binary=True,
+                    skip_optimization_under_threshold=True,
+                )
+                combined_bytes = sum(p.stat().st_size for p in final_parts)
+                reduction_percent = ((original_size_mb - (combined_bytes / (1024 * 1024))) / original_size_mb) * 100
+                return {
+                    "output_path": str(final_parts[0]),
+                    "output_paths": [str(p) for p in final_parts],
+                    "original_size_mb": round(original_size_mb, 2),
+                    "compressed_size_mb": round(combined_bytes / (1024 * 1024), 2),
+                    "reduction_percent": round(reduction_percent, 1),
+                    "compression_method": "ghostscript_ultra_fallback",
+                    "compression_mode": compression_mode,
+                    "was_split": len(final_parts) > 1,
+                    "total_parts": len(final_parts),
+                    "success": True,
+                    "page_count": total_pages,
+                    "part_sizes": [p.stat().st_size for p in final_parts],
+                    "parallel_chunks": num_chunks,
+                    "split_inflation": False,
+                    "split_inflation_pct": 0.0,
+                    "dedupe_parts": True,
+                    "merge_fallback": False,
+                    "merge_fallback_time": 0.0,
+                    "rebalance_attempted": False,
+                    "rebalance_applied": False,
+                    "bloat_detected": False,
+                    "bloat_pct": 0.0,
+                    "bloat_action": None,
+                }
+            else:
+                combined_bytes = fallback_path.stat().st_size
+                reduction_percent = ((original_size_mb - (combined_bytes / (1024 * 1024))) / original_size_mb) * 100
+                return {
+                    "output_path": str(fallback_path),
+                    "output_paths": [str(fallback_path)],
+                    "original_size_mb": round(original_size_mb, 2),
+                    "compressed_size_mb": round(combined_bytes / (1024 * 1024), 2),
+                    "reduction_percent": round(reduction_percent, 1),
+                    "compression_method": "ghostscript_ultra_fallback",
+                    "compression_mode": compression_mode,
+                    "was_split": False,
+                    "total_parts": 1,
+                    "success": True,
+                    "page_count": total_pages,
+                    "part_sizes": [combined_bytes],
+                    "parallel_chunks": num_chunks,
+                    "split_inflation": False,
+                    "split_inflation_pct": 0.0,
+                    "dedupe_parts": True,
+                    "merge_fallback": False,
+                    "merge_fallback_time": 0.0,
+                    "rebalance_attempted": False,
+                    "rebalance_applied": False,
+                    "bloat_detected": False,
+                    "bloat_pct": 0.0,
+                    "bloat_action": None,
+                }
+        else:
+            fallback_path.unlink(missing_ok=True)
+            logger.warning("[PARALLEL] Ultra fallback failed (%s); returning original", ultra_msg)
 
     # Early exit: if no chunks were successfully compressed (all failed or skipped), skip merge and return original
     if compressed_ok == 0 and (len(failed_chunks) > 0 or skipped_chunks > 0):
