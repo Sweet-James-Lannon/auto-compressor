@@ -41,6 +41,11 @@ except ValueError:
     SPLIT_ULTRA_JPEGQ = 50
 _ultra_gap = float(os.environ.get("SPLIT_ULTRA_GAP_PCT", "0.12"))
 SPLIT_ULTRA_GAP_PCT: float = max(0.0, min(0.5, _ultra_gap))
+FAST_SPLIT_ENABLED = True
+FAST_SPLIT_MIN_MB = 120.0
+FAST_SPLIT_MIN_PAGES = 2000
+FAST_SPLIT_EXTRA_PARTS = 1
+FAST_SPLIT_MAX_PARTS = 20
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,114 @@ def _should_try_ultra(file_size_mb: float, threshold_mb: float, part_count: int,
     gap = max(0.0, file_size_mb - target_size)
     return (gap / max(file_size_mb, 0.1)) <= gap_pct
 
+
+def _should_use_fast_split(file_size_mb: float, total_pages: int) -> bool:
+    if not FAST_SPLIT_ENABLED:
+        return False
+    return file_size_mb >= FAST_SPLIT_MIN_MB and total_pages >= FAST_SPLIT_MIN_PAGES
+
+
+def _fast_split_by_pages(
+    pdf_path: Path,
+    output_dir: Path,
+    base_name: str,
+    threshold_mb: float,
+    num_parts: int,
+    total_pages: int,
+    skip_optimization_under_threshold: bool,
+) -> Optional[List[Path]]:
+    extra_parts = FAST_SPLIT_EXTRA_PARTS
+    desired_parts = max(2, num_parts + extra_parts)
+    desired_parts = min(desired_parts, total_pages)
+    if FAST_SPLIT_MAX_PARTS > 0:
+        desired_parts = min(desired_parts, FAST_SPLIT_MAX_PARTS)
+    if desired_parts <= 1:
+        return None
+
+    logger.info(
+        "[split_by_size] Fast split fallback: parts=%s (base=%s extra=%s)",
+        desired_parts,
+        num_parts,
+        extra_parts,
+    )
+
+    parts = split_by_pages(pdf_path, output_dir, desired_parts, base_name)
+    final_parts: List[Path] = []
+    oversize = False
+
+    for idx, part in enumerate(parts, start=1):
+        part_size = get_file_size_mb(part)
+        dest = output_dir / f"{base_name}_part{idx}.pdf"
+        dest.unlink(missing_ok=True)
+
+        if part_size <= threshold_mb and skip_optimization_under_threshold:
+            part.rename(dest)
+            final_parts.append(dest)
+        else:
+            success, opt_message = optimize_split_part(part, dest)
+            if success and dest.exists():
+                optimized_size = get_file_size_mb(dest)
+                if optimized_size > part_size:
+                    logger.warning(
+                        "[split_by_size] Fast split optimization increased size for part %s (%.2fMB -> %.2fMB); using raw",
+                        idx,
+                        part_size,
+                        optimized_size,
+                    )
+                    dest.unlink(missing_ok=True)
+                    part.rename(dest)
+                else:
+                    part.unlink(missing_ok=True)
+            else:
+                logger.warning(
+                    "[split_by_size] Fast split optimization failed for part %s: %s; using raw",
+                    idx,
+                    opt_message,
+                )
+                dest.unlink(missing_ok=True)
+                part.rename(dest)
+            final_parts.append(dest)
+
+        final_size = get_file_size_mb(dest)
+        if final_size > threshold_mb:
+            oversize = True
+
+    if oversize:
+        logger.warning("[split_by_size] Fast split produced oversize parts; falling back to size-based splitter...")
+        _cleanup_paths(final_parts)
+        return None
+
+    return final_parts
+
+
+def _maybe_fast_split(
+    pdf_path: Path,
+    output_dir: Path,
+    base_name: str,
+    threshold_mb: float,
+    num_parts: int,
+    total_pages: int,
+    skip_optimization_under_threshold: bool,
+    reason: str,
+) -> Optional[List[Path]]:
+    if not _should_use_fast_split(get_file_size_mb(pdf_path), total_pages):
+        return None
+
+    fast_parts = _fast_split_by_pages(
+        pdf_path,
+        output_dir,
+        base_name,
+        threshold_mb,
+        num_parts,
+        total_pages,
+        skip_optimization_under_threshold,
+    )
+    if fast_parts:
+        logger.info("[split_by_size] Fast split succeeded (%s)", reason)
+        return fast_parts
+
+    logger.warning("[split_by_size] Fast split failed (%s); falling back to size-based splitter...", reason)
+    return None
 def split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: str) -> List[Path]:
     """Split PDF into N parts by page count. Fast - no Ghostscript.
 
@@ -278,10 +391,20 @@ def split_by_size(
     num_parts = max(2, math.ceil(file_size_mb / threshold_mb))
 
     if num_parts > 10:
-        logger.info(
-            "[split_by_size] Expected %s parts; switching to size-based splitter...",
+        logger.info("[split_by_size] Expected %s parts; large file split fallback", num_parts)
+        fast_parts = _maybe_fast_split(
+            pdf_path,
+            output_dir,
+            base_name,
+            threshold_mb,
             num_parts,
+            total_pages,
+            skip_optimization_under_threshold,
+            reason="num_parts",
         )
+        if fast_parts:
+            return fast_parts
+        logger.info("[split_by_size] Switching to size-based splitter...")
         return split_pdf(
             pdf_path,
             output_dir,
@@ -324,6 +447,18 @@ def split_by_size(
             temp_part_path.unlink(missing_ok=True)
             for p in output_paths:
                 p.unlink(missing_ok=True)
+            fast_parts = _maybe_fast_split(
+                pdf_path,
+                output_dir,
+                base_name,
+                threshold_mb,
+                num_parts,
+                total_pages,
+                skip_optimization_under_threshold,
+                reason=f"overage_part_{i+1}",
+            )
+            if fast_parts:
+                return fast_parts
             return split_pdf(
                 pdf_path,
                 output_dir,
@@ -399,6 +534,18 @@ def split_by_size(
             )
             for p in output_paths:
                 p.unlink(missing_ok=True)
+            fast_parts = _maybe_fast_split(
+                pdf_path,
+                output_dir,
+                base_name,
+                threshold_mb,
+                num_parts,
+                total_pages,
+                skip_optimization_under_threshold,
+                reason=f"oversize_part_{i+1}",
+            )
+            if fast_parts:
+                return fast_parts
             return split_pdf(
                 pdf_path,
                 output_dir,
@@ -432,6 +579,19 @@ def split_by_size(
         # Clean up ALL parts before retrying
         for p in output_paths:
             p.unlink(missing_ok=True)
+
+        fast_parts = _maybe_fast_split(
+            pdf_path,
+            output_dir,
+            base_name,
+            threshold_mb,
+            num_parts,
+            total_pages,
+            skip_optimization_under_threshold,
+            reason="oversize_final",
+        )
+        if fast_parts:
+            return fast_parts
 
         # Fallback to size-based splitter
         return split_pdf(

@@ -34,6 +34,8 @@ PARALLEL_SERIAL_CUTOFF_MB = 100.0
 PARALLEL_PAGE_THRESHOLD = env_int("PARALLEL_PAGE_THRESHOLD", 600)
 # Allow page-count forced parallel even for modest-sized files (helps very page-dense PDFs).
 PARALLEL_PAGE_MIN_MB = env_float("PARALLEL_PAGE_MIN_MB", 0.0)
+# Minimum size to force parallel purely by page count (keeps small, dense files on serial first).
+PARALLEL_PAGE_FORCE_MIN_MB = PARALLEL_THRESHOLD_MB
 PDF_PRECHECK_ENABLED = env_bool("PDF_PRECHECK_ENABLED", True)
 
 # Cap workers to env or available CPU to avoid thrash on small instances
@@ -223,18 +225,28 @@ def compress_pdf(
     # Mid-size files (<~100MB or only 1–2 chunks) stay serial to avoid extra parts
     # =========================================================================
     est_chunks = math.ceil(original_size / DEFAULT_TARGET_CHUNK_MB) if DEFAULT_TARGET_CHUNK_MB > 0 else 3
-    force_parallel_by_pages = (
+    page_parallel_candidate = (
         page_count is not None
         and PARALLEL_PAGE_THRESHOLD > 0
         and page_count >= PARALLEL_PAGE_THRESHOLD
         and original_size >= PARALLEL_PAGE_MIN_MB
     )
+    force_parallel_by_pages = page_parallel_candidate and original_size >= PARALLEL_PAGE_FORCE_MIN_MB
     size_parallel = (
         original_size > PARALLEL_THRESHOLD_MB
         and original_size > PARALLEL_SERIAL_CUTOFF_MB
         and est_chunks > 2
     )
-    use_parallel = force_parallel_by_pages or size_parallel
+    use_parallel = force_parallel_by_pages or size_parallel or page_parallel_candidate
+
+    if page_parallel_candidate and not force_parallel_by_pages:
+        logger.info(
+            "[compress] Page count %s >= %s but size %.1fMB < %.1fMB; trying serial first",
+            page_count,
+            PARALLEL_PAGE_THRESHOLD,
+            original_size,
+            PARALLEL_PAGE_FORCE_MIN_MB,
+        )
 
     def run_parallel(reason: str) -> Dict:
         if reason == "page_count":
