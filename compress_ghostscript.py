@@ -149,7 +149,7 @@ def _run_lossless_ghostscript(
 
     try:
         file_mb = input_path.stat().st_size / (1024 * 1024)
-        timeout = max(300, int(file_mb * 5))
+        timeout = max(120, int(file_mb * 3))  # 3 sec/MB, min 2 minutes
 
         logger.info(f"{label} {input_path.name} ({file_mb:.1f}MB)")
 
