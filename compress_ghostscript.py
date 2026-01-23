@@ -310,7 +310,8 @@ def compress_pdf_with_ghostscript(
 
     try:
         file_mb = input_path.stat().st_size / (1024 * 1024)
-        timeout = max(600, int(file_mb * 10))  # 10 sec/MB, min 10 minutes
+        # Scale to size but keep a lower floor so small dense files fail faster.
+        timeout = max(300, int(file_mb * 8))  # 8 sec/MB, min 5 minutes
 
         logger.info(f"Compressing {input_path.name} ({file_mb:.1f}MB)")
 
@@ -407,7 +408,8 @@ def compress_ultra_aggressive(
 
     try:
         file_mb = input_path.stat().st_size / (1024 * 1024)
-        timeout = max(600, int(file_mb * 10))
+        # Match standard compression timeout for consistent failover behavior.
+        timeout = max(300, int(file_mb * 8))  # 8 sec/MB, min 5 minutes
 
         logger.info(
             f"[ULTRA] Compressing {input_path.name} ({file_mb:.1f}MB) "

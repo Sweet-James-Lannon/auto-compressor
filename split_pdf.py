@@ -42,10 +42,20 @@ except ValueError:
 _ultra_gap = float(os.environ.get("SPLIT_ULTRA_GAP_PCT", "0.12"))
 SPLIT_ULTRA_GAP_PCT: float = max(0.0, min(0.5, _ultra_gap))
 FAST_SPLIT_ENABLED = True
-FAST_SPLIT_MIN_MB = 120.0
-FAST_SPLIT_MIN_PAGES = 2000
-FAST_SPLIT_EXTRA_PARTS = 1
+# Lower gates so fast split is the default path for user-chosen thresholds.
+FAST_SPLIT_MIN_MB = 30.0
+FAST_SPLIT_MIN_PAGES = 100
+FAST_SPLIT_EXTRA_PARTS = 2
 FAST_SPLIT_MAX_PARTS = 20
+_size_tolerance = os.environ.get("SPLIT_SIZE_TOLERANCE_PCT", "0.12")
+try:
+    SPLIT_SIZE_TOLERANCE_PCT = max(0.0, min(0.5, float(_size_tolerance)))
+except ValueError:
+    SPLIT_SIZE_TOLERANCE_PCT = 0.12
+try:
+    SPLIT_QUICK_MAX_ATTEMPTS = max(1, int(os.environ.get("SPLIT_QUICK_MAX_ATTEMPTS", "4")))
+except ValueError:
+    SPLIT_QUICK_MAX_ATTEMPTS = 4
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +199,127 @@ def _maybe_fast_split(
 
     logger.warning("[split_by_size] Fast split failed (%s); falling back to size-based splitter...", reason)
     return None
+
+
+def split_by_size_quick(
+    pdf_path: Path,
+    output_dir: Path,
+    base_name: str,
+    threshold_mb: float,
+    skip_optimization_under_threshold: bool = False,
+    progress_callback: Optional[Callable[[int, str, str], None]] = None,
+) -> List[Path]:
+    """
+    Fast, tolerance-based splitter for UI thresholds (5MB/30MB).
+
+    We aim to land within SPLIT_SIZE_TOLERANCE_PCT of the threshold without
+    binary-searching pages. If we can't reach the target within the attempt
+    budget, we return the closest parts generated.
+    """
+    pdf_path = Path(pdf_path)
+    output_dir = Path(output_dir)
+
+    if threshold_mb is None or threshold_mb <= 0:
+        return [pdf_path]
+
+    file_size_mb = get_file_size_mb(pdf_path)
+    if file_size_mb <= threshold_mb:
+        logger.info(f"[split_quick] PDF {file_size_mb:.1f}MB already under {threshold_mb}MB, no split needed")
+        return [pdf_path]
+
+    try:
+        with open(pdf_path, "rb") as f:
+            reader = PdfReader(f, strict=False)
+            if reader.is_encrypted:
+                try:
+                    reader.decrypt("")
+                    logger.info(f"[split_quick] {pdf_path.name} flagged encrypted; attempted empty password and continuing split.")
+                except Exception as de:
+                    logger.warning(f"[split_quick] {pdf_path.name} decrypt attempt failed ({de}), continuing anyway.")
+            total_pages = len(reader.pages)
+    except Exception as exc:
+        logger.warning(f"[split_quick] Falling back: could not pre-read PDF ({exc})")
+        return []
+
+    if total_pages == 0:
+        raise StructureError.for_file(pdf_path.name, "PDF has no pages")
+
+    tolerance_limit = threshold_mb * (1 + SPLIT_SIZE_TOLERANCE_PCT)
+    max_parts = total_pages
+    num_parts = max(2, math.ceil(file_size_mb / threshold_mb))
+    attempt = 0
+
+    logger.info(
+        "[split_quick] Target %.1fMB parts (tolerance %.0f%%, attempts %s)",
+        threshold_mb,
+        SPLIT_SIZE_TOLERANCE_PCT * 100,
+        SPLIT_QUICK_MAX_ATTEMPTS,
+    )
+
+    last_parts: List[Path] = []
+    last_max_size = 0.0
+
+    while attempt < SPLIT_QUICK_MAX_ATTEMPTS and num_parts <= max_parts:
+        if progress_callback:
+            progress_callback(70, "splitting", f"Quick split attempt {attempt + 1} ({num_parts} parts)...")
+
+        chunk_paths = split_by_pages(pdf_path, output_dir, num_parts, f"{base_name}_quick")
+        final_parts: List[Path] = []
+        max_part_size = 0.0
+
+        for idx, chunk in enumerate(chunk_paths, 1):
+            dest = output_dir / f"{base_name}_part{idx}.pdf"
+            dest.unlink(missing_ok=True)
+            part_size = get_file_size_mb(chunk)
+
+            if part_size <= threshold_mb and skip_optimization_under_threshold:
+                chunk.rename(dest)
+            else:
+                success, _ = optimize_split_part(chunk, dest)
+                if success and dest.exists():
+                    chunk.unlink(missing_ok=True)
+                    part_size = get_file_size_mb(dest)
+                else:
+                    dest.unlink(missing_ok=True)
+                    chunk.rename(dest)
+                    part_size = get_file_size_mb(dest)
+
+            final_parts.append(dest)
+            max_part_size = max(max_part_size, part_size)
+
+        last_parts = final_parts
+        last_max_size = max_part_size
+
+        if max_part_size <= tolerance_limit:
+            if max_part_size > threshold_mb:
+                logger.info(
+                    "[split_quick] Accepting parts within tolerance: max %.1fMB (limit %.1fMB, tolerance %.1fMB)",
+                    max_part_size,
+                    threshold_mb,
+                    tolerance_limit,
+                )
+            return final_parts
+
+        logger.info(
+            "[split_quick] Attempt %s: max part %.1fMB > tolerance %.1fMB; bumping part count",
+            attempt + 1,
+            max_part_size,
+            tolerance_limit,
+        )
+
+        if attempt + 1 >= SPLIT_QUICK_MAX_ATTEMPTS or num_parts >= max_parts:
+            logger.warning(
+                "[split_quick] Reached attempt/part cap; returning closest split (max %.1fMB, limit %.1fMB)",
+                max_part_size,
+                threshold_mb,
+            )
+            return final_parts
+
+        _cleanup_paths(final_parts)
+        attempt += 1
+        num_parts = min(max_parts, num_parts + 1)
+
+    return last_parts
 def split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: str) -> List[Path]:
     """Split PDF into N parts by page count. Fast - no Ghostscript.
 
@@ -620,6 +751,17 @@ def split_for_delivery(
     skip_optimization_under_threshold: bool = False,
 ) -> List[Path]:
     """Split with optional ultra compression to minimize part count when close to a lower split."""
+    quick_parts = split_by_size_quick(
+        pdf_path,
+        output_dir,
+        base_name,
+        threshold_mb=threshold_mb,
+        skip_optimization_under_threshold=skip_optimization_under_threshold,
+        progress_callback=progress_callback,
+    )
+    if quick_parts:
+        return quick_parts
+
     if prefer_binary:
         parts = split_pdf(
             pdf_path,
