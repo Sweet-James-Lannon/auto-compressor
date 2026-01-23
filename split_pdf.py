@@ -270,19 +270,9 @@ def split_by_size_quick(
         for idx, chunk in enumerate(chunk_paths, 1):
             dest = output_dir / f"{base_name}_part{idx}.pdf"
             dest.unlink(missing_ok=True)
-            part_size = get_file_size_mb(chunk)
-
-            if part_size <= threshold_mb and skip_optimization_under_threshold:
-                chunk.rename(dest)
-            else:
-                success, _ = optimize_split_part(chunk, dest)
-                if success and dest.exists():
-                    chunk.unlink(missing_ok=True)
-                    part_size = get_file_size_mb(dest)
-                else:
-                    dest.unlink(missing_ok=True)
-                    chunk.rename(dest)
-                    part_size = get_file_size_mb(dest)
+            # Quick path: keep raw chunk to avoid costly optimization loops.
+            chunk.rename(dest)
+            part_size = get_file_size_mb(dest)
 
             final_parts.append(dest)
             max_part_size = max(max_part_size, part_size)

@@ -21,7 +21,7 @@ MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(TARGET_CHUNK_MB * 1.5)))
 MAX_PARALLEL_CHUNKS = int(os.environ.get("MAX_PARALLEL_CHUNKS", "16"))
 MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
 # Minimum chunk size to avoid spawning tiny Ghostscript jobs that add overhead.
-MIN_CHUNK_MB = 20.0
+MIN_CHUNK_MB = 5.0
 # Large-file tuning defaults (used only when chunk env vars are not set).
 LARGE_FILE_TUNE_MIN_MB = 200.0
 LARGE_FILE_TARGET_CHUNK_MB = 60.0
@@ -512,6 +512,13 @@ def compress_parallel(
     tuned_max_pages = MAX_PAGES_PER_CHUNK
 
     has_chunk_env = "TARGET_CHUNK_MB" in os.environ or "MAX_CHUNK_MB" in os.environ
+    dense_small = (
+        compression_mode == "aggressive"
+        and input_page_count is not None
+        and input_page_count >= 900
+        and original_size_mb <= 80
+    )
+
     if original_size_mb >= LARGE_FILE_TUNE_MIN_MB and compression_mode == "aggressive":
         if not has_chunk_env:
             tuned_target = max(tuned_target, LARGE_FILE_TARGET_CHUNK_MB)
@@ -529,6 +536,20 @@ def compress_parallel(
             logger.info(
                 "[PARALLEL] Large file tuning skipped; explicit chunk env override present",
             )
+
+    if dense_small and not has_chunk_env:
+        tuned_target = min(tuned_target, 20.0)
+        tuned_max_chunk = max(30.0, tuned_target * 1.5)
+        tuned_max_pages = min(tuned_max_pages, 400)
+        tuned_max_chunks = max(tuned_max_chunks, 8)
+        logger.info(
+            "[PARALLEL] Dense-small tuning (pages=%s size=%.1fMB): target %.1fMB max %.1fMB max_pages/chunk %s",
+            input_page_count,
+            original_size_mb,
+            tuned_target,
+            tuned_max_chunk,
+            tuned_max_pages,
+        )
 
     target_chunk_mb = max(MIN_CHUNK_MB, tuned_target)
     max_chunk_mb = max(target_chunk_mb, tuned_max_chunk)
@@ -681,14 +702,6 @@ def compress_parallel(
         """Compress a single chunk and return result."""
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
-
-        # Skip GS if chunk is below minimum size; likely not worth recompressing.
-        try:
-            chunk_mb = get_file_size_mb(chunk_path)
-        except Exception:
-            chunk_mb = None
-        if not force_dedup and chunk_mb is not None and chunk_mb <= MIN_CHUNK_MB:
-            return chunk_path, True, f"SKIPPED: {chunk_mb:.1f}MB < {MIN_CHUNK_MB:.1f}MB"
 
         success, message = compress_fn(chunk_path, compressed_path, num_threads=gs_threads)
 
