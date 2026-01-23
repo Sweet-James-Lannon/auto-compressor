@@ -795,6 +795,66 @@ def compress_parallel(
     compress_time = time.time() - start_ts - split_time
     logger.info("[PERF] Compress: %.1fs", compress_time)
 
+    # Early exit: if no chunks were successfully compressed (all failed or skipped), skip merge and return original
+    if compressed_ok == 0 and (len(failed_chunks) > 0 or skipped_chunks > 0):
+        logger.warning(
+            "[PARALLEL] No chunks compressed successfully (%s skipped, %s failed); returning original",
+            skipped_chunks,
+            len(failed_chunks),
+        )
+        # Cleanup chunk files
+        for chunk in chunk_paths:
+            chunk.unlink(missing_ok=True)
+        for _, compressed in compressed_chunks:
+            compressed.unlink(missing_ok=True)
+
+        # Copy original to expected output path
+        output_path = working_dir / f"{base_name}_compressed.pdf"
+        shutil.copy2(input_path, output_path)
+
+        total_time = time.time() - start_ts
+        logger.info(
+            "[PARALLEL_METRICS] total=%.1fs split=%.1fs compress=%.1fs split_parts=0.0s (early_exit)",
+            total_time,
+            split_time,
+            compress_time,
+        )
+        report_progress(100, "finalizing", "Returning original file (compression not beneficial)...")
+
+        return {
+            "output_path": str(output_path),
+            "output_paths": [str(output_path)],
+            "original_size_mb": round(original_size_mb, 2),
+            "compressed_size_mb": round(original_size_mb, 2),
+            "reduction_percent": 0.0,
+            "compression_method": "ghostscript_parallel",
+            "compression_mode": compression_mode,
+            "was_split": False,
+            "total_parts": 1,
+            "success": True,
+            "page_count": total_pages,
+            "part_sizes": [input_path.stat().st_size],
+            "parallel_chunks": num_chunks,
+            "split_inflation": split_inflation,
+            "split_inflation_pct": round((split_inflation_ratio - 1) * 100, 1),
+            "dedupe_parts": force_split_dedup,
+            "merge_fallback": False,
+            "merge_fallback_time": 0.0,
+            "rebalance_attempted": False,
+            "rebalance_applied": False,
+            "rebalance_reason": None,
+            "rebalance_parts_before": 1,
+            "rebalance_parts_after": 1,
+            "rebalance_size_before_mb": round(original_size_mb, 2),
+            "rebalance_size_after_mb": None,
+            "rebalance_time": 0.0,
+            "bloat_detected": False,
+            "bloat_pct": 0.0,
+            "bloat_action": None,
+            "early_exit": True,
+            "early_exit_reason": "no_compression_achieved",
+        }
+
     # Step 4: Merge compressed chunks for consistent results, then split if required.
     split_enabled = split_threshold_mb is not None and split_threshold_mb > 0
     effective_split_trigger_mb = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
@@ -1144,4 +1204,6 @@ def compress_parallel(
         "bloat_detected": bloat_detected,
         "bloat_pct": bloat_pct,
         "bloat_action": bloat_action,
+        "early_exit": False,
+        "early_exit_reason": None,
     }
