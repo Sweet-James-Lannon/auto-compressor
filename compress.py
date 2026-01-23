@@ -34,8 +34,8 @@ PARALLEL_SERIAL_CUTOFF_MB = 100.0
 PARALLEL_PAGE_THRESHOLD = env_int("PARALLEL_PAGE_THRESHOLD", 600)
 # Allow page-count forced parallel even for modest-sized files (helps very page-dense PDFs).
 PARALLEL_PAGE_MIN_MB = env_float("PARALLEL_PAGE_MIN_MB", 0.0)
-# Minimum size to force parallel purely by page count (set to 0 to always parallelize dense files).
-PARALLEL_PAGE_FORCE_MIN_MB = env_float("PARALLEL_PAGE_FORCE_MIN_MB", 0.0)
+# Minimum size to force parallel purely by page count (keeps small, dense files on serial first).
+PARALLEL_PAGE_FORCE_MIN_MB = PARALLEL_THRESHOLD_MB
 PDF_PRECHECK_ENABLED = env_bool("PDF_PRECHECK_ENABLED", True)
 
 # Cap workers to env or available CPU to avoid thrash on small instances
