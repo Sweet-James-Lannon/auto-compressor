@@ -32,7 +32,8 @@ PARALLEL_SERIAL_CUTOFF_MB = 100.0
 
 # Force parallel compression for very high page counts, even when file size is modest.
 PARALLEL_PAGE_THRESHOLD = env_int("PARALLEL_PAGE_THRESHOLD", 600)
-PARALLEL_PAGE_MIN_MB = env_float("PARALLEL_PAGE_MIN_MB", 50.0)
+# Allow page-count forced parallel even for modest-sized files (helps very page-dense PDFs).
+PARALLEL_PAGE_MIN_MB = env_float("PARALLEL_PAGE_MIN_MB", 0.0)
 PDF_PRECHECK_ENABLED = env_bool("PDF_PRECHECK_ENABLED", True)
 
 # Cap workers to env or available CPU to avoid thrash on small instances
@@ -228,32 +229,30 @@ def compress_pdf(
         and page_count >= PARALLEL_PAGE_THRESHOLD
         and original_size >= PARALLEL_PAGE_MIN_MB
     )
-    use_parallel = (
-        force_parallel_by_pages
-        or (
-            original_size > PARALLEL_THRESHOLD_MB
-            and original_size > PARALLEL_SERIAL_CUTOFF_MB
-            and est_chunks > 2
-        )
+    size_parallel = (
+        original_size > PARALLEL_THRESHOLD_MB
+        and original_size > PARALLEL_SERIAL_CUTOFF_MB
+        and est_chunks > 2
     )
+    use_parallel = force_parallel_by_pages or size_parallel
 
-    def run_parallel() -> Dict:
-        if force_parallel_by_pages:
+    def run_parallel(reason: str) -> Dict:
+        if reason == "page_count":
             logger.info(
-                "[PARALLEL] Page count %s >= %s; forcing parallel compression",
+                "[PARALLEL] Page count %s >= %s; using parallel compression",
                 page_count,
                 PARALLEL_PAGE_THRESHOLD,
             )
+        elif reason == "size":
             logger.info(
-                "[PARALLEL] Using parallel compression for %.1fMB file (est_chunks=%s)",
+                "[PARALLEL] Large file %.1fMB (est_chunks=%s); using parallel compression",
                 original_size,
                 est_chunks,
             )
+        elif reason == "timeout":
+            logger.info("[PARALLEL] Serial compression timed out; switching to parallel")
         else:
-            logger.info(
-                f"[PARALLEL] File {original_size:.1f}MB > {PARALLEL_THRESHOLD_MB}MB threshold "
-                f"and > {PARALLEL_SERIAL_CUTOFF_MB}MB cutoff, using parallel compression (est_chunks={est_chunks})"
-            )
+            logger.info("[PARALLEL] Using parallel compression (reason=%s)", reason)
         effective_cpu = get_effective_cpu_count()
         max_workers, env_workers = _resolve_parallel_workers(effective_cpu)
         env_label = env_workers if env_workers is not None else "unset"
@@ -293,13 +292,24 @@ def compress_pdf(
             input_page_count=page_count,
         )
 
-    if split_requested and use_parallel:
+    if force_parallel_by_pages:
         logger.info(
-            "[compress] Split requested; using serial compression for maximum savings "
+            "[compress] Page count %s >= %s; using parallel compression to avoid serial timeouts",
+            page_count,
+            PARALLEL_PAGE_THRESHOLD,
+        )
+        return run_parallel("page_count")
+    if size_parallel:
+        if split_requested:
+            logger.info("[compress] Large file with split requested; using parallel compression for speed")
+        else:
+            logger.info("[compress] Large file detected; using parallel compression for speed")
+        return run_parallel("size")
+    if split_requested:
+        logger.info(
+            "[compress] Split requested; trying serial compression first for maximum savings "
             "and falling back to parallel on timeout",
         )
-    elif use_parallel:
-        logger.info("[compress] Split not requested; using serial compression to avoid chunk/merge overhead")
 
     # =========================================================================
     # ROUTE: Small files use serial compression (existing logic)
@@ -325,7 +335,7 @@ def compress_pdf(
                 "[compress] Serial compression timed out; retrying in parallel for %s",
                 input_path.name,
             )
-            result = run_parallel()
+            result = run_parallel("timeout")
             parts = result.get("total_parts") or len(result.get("output_paths", []))
             out_mb = result.get("compressed_size_mb", 0.0)
             method = result.get("compression_method", "unknown")
@@ -341,7 +351,7 @@ def compress_pdf(
                 "[compress] Serial compression timed out; falling back to parallel for %s",
                 input_path.name,
             )
-            result = run_parallel()
+            result = run_parallel("timeout")
             parts = result.get("total_parts") or len(result.get("output_paths", []))
             out_mb = result.get("compressed_size_mb", 0.0)
             method = result.get("compression_method", "unknown")
