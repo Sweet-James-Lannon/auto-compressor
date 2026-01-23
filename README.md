@@ -9,16 +9,20 @@ Requests are always async. The API returns a job ID immediately so the LWC can s
 and poll `/status/<job_id>` for results.
 
 ## Main files (the cast)
-| File | Role | What it does |
-| --- | --- | --- |
-| `app.py` | Front desk | HTTP API, request parsing, job queue, callbacks, dashboard |
-| `job_queue.py` | Waiting room | Holds jobs until workers are available |
-| `compress.py` | Traffic controller | Chooses serial vs parallel compression paths |
-| `compress_ghostscript.py` | Compressor | Runs Ghostscript and parallel chunk compression |
-| `split_pdf.py` | Paper cutter | Splits PDFs into parts for delivery constraints |
-| `utils.py` | Toolbox | Shared helpers (SSRF checks, CPU detection, sizes) |
-| `exceptions.py` | Error translator | Friendly error types for callers |
-| `pdf_diagnostics.py` | Quality inspector | Detects quality risks and warnings |
+```text
++--------------------------+--------------------+------------------------------------------------------+
+| File                     | Role               | What it does                                         |
++--------------------------+--------------------+------------------------------------------------------+
+| app.py                   | Front desk         | HTTP API, request parsing, job queue, callbacks, UI  |
+| job_queue.py             | Waiting room       | Holds jobs until workers are available               |
+| compress.py              | Traffic controller | Chooses serial vs parallel compression paths         |
+| compress_ghostscript.py  | Compressor         | Runs Ghostscript and parallel chunk compression      |
+| split_pdf.py             | Paper cutter       | Splits PDFs into parts for delivery constraints      |
+| utils.py                 | Toolbox            | Shared helpers (SSRF checks, CPU detection, sizes)   |
+| exceptions.py            | Error translator   | Friendly error types for callers                     |
+| pdf_diagnostics.py       | Quality inspector  | Detects quality risks and warnings                   |
++--------------------------+--------------------+------------------------------------------------------+
+```
 
 ## How it works (step by step)
 1) User submits a Docrio file URL (or upload/base64).
@@ -29,12 +33,17 @@ and poll `/status/<job_id>` for results.
 6) If a split size was requested, `split_pdf.py` slices the output into parts.
 7) The LWC polls `/status/<job_id>` and gets download links + quality warnings.
 
+```text
+[User] -> [API] -> [Job queue] -> [compress.py] -> [Ghostscript] -> [split_pdf] -> [Links]
+```
+
 ## Compression decision logic (current defaults)
 - < 1 MB: skip compression (already tiny).
 - 1 to 30 MB: serial Ghostscript.
 - 30 to 100 MB: serial Ghostscript (unless page-heavy rule triggers).
 - > 100 MB: parallel compression (split into chunks, compress in parallel).
-- >= 600 pages: parallel compression even if the file is smaller.
+- >= 600 pages and >= 30 MB: parallel compression.
+- >= 600 pages and < 30 MB: serial first; parallel only if serial times out.
 
 Notes:
 - Size-based parallel uses `PARALLEL_THRESHOLD_MB=30` and `PARALLEL_SERIAL_CUTOFF_MB=100`.
@@ -63,6 +72,7 @@ Lossless mode keeps images and focuses on deduplication only.
 - Splitting happens only when `split_threshold_mb` (or `splitSizeMB`) is provided.
 - If `split_trigger_mb` is set, splitting only occurs when output exceeds the trigger.
 - The splitter uses a size-based binary search to minimize part count.
+- Very large, page-heavy PDFs first try a fast page split (+1 part) to avoid slow binary search.
 - If the output is close to fitting into fewer parts (default 12% gap), it can try an
   ultra pass (JPEG quality 50) to reduce parts when lossy is allowed.
 
