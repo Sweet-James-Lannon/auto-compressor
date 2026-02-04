@@ -145,6 +145,12 @@ def compress_pdf(
     probe_info = None
     probe_bad = False
     bytes_per_page = None
+    composition = {
+        "already_compressed": False,
+        "already_reason": "",
+        "scanned": False,
+        "scan_confidence": 0.0,
+    }
 
     # Validate PDF before processing - catch encrypted files early
     page_count = None
@@ -171,6 +177,34 @@ def compress_pdf(
     original_size = get_file_size_mb(input_path)
     original_bytes = input_path.stat().st_size
     compression_mode = resolve_compression_mode(input_path)
+
+    # ---------------------------------------------------------------------
+    # Composition-aware mode overrides (avoid aggressive on vector/text PDFs
+    # or on files already compressed by upstream tooling).
+    # ---------------------------------------------------------------------
+    try:
+        from pdf_diagnostics import detect_already_compressed, detect_scanned_document
+
+        composition["already_compressed"], composition["already_reason"] = detect_already_compressed(input_path)
+        composition["scanned"], composition["scan_confidence"] = detect_scanned_document(input_path)
+    except Exception as exc:  # diagnostics are best-effort
+        logger.warning(f"[compress] Composition detection failed (continuing): {exc}")
+
+    if composition["already_compressed"]:
+        compression_mode = "lossless"
+        logger.info("[compress] Detected already-compressed PDF (%s); forcing lossless path", composition["already_reason"])
+    elif compression_mode == "aggressive" and not composition["scanned"]:
+        # Mixed/vector-heavy PDFs bloat when forced through /screen; prefer lossless.
+        compression_mode = "lossless"
+        logger.info("[compress] Not scanned (or low confidence); preferring lossless to avoid inflation")
+    elif compression_mode == "aggressive" and composition["scanned"] and composition["scan_confidence"] < SCANNED_CONFIDENCE_FOR_AGGRESSIVE:
+        compression_mode = "lossless"
+        logger.info(
+            "[compress] Scanned but low confidence (%.1f%% < %.1f%%); using lossless",
+            composition["scan_confidence"],
+            SCANNED_CONFIDENCE_FOR_AGGRESSIVE,
+        )
+
     logger.info(f"[compress] Compression mode: {compression_mode} (allow_lossy={ALLOW_LOSSY_COMPRESSION})")
     effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
     split_requested = split_threshold_mb is not None and split_threshold_mb > 0
@@ -186,6 +220,7 @@ def compress_pdf(
                 "bytes_per_page": bytes_per_page,
                 "probe": probe_info,
                 "probe_bad": probe_bad,
+                "composition": composition,
             },
         )
         return resp
@@ -246,7 +281,7 @@ def compress_pdf(
             probe_info = compress_ghostscript.run_micro_probe(input_path, "lossless")
             probe_bad = (
                 not probe_info.get("success")
-                or probe_info.get("delta_pct", 0) > 5
+                or probe_info.get("delta_pct", 0) > 3
                 or probe_info.get("elapsed", 0) > compress_ghostscript.PROBE_TIME_BUDGET_SEC
             )
             logger.info(

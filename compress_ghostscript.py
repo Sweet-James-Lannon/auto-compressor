@@ -64,8 +64,8 @@ PARALLEL_SERIAL_FALLBACK = env_bool("PARALLEL_SERIAL_FALLBACK", True)
 CHUNK_TIME_BUDGET_SEC = 60
 CHUNK_TIME_BUDGET_MIN_SEC = 40
 CHUNK_TIME_BUDGET_MAX_SEC = 90
-PROBE_TIME_BUDGET_SEC = 12          # seconds
-PROBE_INFLATION_ABORT_PCT = 0.05    # 5% growth triggers bailout
+PROBE_TIME_BUDGET_SEC = 10          # seconds
+PROBE_INFLATION_ABORT_PCT = 0.03    # 3% growth triggers bailout
 PROBE_SAMPLE_PAGES = 3
 PARALLEL_JOB_SLA_SEC = 300          # hard cap for parallel job
 SLA_MAX_PARALLEL_CHUNKS = 5         # cap chunk fan-out in aggressive mode
@@ -734,12 +734,16 @@ def compress_parallel(
             "[PARALLEL] Aggressive mode: skipping pre-dedupe on chunks unless split inflation forces it"
         )
 
-    def compress_single_chunk(chunk_path: Path, force_dedup: bool = False) -> Tuple[Path, bool, str, float]:
+    def compress_single_chunk(
+        chunk_path: Path,
+        force_dedup: bool = False,
+        timeout_override: Optional[int] = None,
+    ) -> Tuple[Path, bool, str, float]:
         """Compress a single chunk and return result."""
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
         chunk_mb = get_file_size_mb(chunk_path)
-        chunk_timeout = _chunk_timeout_seconds(chunk_mb)
+        chunk_timeout = timeout_override or _chunk_timeout_seconds(chunk_mb)
 
         should_dedupe = compression_mode == "lossless" or force_dedup
         if should_dedupe:
@@ -834,7 +838,11 @@ def compress_parallel(
         # aggressive mode because it frequently inflates the chunk and trips
         # the bailout logic. In lossless mode we still allow dedupe.
         probe_force_dedup = force_split_dedup if compression_mode == "lossless" else False
-        probe_result = compress_single_chunk(probe_chunk, probe_force_dedup)
+        probe_result = compress_single_chunk(
+            probe_chunk,
+            probe_force_dedup,
+            timeout_override=PROBE_TIME_BUDGET_SEC,
+        )
         probe_elapsed = time.time() - probe_start
         try:
             probe_path, success, message, probe_mb = probe_result
@@ -1068,7 +1076,7 @@ def compress_parallel(
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         # Submit all compression jobs
         futures = {
-            executor.submit(compress_single_chunk, chunk, force_split_dedup): (idx, chunk)
+            executor.submit(compress_single_chunk, chunk, force_split_dedup, None): (idx, chunk)
             for idx, chunk in tasks
         }
 
