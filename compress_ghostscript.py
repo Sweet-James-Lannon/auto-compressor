@@ -830,7 +830,11 @@ def compress_parallel(
             chunk_sizes[probe_idx],
         )
         probe_start = time.time()
-        probe_result = compress_single_chunk(probe_chunk, force_split_dedup)
+        # For the probe we want to avoid the expensive /default dedupe pass in
+        # aggressive mode because it frequently inflates the chunk and trips
+        # the bailout logic. In lossless mode we still allow dedupe.
+        probe_force_dedup = force_split_dedup if compression_mode == "lossless" else False
+        probe_result = compress_single_chunk(probe_chunk, probe_force_dedup)
         probe_elapsed = time.time() - probe_start
         try:
             probe_path, success, message, probe_mb = probe_result
@@ -879,31 +883,41 @@ def compress_parallel(
                 "[PARALLEL_PROBE] Bailout triggered (%s); returning original to preserve SLA/quality",
                 ", ".join(bailout_reason),
             )
-            # Optional quick lossless attempt (fast, no downsample) if the file is mid-size.
+            merged_path = working_dir / f"{base_name}_compressed.pdf"
+            # Always attempt a quick lossless full-file pass before giving up.
             lossless_path = working_dir / f"{base_name}_lossless_probe.pdf"
             lossless_used = False
-            if original_size_mb <= 180 and (total_pages or 0) <= 1200:
+            ok_lossless = False
+            msg_lossless = ""
+            # Cap the lossless attempt to stay within the 1–5 minute SLA.
+            lossless_timeout = min(240, max(90, int(original_size_mb * 1.2)))
+            try:
                 ok_lossless, msg_lossless = compress_pdf_lossless(
                     input_path,
                     lossless_path,
-                    timeout_override=90,
+                    timeout_override=lossless_timeout,
                 )
-                if ok_lossless and lossless_path.exists():
-                    lossless_mb = get_file_size_mb(lossless_path)
-                    if lossless_mb < original_size_mb:
-                        lossless_used = True
-                        logger.info(
-                            "[PARALLEL_PROBE] Lossless fallback succeeded: %.1fMB -> %.1fMB",
-                            original_size_mb,
-                            lossless_mb,
-                        )
-                        original_bytes = lossless_path.stat().st_size
-                        original_size_mb = lossless_mb
-                        shutil.copy2(lossless_path, merged_path)
-                    lossless_path.unlink(missing_ok=True)
-                else:
-                    if not ok_lossless and "timeout" in (msg_lossless or "").lower():
-                        strategy_outcome["timeouts"]["probe_timeout"] += 1
+            except Exception as exc:
+                msg_lossless = str(exc)
+
+            if ok_lossless and lossless_path.exists():
+                lossless_mb = get_file_size_mb(lossless_path)
+                if lossless_mb < original_size_mb:
+                    lossless_used = True
+                    logger.info(
+                        "[PARALLEL_PROBE] Lossless fallback succeeded: %.1fMB -> %.1fMB (timeout=%ss)",
+                        original_size_mb,
+                        lossless_mb,
+                        lossless_timeout,
+                    )
+                    original_bytes = lossless_path.stat().st_size
+                    original_size_mb = lossless_mb
+                    merged_path.unlink(missing_ok=True)
+                    shutil.copy2(lossless_path, merged_path)
+                lossless_path.unlink(missing_ok=True)
+            else:
+                if not ok_lossless and "timeout" in (msg_lossless or "").lower():
+                    strategy_outcome["timeouts"]["probe_timeout"] += 1
 
             # Cleanup temp chunks
             for p in chunk_paths:
@@ -917,26 +931,31 @@ def compress_parallel(
             merged_path.unlink(missing_ok=True)
             shutil.copy2(input_path, merged_path)
             strategy_outcome["probe_status"] = "bailout"
+            # If lossless fallback produced a smaller file, return it; otherwise return original.
+            compressed_mb = get_file_size_mb(merged_path) if merged_path.exists() else original_size_mb
+            reduction_pct = 0.0
+            if lossless_used and compressed_mb < original_size_mb and original_size_mb > 0:
+                reduction_pct = ((original_size_mb - compressed_mb) / original_size_mb) * 100
             return {
                 "output_path": str(merged_path),
                 "output_paths": [str(merged_path)],
                 "original_size_mb": round(original_size_mb, 2),
-                "compressed_size_mb": round(original_size_mb, 2),
-                "reduction_percent": 0.0,
-                "compression_method": "none",
+                "compressed_size_mb": round(compressed_mb, 2),
+                "reduction_percent": round(reduction_pct, 1),
+                "compression_method": "lossless" if lossless_used else "none",
                 "compression_mode": compression_mode,
-                "quality_mode": "aggressive_150dpi" if compression_mode == "aggressive" else "lossless",
+                "quality_mode": "lossless",
                 "was_split": False,
                 "total_parts": 1,
                 "success": True,
                 "page_count": total_pages,
                 "part_sizes": [original_bytes],
-                "bloat_detected": True,
-                "bloat_action": "probe_bailout",
+                "bloat_detected": not lossless_used,
+                "bloat_action": "lossless_fallback" if lossless_used else "probe_bailout",
                 "probe_bailout": True,
                 "probe_bailout_reason": ", ".join(bailout_reason),
                 "lossless_fallback_used": lossless_used,
-                "note": "Probe showed inflation/slow path; returned original to meet SLA",
+                "note": "Probe showed inflation/slow path; applied lossless fallback before returning",
             }
 
         # Retune remaining chunks based on probe throughput.

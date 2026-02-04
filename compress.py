@@ -242,7 +242,8 @@ def compress_pdf(
     probe_bad = False
     if compression_mode == "aggressive" and original_size >= PARALLEL_THRESHOLD_MB and original_size <= 400 and page_count:
         try:
-            probe_info = compress_ghostscript.run_micro_probe(input_path, compression_mode)
+            # Micro-probe always uses lossless to avoid inflate-y aggressive test runs
+            probe_info = compress_ghostscript.run_micro_probe(input_path, "lossless")
             probe_bad = (
                 not probe_info.get("success")
                 or probe_info.get("delta_pct", 0) > 5
@@ -257,6 +258,12 @@ def compress_pdf(
             )
         except Exception as exc:
             logger.warning("[compress] Micro-probe failed (will ignore): %s", exc)
+
+    # If probe indicates risk, downgrade to lossless path to protect quality/SLA.
+    if probe_bad and compression_mode == "aggressive":
+        logger.info("[compress] Probe indicated risk; downgrading to lossless path")
+        compression_mode = "lossless"
+        quality_mode = "lossless"
 
     # =========================================================================
     # ROUTE: Large files use parallel compression for speed
