@@ -232,9 +232,14 @@ def compress_pdf(
         and original_size >= PARALLEL_PAGE_MIN_MB
     )
     force_parallel_by_pages = page_parallel_candidate and original_size >= PARALLEL_PAGE_FORCE_MIN_MB
+    # For no-split flows, be more conservative about parallelizing midsize files to avoid
+    # heavy split/merge overhead. Require >150MB before size-based parallel if split is off.
     size_parallel = (
         original_size > PARALLEL_THRESHOLD_MB
-        and original_size > PARALLEL_SERIAL_CUTOFF_MB
+        and (
+            (split_requested and original_size > PARALLEL_SERIAL_CUTOFF_MB)
+            or (not split_requested and original_size > 150.0)
+        )
         and est_chunks > 2
     )
     use_parallel = force_parallel_by_pages or size_parallel or page_parallel_candidate
@@ -285,6 +290,10 @@ def compress_pdf(
                 max_chunk_mb,
             )
         else:
+            # No-split path: favor fewer, larger chunks to speed merge and avoid PyPDF2 fallback.
+            if not split_requested and original_size <= 150.0:
+                target_chunk_mb = max(target_chunk_mb, 80.0)
+                max_chunk_mb = max(max_chunk_mb, target_chunk_mb * 1.5)
             logger.info(
                 "[compress] Aggressive mode: standard chunks (target %.1fMB, max %.1fMB)",
                 target_chunk_mb,

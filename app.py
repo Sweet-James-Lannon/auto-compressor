@@ -664,6 +664,14 @@ def _compression_slot(job_id: str | None = None, input_size_mb: float | None = N
         semaphore.release()
 
 
+def _is_truthy(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _resolve_split_threshold_mb(raw_value: Any) -> float | None:
     if raw_value is None:
         return None
@@ -1035,13 +1043,12 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         elif isinstance(task_data.get("download_url"), str):
             name_hint = task_data["download_url"]
 
-        split_override = _resolve_split_threshold_mb(task_data.get("split_threshold_mb"))
-        if split_override is not None:
-            split_threshold_mb = split_override
-            split_trigger_mb = split_override
-        else:
-            split_threshold_mb = None
-            split_trigger_mb = None
+        split_requested = _is_truthy(task_data.get("split"))
+        split_override = _resolve_split_threshold_mb(task_data.get("split_threshold_mb")) if split_requested else None
+        if split_requested and split_override is None:
+            split_override = BASE_SPLIT_THRESHOLD_MB
+        split_threshold_mb = split_override if split_requested else None
+        split_trigger_mb = split_threshold_mb if split_threshold_mb is not None else None
 
         input_path: Path
         source_label = "unknown"

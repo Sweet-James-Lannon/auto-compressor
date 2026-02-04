@@ -21,7 +21,8 @@ MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(TARGET_CHUNK_MB * 1.5)))
 MAX_PARALLEL_CHUNKS = int(os.environ.get("MAX_PARALLEL_CHUNKS", "16"))
 MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
 # Minimum chunk size to avoid spawning tiny Ghostscript jobs that add overhead.
-MIN_CHUNK_MB = 20.0
+# Keep hardcoded (no env tuning) for predictable behavior.
+MIN_CHUNK_MB = 5.0
 # Large-file tuning defaults (used only when chunk env vars are not set).
 LARGE_FILE_TUNE_MIN_MB = 200.0
 LARGE_FILE_TARGET_CHUNK_MB = 60.0
@@ -33,7 +34,8 @@ PARALLEL_MERGE_ON_BLOAT = env_bool("PARALLEL_MERGE_ON_BLOAT", True)
 # Log-only signal when chunking inflates total size (PyPDF2 duplicates resources).
 PARALLEL_SPLIT_INFLATION_PCT = 0.02
 # If split inflation is high, force dedupe on split parts (targeted slow path).
-PARALLEL_DEDUP_SPLIT_INFLATION_PCT = float(os.environ.get("PARALLEL_DEDUP_SPLIT_INFLATION_PCT", "0.12"))
+# Lower default threshold to catch modest PyPDF2 bloat before it cascades.
+PARALLEL_DEDUP_SPLIT_INFLATION_PCT = float(os.environ.get("PARALLEL_DEDUP_SPLIT_INFLATION_PCT", "0.08"))
 
 
 REBALANCE_SPLIT_ENABLED = env_bool("REBALANCE_SPLIT_ENABLED", True)
@@ -558,6 +560,9 @@ def compress_parallel(
     num_chunks_by_pages = 1
     if total_pages and max_pages_per_chunk > 0:
         num_chunks_by_pages = math.ceil(total_pages / max_pages_per_chunk)
+        # When no split is requested, cap page-driven chunking to keep merge cheap.
+        if split_threshold_mb is None:
+            num_chunks_by_pages = max(1, min(num_chunks_by_pages, 3))
 
     if original_size_mb >= 200:
         num_chunks = max(2, min(max_parallel_chunks, num_chunks_by_size))
@@ -680,13 +685,18 @@ def compress_parallel(
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
 
-        # Skip GS if chunk is below minimum size; likely not worth recompressing.
-        try:
-            chunk_mb = get_file_size_mb(chunk_path)
-        except Exception:
-            chunk_mb = None
-        if not force_dedup and chunk_mb is not None and chunk_mb <= MIN_CHUNK_MB:
-            return chunk_path, True, f"SKIPPED: {chunk_mb:.1f}MB < {MIN_CHUNK_MB:.1f}MB"
+        # Always attempt dedupe first (fast, lossless), then fall through to full compression.
+        dedup_path = working_dir / f"{chunk_path.stem}_{unique_id}_dedup.pdf"
+        ok, msg = optimize_split_part(chunk_path, dedup_path, num_threads=gs_threads)
+        if ok and dedup_path.exists():
+            try:
+                dedup_mb = get_file_size_mb(dedup_path)
+                orig_mb = get_file_size_mb(chunk_path)
+                if dedup_mb <= orig_mb:
+                    return dedup_path, True, f"DEDUP: {orig_mb:.1f}MB -> {dedup_mb:.1f}MB"
+                dedup_path.unlink(missing_ok=True)
+            except Exception:
+                dedup_path.unlink(missing_ok=True)
 
         success, message = compress_fn(chunk_path, compressed_path, num_threads=gs_threads)
 
@@ -1054,7 +1064,9 @@ def compress_parallel(
                     split_threshold_mb,
                     progress_callback=progress_callback,
                     prefer_binary=True,
-                    skip_optimization_under_threshold=True,
+                    # Always optimize parts when recovering from bloat; PyPDF2 raw
+                    # splits duplicate resources and can easily exceed input size.
+                    skip_optimization_under_threshold=False,
                 )
                 combined_bytes = sum(p.stat().st_size for p in verified_parts)
                 combined_mb = combined_bytes / (1024 * 1024)
@@ -1063,9 +1075,19 @@ def compress_parallel(
                 bloat_pct = round(((combined_mb / original_size_mb) - 1) * 100, 1)
             except Exception as exc:
                 logger.warning(
-                    "[PARALLEL] Fallback split of original failed: %s; keeping compressed output",
+                    "[PARALLEL] Fallback split of original failed: %s; returning original instead",
                     exc,
                 )
+                # Fail safe: return the original, not a bloated output.
+                merged_path = verified_parts[0] if verified_parts else (working_dir / f"{input_path.stem}_compressed.pdf")
+                if merged_path.resolve() != input_path.resolve():
+                    merged_path.unlink(missing_ok=True)
+                    shutil.copy2(input_path, merged_path)
+                verified_parts = [merged_path]
+                combined_mb = original_size_mb
+                reduction_percent = 0.0
+                bloat_action = "return_original"
+                bloat_pct = 0.0
         else:
             logger.warning(
                 "[PARALLEL] Output larger than input (%.1fMB -> %.1fMB, +%.1f%%); returning original",
