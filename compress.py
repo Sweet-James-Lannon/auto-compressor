@@ -142,24 +142,9 @@ def compress_pdf(
         if progress_callback:
             progress_callback(percent, stage, message)
 
-    quality_mode = "aggressive_150dpi" if compression_mode == "aggressive" else "lossless"
     probe_info = None
     probe_bad = False
     bytes_per_page = None
-    def _augment(resp: Dict) -> Dict:
-        resp.setdefault("quality_mode", quality_mode)
-        resp.setdefault(
-            "analysis",
-            {
-                "page_count": page_count,
-                "bytes_per_page": bytes_per_page,
-                "probe": probe_info,
-                "probe_bad": probe_bad,
-            },
-        )
-        return resp
-
-    report_progress(5, "validating", "Validating PDF...")
 
     # Validate PDF before processing - catch encrypted files early
     page_count = None
@@ -190,6 +175,20 @@ def compress_pdf(
     effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
     split_requested = split_threshold_mb is not None and split_threshold_mb > 0
     bytes_per_page = (original_bytes / max(page_count, 1)) if page_count else None
+    quality_mode = "aggressive_150dpi" if compression_mode == "aggressive" else "lossless"
+
+    def _augment(resp: Dict) -> Dict:
+        resp.setdefault("quality_mode", quality_mode)
+        resp.setdefault(
+            "analysis",
+            {
+                "page_count": page_count,
+                "bytes_per_page": bytes_per_page,
+                "probe": probe_info,
+                "probe_bad": probe_bad,
+            },
+        )
+        return resp
 
     # Skip compression for very small files - usually already optimized
     if original_size < MIN_COMPRESSION_SIZE_MB:
