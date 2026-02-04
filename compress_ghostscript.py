@@ -36,7 +36,6 @@ PARALLEL_SPLIT_INFLATION_PCT = 0.02
 # If split inflation is high, force dedupe on split parts (targeted slow path).
 # Lower default threshold to catch modest PyPDF2 bloat before it cascades.
 PARALLEL_DEDUP_SPLIT_INFLATION_PCT = float(os.environ.get("PARALLEL_DEDUP_SPLIT_INFLATION_PCT", "0.08"))
-PARALLEL_JOB_SLA_SEC = env_int("PARALLEL_JOB_SLA_SEC", 600)
 
 
 REBALANCE_SPLIT_ENABLED = env_bool("REBALANCE_SPLIT_ENABLED", True)
@@ -57,13 +56,19 @@ GS_GRAY_DOWNSAMPLE_TYPE = env_choice(
 )
 GS_BAND_HEIGHT = env_int("GS_BAND_HEIGHT", 100)
 GS_BAND_BUFFER_SPACE_MB = env_int("GS_BAND_BUFFER_SPACE_MB", 500)
-GS_COLOR_IMAGE_RESOLUTION = max(1, env_int("GS_COLOR_IMAGE_RESOLUTION", 50))
-GS_GRAY_IMAGE_RESOLUTION = max(1, env_int("GS_GRAY_IMAGE_RESOLUTION", 50))
-GS_MONO_IMAGE_RESOLUTION = max(1, env_int("GS_MONO_IMAGE_RESOLUTION", 100))
+GS_COLOR_IMAGE_RESOLUTION = max(150, env_int("GS_COLOR_IMAGE_RESOLUTION", 150))
+GS_GRAY_IMAGE_RESOLUTION = max(200, env_int("GS_GRAY_IMAGE_RESOLUTION", 200))
+GS_MONO_IMAGE_RESOLUTION = max(300, env_int("GS_MONO_IMAGE_RESOLUTION", 300))
 PARALLEL_SERIAL_FALLBACK = env_bool("PARALLEL_SERIAL_FALLBACK", True)
-CHUNK_TIME_BUDGET_SEC = env_int("CHUNK_TIME_BUDGET_SEC", 150)
-CHUNK_TIME_BUDGET_MIN_SEC = env_int("CHUNK_TIME_BUDGET_MIN_SEC", 90)
-CHUNK_TIME_BUDGET_MAX_SEC = env_int("CHUNK_TIME_BUDGET_MAX_SEC", 300)
+# Fixed SLA/quality guardrails (non-configurable)
+CHUNK_TIME_BUDGET_SEC = 60
+CHUNK_TIME_BUDGET_MIN_SEC = 40
+CHUNK_TIME_BUDGET_MAX_SEC = 90
+PROBE_TIME_BUDGET_SEC = 12          # seconds
+PROBE_INFLATION_ABORT_PCT = 0.05    # 5% growth triggers bailout
+PROBE_SAMPLE_PAGES = 3
+PARALLEL_JOB_SLA_SEC = 300          # hard cap for parallel job
+SLA_MAX_PARALLEL_CHUNKS = 5         # cap chunk fan-out in aggressive mode
 
 
 def _chunk_timeout_seconds(file_mb: float) -> int:
@@ -511,6 +516,25 @@ def compress_parallel(
     working_dir.mkdir(parents=True, exist_ok=True)
     start_ts = time.time()
     sla_deadline = start_ts + PARALLEL_JOB_SLA_SEC
+    worst_inflation_pct = 0.0
+    strategy_outcome = {
+        "mode": "aggressive" if compression_mode == "aggressive" else "lossless",
+        "forced_by": None,  # page_count | size | timeout | manual
+        "probe_status": None,  # success | fail | bailout
+        "merge_path": None,    # gs | pypdf2 | skipped
+        "timeouts": {
+            "chunk_timeout": 0,
+            "probe_timeout": 0,
+            "merge_timeout": 0,
+            "job_sla_hit": False,
+        },
+        "quality_overrides": {
+            "dedupe_forced": False,
+            "dpi_floor": True,
+        },
+        "max_chunk_inflation_pct": 0.0,
+        "max_merge_inflation_pct": 0.0,
+    }
 
     def report_progress(percent: int, stage: str, message: str):
         if progress_callback:
@@ -531,6 +555,8 @@ def compress_parallel(
     tuned_target = effective_target_chunk_mb
     tuned_max_chunk = effective_max_chunk_mb
     tuned_max_chunks = max(2, MAX_PARALLEL_CHUNKS)
+    if compression_mode == "aggressive":
+        tuned_max_chunks = max(2, min(tuned_max_chunks, SLA_MAX_PARALLEL_CHUNKS))
     tuned_max_pages = MAX_PAGES_PER_CHUNK
 
     has_chunk_env = "TARGET_CHUNK_MB" in os.environ or "MAX_CHUNK_MB" in os.environ
@@ -693,6 +719,7 @@ def compress_parallel(
         pass
     if split_inflation_ratio > (1 + PARALLEL_DEDUP_SPLIT_INFLATION_PCT):
         force_split_dedup = True
+        strategy_outcome["quality_overrides"]["dedupe_forced"] = True
         logger.warning(
             "[PARALLEL] High split inflation %.1f%% (threshold %.1f%%); forcing dedupe on split parts (no skip)",
             (split_inflation_ratio - 1) * 100,
@@ -702,6 +729,10 @@ def compress_parallel(
     # Step 3: Compress each chunk in parallel
 
     compress_fn = compress_pdf_lossless if compression_mode == "lossless" else compress_pdf_with_ghostscript
+    if compression_mode != "lossless" and not force_split_dedup:
+        logger.info(
+            "[PARALLEL] Aggressive mode: skipping pre-dedupe on chunks unless split inflation forces it"
+        )
 
     def compress_single_chunk(chunk_path: Path, force_dedup: bool = False) -> Tuple[Path, bool, str, float]:
         """Compress a single chunk and return result."""
@@ -710,23 +741,25 @@ def compress_parallel(
         chunk_mb = get_file_size_mb(chunk_path)
         chunk_timeout = _chunk_timeout_seconds(chunk_mb)
 
-        # Always attempt dedupe first (fast, lossless), then fall through to full compression.
-        dedup_path = working_dir / f"{chunk_path.stem}_{unique_id}_dedup.pdf"
-        ok, msg = optimize_split_part(
-            chunk_path,
-            dedup_path,
-            num_threads=gs_threads,
-            timeout_override=chunk_timeout,
-        )
-        if ok and dedup_path.exists():
-            try:
-                dedup_mb = get_file_size_mb(dedup_path)
-                orig_mb = get_file_size_mb(chunk_path)
-                if dedup_mb <= orig_mb:
-                    return dedup_path, True, f"DEDUP: {orig_mb:.1f}MB -> {dedup_mb:.1f}MB", chunk_mb
-                dedup_path.unlink(missing_ok=True)
-            except Exception:
-                dedup_path.unlink(missing_ok=True)
+        should_dedupe = compression_mode == "lossless" or force_dedup
+        if should_dedupe:
+            # Attempt dedupe first (fast, lossless), then fall through to full compression.
+            dedup_path = working_dir / f"{chunk_path.stem}_{unique_id}_dedup.pdf"
+            ok, msg = optimize_split_part(
+                chunk_path,
+                dedup_path,
+                num_threads=gs_threads,
+                timeout_override=chunk_timeout,
+            )
+            if ok and dedup_path.exists():
+                try:
+                    dedup_mb = get_file_size_mb(dedup_path)
+                    orig_mb = get_file_size_mb(chunk_path)
+                    if dedup_mb <= orig_mb:
+                        return dedup_path, True, f"DEDUP: {orig_mb:.1f}MB -> {dedup_mb:.1f}MB", chunk_mb
+                    dedup_path.unlink(missing_ok=True)
+                except Exception:
+                    dedup_path.unlink(missing_ok=True)
 
         success, message = compress_fn(
             chunk_path,
@@ -783,7 +816,73 @@ def compress_parallel(
             with open(path, "rb") as f:
                 return len(PdfReader(f, strict=False).pages)
         except Exception:
-            return None
+    return None
+
+
+# =============================================================================
+# MICRO PROBE (small sample compression to predict risk)
+# =============================================================================
+
+def run_micro_probe(
+    input_path: Path,
+    compression_mode: str,
+    max_pages: int = PROBE_SAMPLE_PAGES,
+) -> Dict:
+    """
+    Compress a small sample (first few pages) to predict inflation/throughput.
+
+    Returns a dict with success, delta_pct, elapsed, in_mb, out_mb, pages, message.
+    """
+    from PyPDF2 import PdfReader, PdfWriter
+
+    t0 = time.time()
+    sample_path = input_path.parent / f"{input_path.stem}_probe.pdf"
+    sample_out = input_path.parent / f"{input_path.stem}_probe_out.pdf"
+    result = {
+        "success": False,
+        "delta_pct": 0.0,
+        "elapsed": 0.0,
+        "in_mb": 0.0,
+        "out_mb": 0.0,
+        "pages": 0,
+        "message": "",
+    }
+    try:
+        with open(input_path, "rb") as f:
+            reader = PdfReader(f, strict=False)
+            pages = min(max_pages, len(reader.pages))
+            writer = PdfWriter()
+            for i in range(pages):
+                writer.add_page(reader.pages[i])
+            with open(sample_path, "wb") as out_f:
+                writer.write(out_f)
+        sample_bytes = sample_path.stat().st_size
+        result["in_mb"] = sample_bytes / (1024 * 1024)
+        result["pages"] = pages
+
+        compress_fn = compress_pdf_lossless if compression_mode == "lossless" else compress_pdf_with_ghostscript
+        success, message = compress_fn(
+            sample_path,
+            sample_out,
+            timeout_override=PROBE_TIME_BUDGET_SEC,
+        )
+        result["elapsed"] = time.time() - t0
+        result["message"] = message
+        if success and sample_out.exists():
+            out_bytes = sample_out.stat().st_size
+            result["out_mb"] = out_bytes / (1024 * 1024)
+            if result["in_mb"] > 0:
+                result["delta_pct"] = ((result["out_mb"] - result["in_mb"]) / result["in_mb"]) * 100
+            result["success"] = True
+        else:
+            result["success"] = False
+    except Exception as exc:
+        result["message"] = str(exc)
+    finally:
+        sample_path.unlink(missing_ok=True)
+        sample_out.unlink(missing_ok=True)
+        result["elapsed"] = time.time() - t0
+    return result
 
     if chunk_paths:
         # Pick the smallest chunk by size for the probe to keep risk low.
@@ -824,9 +923,87 @@ def compress_parallel(
                 (f"{probe_pps:.2f}" if probe_pps else "n/a"),
                 message,
             )
+            strategy_outcome["probe_status"] = "success"
         else:
             logger.warning("[PARALLEL_PROBE] failed: %s", message)
             failed_chunks.append((probe_order, probe_chunk))
+            strategy_outcome["probe_status"] = "fail"
+
+        # Early exit if probe inflates or is slow; avoid spending minutes on bad strategy.
+        probe_out_mb = get_file_size_mb(probe_path) if probe_path.exists() else probe_mb
+        probe_inflated = success and probe_out_mb > probe_mb * (1 + PROBE_INFLATION_ABORT_PCT)
+        probe_slow = probe_elapsed is not None and probe_elapsed > PROBE_TIME_BUDGET_SEC
+        if probe_inflated or probe_slow:
+            bailout_reason = []
+            if probe_inflated:
+                bailout_reason.append(
+                    f"inflated {probe_mb:.1f}->{probe_out_mb:.1f}MB (+{(probe_out_mb/probe_mb-1)*100:.1f}%)"
+                )
+            if probe_slow:
+                bailout_reason.append(f"slow {probe_elapsed:.1f}s>{PROBE_TIME_BUDGET_SEC}s")
+            logger.warning(
+                "[PARALLEL_PROBE] Bailout triggered (%s); returning original to preserve SLA/quality",
+                ", ".join(bailout_reason),
+            )
+            # Optional quick lossless attempt (fast, no downsample) if the file is mid-size.
+            lossless_path = working_dir / f"{base_name}_lossless_probe.pdf"
+            lossless_used = False
+            if original_size_mb <= 180 and (total_pages or 0) <= 1200:
+                ok_lossless, msg_lossless = compress_pdf_lossless(
+                    input_path,
+                    lossless_path,
+                    timeout_override=90,
+                )
+                if ok_lossless and lossless_path.exists():
+                    lossless_mb = get_file_size_mb(lossless_path)
+                    if lossless_mb < original_size_mb:
+                        lossless_used = True
+                        logger.info(
+                            "[PARALLEL_PROBE] Lossless fallback succeeded: %.1fMB -> %.1fMB",
+                            original_size_mb,
+                            lossless_mb,
+                        )
+                        original_bytes = lossless_path.stat().st_size
+                        original_size_mb = lossless_mb
+                        shutil.copy2(lossless_path, merged_path)
+                    lossless_path.unlink(missing_ok=True)
+                else:
+                    if not ok_lossless and "timeout" in (msg_lossless or "").lower():
+                        strategy_outcome["timeouts"]["probe_timeout"] += 1
+
+            # Cleanup temp chunks
+            for p in chunk_paths:
+                p.unlink(missing_ok=True)
+            if "probe_path" in locals() and probe_path.exists() and probe_path != probe_chunk:
+                probe_path.unlink(missing_ok=True)
+            if probe_chunk.exists():
+                probe_chunk.unlink(missing_ok=True)
+            # Materialize output path
+            merged_path = working_dir / f"{base_name}_compressed.pdf"
+            merged_path.unlink(missing_ok=True)
+            shutil.copy2(input_path, merged_path)
+            strategy_outcome["probe_status"] = "bailout"
+            return {
+                "output_path": str(merged_path),
+                "output_paths": [str(merged_path)],
+                "original_size_mb": round(original_size_mb, 2),
+                "compressed_size_mb": round(original_size_mb, 2),
+                "reduction_percent": 0.0,
+                "compression_method": "none",
+                "compression_mode": compression_mode,
+                "quality_mode": "aggressive_150dpi" if compression_mode == "aggressive" else "lossless",
+                "was_split": False,
+                "total_parts": 1,
+                "success": True,
+                "page_count": total_pages,
+                "part_sizes": [original_bytes],
+                "bloat_detected": True,
+                "bloat_action": "probe_bailout",
+                "probe_bailout": True,
+                "probe_bailout_reason": ", ".join(bailout_reason),
+                "lossless_fallback_used": lossless_used,
+                "note": "Probe showed inflation/slow path; returned original to meet SLA",
+            }
 
         # Retune remaining chunks based on probe throughput.
         if (probe_pps or probe_mbps) and chunk_paths:
@@ -966,6 +1143,15 @@ def compress_parallel(
                             skip_reason,
                         )
                     else:
+                        if chunk_mb_val:
+                            # Track worst-case chunk inflation (if any)
+                            comp_mb = get_file_size_mb(compressed_path)
+                            if comp_mb > chunk_mb_val:
+                                inflation_pct = ((comp_mb - chunk_mb_val) / chunk_mb_val) * 100
+                                strategy_outcome["max_chunk_inflation_pct"] = max(
+                                    strategy_outcome["max_chunk_inflation_pct"],
+                                    inflation_pct,
+                                )
                         logger.info(
                             "[PARALLEL_CHUNK] idx=%s size=%.1fMB status=compressed msg=%s",
                             chunk_idx + 1,
@@ -1017,10 +1203,18 @@ def compress_parallel(
     merged_path = working_dir / f"{base_name}_compressed.pdf"
     merged_path.unlink(missing_ok=True)
 
+    merge_used = "gs"
     if len(ordered_paths) == 1:
         ordered_paths[0].rename(merged_path)
+        merge_used = "skipped"
     else:
-        merge_pdfs(ordered_paths, merged_path)
+        try:
+            merge_pdfs(ordered_paths, merged_path)
+            merge_used = "gs"
+        except Exception as exc:
+            merge_used = "pypdf2"
+            strategy_outcome["timeouts"]["merge_timeout"] += 1 if isinstance(exc, TimeoutError) else 0
+            raise
 
     if not merged_path.exists() or merged_path.stat().st_size == 0:
         raise SplitError(f"Merged output missing or empty: {merged_path.name}")
@@ -1140,6 +1334,7 @@ def compress_parallel(
                     reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
                     merge_fallback_used = True
                     merge_fallback_time = time.time() - merge_start
+                    strategy_outcome["merge_path"] = "gs_fallback_split"
                     logger.info(
                         "[PARALLEL] Merge fallback complete: parts=%s, reduction=%.1f%%",
                         len(verified_parts),
@@ -1319,10 +1514,18 @@ def compress_parallel(
             bloat_action = "return_original"
             bloat_pct = 0.0
 
+    strategy_outcome["merge_path"] = strategy_outcome["merge_path"] or merge_used
+    strategy_outcome["timeouts"]["job_sla_hit"] = sla_exceeded
+    strategy_outcome["max_merge_inflation_pct"] = max(
+        strategy_outcome["max_merge_inflation_pct"],
+        max(0.0, ((merged_mb / original_size_mb) - 1) * 100) if original_size_mb > 0 else 0.0,
+    )
+
     logger.info(
         "[PARALLEL] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s, compressed=%s, skipped=%s, "
         "used_original=%s, split_inflation=%s (%.1f%%), dedupe_parts=%s, merge_fallback=%s, "
-        "bloat_detected=%s, bloat_action=%s, bloat_pct=%.1f%%, sla_exceeded=%s",
+        "bloat_detected=%s, bloat_action=%s, bloat_pct=%.1f%%, sla_exceeded=%s, "
+        "strategy=%s",
         original_size_mb,
         combined_mb,
         reduction_percent,
@@ -1338,6 +1541,7 @@ def compress_parallel(
         bloat_action or "none",
         bloat_pct,
         "yes" if sla_exceeded else "no",
+        strategy_outcome,
     )
     total_time = time.time() - start_ts
     logger.info(
@@ -1358,6 +1562,7 @@ def compress_parallel(
         "reduction_percent": round(reduction_percent, 1),
         "compression_method": "ghostscript_parallel",
         "compression_mode": compression_mode,
+        "quality_mode": "aggressive_150dpi" if compression_mode == "aggressive" else "lossless",
         "was_split": len(verified_parts) > 1,
         "total_parts": len(verified_parts),
         "success": True,
@@ -1381,4 +1586,6 @@ def compress_parallel(
         "bloat_pct": bloat_pct,
         "bloat_action": bloat_action,
         "sla_exceeded": sla_exceeded,
+        "probe_bailout": False,
+        "probe_bailout_reason": None,
     }

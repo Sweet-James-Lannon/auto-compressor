@@ -40,7 +40,9 @@ try:
     SPLIT_ULTRA_JPEGQ = max(20, min(90, int(_ultra_jpegq)))
 except ValueError:
     SPLIT_ULTRA_JPEGQ = 50
-MERGE_FALLBACK_TIMEOUT_SEC = int(os.environ.get("MERGE_FALLBACK_TIMEOUT_SEC", "120"))
+MERGE_TIMEOUT_SEC = 45
+MERGE_FALLBACK_TIMEOUT_SEC = 60
+MERGE_BLOAT_ABORT_PCT = 0.02
 _ultra_gap = float(os.environ.get("SPLIT_ULTRA_GAP_PCT", "0.12"))
 SPLIT_ULTRA_GAP_PCT: float = max(0.0, min(0.5, _ultra_gap))
 FAST_SPLIT_ENABLED = True
@@ -303,7 +305,7 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=900)
+        result = subprocess.run(cmd, capture_output=True, timeout=MERGE_TIMEOUT_SEC)
         if result.returncode != 0:
             logger.warning(f"Ghostscript merge failed (code {result.returncode}), falling back to PyPDF2")
             # Fallback to PyPDF2
@@ -337,7 +339,8 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
             logger.warning(f"[merge_pdfs]    Bloat: +{bloat_mb:.2f}MB (+{bloat_pct:.1f}%)")
             logger.warning(f"[merge_pdfs]    Likely cause: PyPDF2 fallback duplicated shared resources")
             # Attempt a lossless Ghostscript pass only if bloat is meaningful (>1%) and size is reasonable (<100MB).
-            if gs_cmd and bloat_pct > 1.0 and output_mb < 100:
+            min_bloat_for_dedup = max(1.0, MERGE_BLOAT_ABORT_PCT * 100)
+            if gs_cmd and bloat_pct > min_bloat_for_dedup and output_mb < 100:
                 dedup_path = output_path.with_name(f"{output_path.stem}_dedup.pdf")
                 success, _ = optimize_split_part(output_path, dedup_path)
                 if success and dedup_path.exists() and dedup_path.stat().st_size < output_bytes:

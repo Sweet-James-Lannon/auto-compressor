@@ -39,29 +39,26 @@ and poll `/status/<job_id>` for results.
 
 ## Compression decision logic (current defaults)
 - < 1 MB: skip compression (already tiny).
-- 1 to 30 MB: serial Ghostscript.
-- 30 to 100 MB: serial Ghostscript (unless page-heavy rule triggers).
-- > 100 MB: parallel compression (split into chunks, compress in parallel).
-- >= 600 pages and >= 30 MB: parallel compression.
-- >= 600 pages and < 30 MB: serial first; parallel only if serial times out.
-
-Notes:
-- Size-based parallel uses `PARALLEL_THRESHOLD_MB=30` and `PARALLEL_SERIAL_CUTOFF_MB=100`.
-- Page-based parallel uses `PARALLEL_PAGE_THRESHOLD=600` and `PARALLEL_PAGE_MIN_MB` (default 0).
+- 1 to ~200 MB: serial Ghostscript unless page-heavy rule forces parallel.
+- >= 200 MB (no split) and estimated chunks > 3: parallel compression for throughput.
+- Split requests: size-based threshold still applies but prefer serial first when feasible.
+- Page heavy: >= 600 pages and meets `PARALLEL_PAGE_MIN_MB` (default 0) routes to parallel to avoid serial timeouts.
+- If serial times out and parallel is allowed, we fall back to parallel.
 
 ## Parallel strategy (under the hood)
-- Splits the input into page-based chunks near `TARGET_CHUNK_MB` (default 40 MB).
-- Caps chunk size at `MAX_CHUNK_MB` (default 60 MB) and chunk count at `MAX_PARALLEL_CHUNKS` (default 16).
-- Caps pages per chunk at `MAX_PAGES_PER_CHUNK` (default 200).
-- Files >= 200 MB use larger chunks (60 MB target, 90 MB max) and fewer chunks (max 12) unless env overrides.
-- Chunks under 20 MB are skipped to avoid overhead.
-- Chunks are merged with Ghostscript to dedupe resources.
+- Splits the input into page-based chunks near `TARGET_CHUNK_MB` (default 40 MB; 60 MB for 200 MB+ aggressive files).
+- Caps chunk size at `MAX_CHUNK_MB` (default 60 MB / 90 MB for large) and chunk count at `SLA_MAX_PARALLEL_CHUNKS` (default 5 for aggressive paths).
+- Caps pages per chunk at `MAX_PAGES_PER_CHUNK` (default 200; env can raise).
+- Pre-dedupe is **skipped in aggressive mode** unless split inflation exceeds 8% (then forced).
+- Micro-probe: a 3-page sample compression predicts inflation/throughput; if delta >5% or >12s, we avoid parallel unless page-count forces it.
+- Probe (parallel): run the smallest chunk first; if it inflates >5% or takes >12s, bail early (after an optional quick lossless attempt) to protect SLA/quality.
+- Chunks are merged with Ghostscript (45s timeout). PyPDF2 fallback has a 60s timeout; bloat is logged and caught downstream.
 - If chunked output is >8% larger than input and splitting is enabled, a merge + re-split pass runs to dedupe.
-- If parallel output is larger than input and splitting is enabled, the system falls back to splitting the original.
+- If parallel output is larger than input, we return the original (or split original if splitting was requested).
 
 ## Ghostscript defaults (aggressive mode)
 - `/screen` preset plus explicit downsampling for size.
-- Color DPI: 50, Gray DPI: 50, Mono DPI: 100.
+- Quality floors: Color ≥150 DPI, Gray ≥200 DPI, Mono ≥300 DPI (env values are floored to these mins).
 - JPEG re-encode; JPEG2000 is converted to JPEG.
 - Duplicate images are detected and deduped; fonts are subset.
 - Fast web view enabled by default.
@@ -86,6 +83,12 @@ Lossless mode keeps images and focuses on deduplication only.
 - `GET /health`
 - `GET /diagnose/<job_id>`
 
+### Response fields of interest
+- `quality_mode`: `aggressive_150dpi` or `lossless`.
+- `analysis`: `{ page_count, bytes_per_page, probe: {pages, delta_pct, elapsed, success}, probe_bad }`.
+- `probe_bailout`: true when we returned the original because a quick safety test showed no safe win; `probe_bailout_reason` is a short human string.
+- `lossless_fallback_used`: true when a fast, safe lossless attempt improved size after a probe bailout.
+
 ## Key config settings
 - `SPLIT_THRESHOLD_MB` (default 25)
 - `SPLIT_TRIGGER_MB` (default = threshold)
@@ -100,12 +103,16 @@ Lossless mode keeps images and focuses on deduplication only.
 - `PARALLEL_PAGE_MIN_MB` (default 0)
 - `PARALLEL_MAX_WORKERS` (default auto)
 - `TARGET_CHUNK_MB` (default 40)
-- `MAX_CHUNK_MB` (default 60)
-- `MAX_PARALLEL_CHUNKS` (default 16)
+- `MAX_CHUNK_MB` (default 60; 90 for large aggressive)
+- `MAX_PARALLEL_CHUNKS` (default 16), `SLA_MAX_PARALLEL_CHUNKS` (default 5 for aggressive paths)
 - `MAX_PAGES_PER_CHUNK` (default 200)
-- `GS_COLOR_IMAGE_RESOLUTION` (default 50)
-- `GS_GRAY_IMAGE_RESOLUTION` (default 50)
-- `GS_MONO_IMAGE_RESOLUTION` (default 100)
+- (Fixed) `PROBE_TIME_BUDGET_SEC` = 12s, `PROBE_INFLATION_ABORT_PCT` = 0.05, `PROBE_SAMPLE_PAGES` = 3
+- (Fixed) `PARALLEL_JOB_SLA_SEC` = 300s, `SLA_MAX_PARALLEL_CHUNKS` = 5
+- (Fixed) `MERGE_TIMEOUT_SEC` = 45s, `MERGE_FALLBACK_TIMEOUT_SEC` = 60s
+- (Fixed) `MERGE_BLOAT_ABORT_PCT` = 0.02
+- `GS_COLOR_IMAGE_RESOLUTION` (floored at 150)
+- `GS_GRAY_IMAGE_RESOLUTION` (floored at 200)
+- `GS_MONO_IMAGE_RESOLUTION` (floored at 300)
 - `ASYNC_WORKERS` (default min(2, cpu))
 - `FILE_RETENTION_SECONDS` (default 86400, minimum 3600)
 - `ASYNC_MAX_MB` (default 450, hard cap 600)
@@ -117,9 +124,11 @@ Lossless mode keeps images and focuses on deduplication only.
 - Async download limit: `ASYNC_MAX_MB` (default 450 MB, capped at 600 MB).
 - Queue size cap: 50 jobs by default.
 - File cleanup: automatic deletion after retention window (min 1 hour).
-- Ghostscript timeouts:
-  - Aggressive mode: ~10 seconds per MB, minimum 600 seconds.
-  - Lossless mode: ~5 seconds per MB, minimum 300 seconds.
+- Time/SLA guardrails (fixed):
+  - Parallel job SLA: 300s (hard stop for post-processing).
+  - Probe bailout: >5% inflation or >12s runtime returns the original.
+  - Per-chunk Ghostscript budget: 40–90s (size-scaled, clamped).
+  - Merge timeout: 45s for Ghostscript; PyPDF2 fallback capped at 60s.
 - Quality warnings are included when `ENABLE_QUALITY_WARNINGS=1`.
 
 ## Error messages (friendly translations)

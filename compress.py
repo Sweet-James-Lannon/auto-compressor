@@ -142,6 +142,23 @@ def compress_pdf(
         if progress_callback:
             progress_callback(percent, stage, message)
 
+    quality_mode = "aggressive_150dpi" if compression_mode == "aggressive" else "lossless"
+    probe_info = None
+    probe_bad = False
+    bytes_per_page = None
+    def _augment(resp: Dict) -> Dict:
+        resp.setdefault("quality_mode", quality_mode)
+        resp.setdefault(
+            "analysis",
+            {
+                "page_count": page_count,
+                "bytes_per_page": bytes_per_page,
+                "probe": probe_info,
+                "probe_bad": probe_bad,
+            },
+        )
+        return resp
+
     report_progress(5, "validating", "Validating PDF...")
 
     # Validate PDF before processing - catch encrypted files early
@@ -172,6 +189,7 @@ def compress_pdf(
     logger.info(f"[compress] Compression mode: {compression_mode} (allow_lossy={ALLOW_LOSSY_COMPRESSION})")
     effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
     split_requested = split_threshold_mb is not None and split_threshold_mb > 0
+    bytes_per_page = (original_bytes / max(page_count, 1)) if page_count else None
 
     # Skip compression for very small files - usually already optimized
     if original_size < MIN_COMPRESSION_SIZE_MB:
@@ -186,7 +204,7 @@ def compress_pdf(
                 prefer_binary=True,
                 skip_optimization_under_threshold=True,
             )
-            return {
+            return _augment({
                 "output_path": str(output_paths[0]),
                 "output_paths": [str(p) for p in output_paths],
                 "original_size_mb": round(original_size, 2),
@@ -200,9 +218,9 @@ def compress_pdf(
                 "note": "File under compression threshold, split only",
                 "page_count": page_count,
                 "part_sizes": [p.stat().st_size for p in output_paths]
-            }
+            })
 
-        return {
+        return _augment({
             "output_path": str(input_path),
             "output_paths": [str(input_path)],
             "original_size_mb": round(original_size, 2),
@@ -216,9 +234,30 @@ def compress_pdf(
             "note": f"File under {MIN_COMPRESSION_SIZE_MB}MB threshold - already optimized",
             "page_count": page_count,
             "part_sizes": [original_bytes]
-        }
+        })
 
     logger.info(f"[SIZE_CHECK] Input: {input_path.name} = {original_bytes} bytes ({original_size:.2f}MB)")
+
+    # Optional micro-probe to predict inflation/throughput on aggressive mode
+    probe_info = None
+    probe_bad = False
+    if compression_mode == "aggressive" and original_size >= PARALLEL_THRESHOLD_MB and original_size <= 400 and page_count:
+        try:
+            probe_info = compress_ghostscript.run_micro_probe(input_path, compression_mode)
+            probe_bad = (
+                not probe_info.get("success")
+                or probe_info.get("delta_pct", 0) > 5
+                or probe_info.get("elapsed", 0) > compress_ghostscript.PROBE_TIME_BUDGET_SEC
+            )
+            logger.info(
+                "[compress] Micro-probe pages=%s delta=%.1f%% elapsed=%.1fs success=%s",
+                probe_info.get("pages"),
+                probe_info.get("delta_pct", 0.0),
+                probe_info.get("elapsed", 0.0),
+                probe_info.get("success"),
+            )
+        except Exception as exc:
+            logger.warning("[compress] Micro-probe failed (will ignore): %s", exc)
 
     # =========================================================================
     # ROUTE: Large files use parallel compression for speed
@@ -238,11 +277,15 @@ def compress_pdf(
         original_size > PARALLEL_THRESHOLD_MB
         and (
             (split_requested and original_size > PARALLEL_SERIAL_CUTOFF_MB)
-            or (not split_requested and original_size > 150.0)
+            or (not split_requested and original_size > 200.0)
         )
-        and est_chunks > 2
+        and est_chunks > 3
     )
     use_parallel = force_parallel_by_pages or size_parallel or page_parallel_candidate
+
+    # If probe shows inflation/slow path and we weren't forced by pages, prefer serial to protect quality/SLA.
+    if probe_bad and not force_parallel_by_pages:
+        use_parallel = False
 
     if page_parallel_candidate and not force_parallel_by_pages:
         logger.info(
@@ -324,13 +367,13 @@ def compress_pdf(
             page_count,
             PARALLEL_PAGE_THRESHOLD,
         )
-        return run_parallel("page_count")
+        return _augment(run_parallel("page_count"))
     if size_parallel:
         if split_requested:
             logger.info("[compress] Large file with split requested; using parallel compression for speed")
         else:
             logger.info("[compress] Large file detected; using parallel compression for speed")
-        return run_parallel("size")
+        return _augment(run_parallel("size"))
     if split_requested:
         logger.info(
             "[compress] Split requested; trying serial compression first for maximum savings "
@@ -371,7 +414,7 @@ def compress_pdf(
                 parts,
                 out_mb,
             )
-            return result
+            return _augment(result)
         if timed_out and not split_requested and use_parallel:
             logger.warning(
                 "[compress] Serial compression timed out; falling back to parallel for %s",
@@ -387,7 +430,7 @@ def compress_pdf(
                 parts,
                 out_mb,
             )
-            return result
+            return _augment(result)
         # Map error message to specific exception type
         if 'password' in msg_lower or 'encrypt' in msg_lower or 'locked' in msg_lower:
             raise EncryptionError.for_file(input_path.name)
@@ -431,7 +474,7 @@ def compress_pdf(
                 prefer_binary=True,
                 skip_optimization_under_threshold=True,
             )
-            return {
+            return _augment({
                 "output_path": str(output_paths[0]),
                 "output_paths": [str(p) for p in output_paths],
                 "original_size_mb": round(original_size, 2),
@@ -448,10 +491,10 @@ def compress_pdf(
                 "bloat_detected": True,
                 "bloat_pct": round(bloat_pct, 1),
                 "bloat_action": "return_original",
-            }
+            })
 
         single_size = output_path.stat().st_size
-        return {
+        return _augment({
             "output_path": str(output_path),
             "output_paths": [str(output_path)],
             "original_size_mb": round(original_size, 2),
@@ -468,7 +511,7 @@ def compress_pdf(
             "bloat_detected": True,
             "bloat_pct": round(bloat_pct, 1),
             "bloat_action": "return_original",
-        }
+        })
 
     reduction = ((original_size - compressed_size) / original_size) * 100
 
@@ -494,7 +537,7 @@ def compress_pdf(
             logger.info(f"[SIZE_CHECK] Part {i+1}: {part_path.name} = {part_bytes} bytes ({part_mb:.2f}MB)")
 
         report_progress(95, "finalizing", "Finalizing...")
-        return {
+        return _augment({
             "output_path": str(output_paths[0]),
             "output_paths": [str(p) for p in output_paths],
             "original_size_mb": round(original_size, 2),
@@ -507,7 +550,7 @@ def compress_pdf(
             "success": True,
             "page_count": page_count,
             "part_sizes": [p.stat().st_size for p in output_paths]
-        }
+        })
 
     # No splitting needed
     logger.info(f"[SIZE_CHECK] Final: {output_path.name} = {compressed_bytes} bytes ({compressed_size:.2f}MB)")
@@ -515,7 +558,7 @@ def compress_pdf(
 
     single_size = output_path.stat().st_size
 
-    return {
+    return _augment({
         "output_path": str(output_path),
         "output_paths": [str(output_path)],
         "original_size_mb": round(original_size, 2),
@@ -528,4 +571,4 @@ def compress_pdf(
         "success": True,
         "page_count": page_count,
         "part_sizes": [single_size]
-    }
+    })
