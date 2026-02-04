@@ -816,73 +816,7 @@ def compress_parallel(
             with open(path, "rb") as f:
                 return len(PdfReader(f, strict=False).pages)
         except Exception:
-    return None
-
-
-# =============================================================================
-# MICRO PROBE (small sample compression to predict risk)
-# =============================================================================
-
-def run_micro_probe(
-    input_path: Path,
-    compression_mode: str,
-    max_pages: int = PROBE_SAMPLE_PAGES,
-) -> Dict:
-    """
-    Compress a small sample (first few pages) to predict inflation/throughput.
-
-    Returns a dict with success, delta_pct, elapsed, in_mb, out_mb, pages, message.
-    """
-    from PyPDF2 import PdfReader, PdfWriter
-
-    t0 = time.time()
-    sample_path = input_path.parent / f"{input_path.stem}_probe.pdf"
-    sample_out = input_path.parent / f"{input_path.stem}_probe_out.pdf"
-    result = {
-        "success": False,
-        "delta_pct": 0.0,
-        "elapsed": 0.0,
-        "in_mb": 0.0,
-        "out_mb": 0.0,
-        "pages": 0,
-        "message": "",
-    }
-    try:
-        with open(input_path, "rb") as f:
-            reader = PdfReader(f, strict=False)
-            pages = min(max_pages, len(reader.pages))
-            writer = PdfWriter()
-            for i in range(pages):
-                writer.add_page(reader.pages[i])
-            with open(sample_path, "wb") as out_f:
-                writer.write(out_f)
-        sample_bytes = sample_path.stat().st_size
-        result["in_mb"] = sample_bytes / (1024 * 1024)
-        result["pages"] = pages
-
-        compress_fn = compress_pdf_lossless if compression_mode == "lossless" else compress_pdf_with_ghostscript
-        success, message = compress_fn(
-            sample_path,
-            sample_out,
-            timeout_override=PROBE_TIME_BUDGET_SEC,
-        )
-        result["elapsed"] = time.time() - t0
-        result["message"] = message
-        if success and sample_out.exists():
-            out_bytes = sample_out.stat().st_size
-            result["out_mb"] = out_bytes / (1024 * 1024)
-            if result["in_mb"] > 0:
-                result["delta_pct"] = ((result["out_mb"] - result["in_mb"]) / result["in_mb"]) * 100
-            result["success"] = True
-        else:
-            result["success"] = False
-    except Exception as exc:
-        result["message"] = str(exc)
-    finally:
-        sample_path.unlink(missing_ok=True)
-        sample_out.unlink(missing_ok=True)
-        result["elapsed"] = time.time() - t0
-    return result
+            return None
 
     if chunk_paths:
         # Pick the smallest chunk by size for the probe to keep risk low.
@@ -1589,3 +1523,69 @@ def run_micro_probe(
         "probe_bailout": False,
         "probe_bailout_reason": None,
     }
+
+
+# =============================================================================
+# MICRO PROBE (small sample compression to predict risk)
+# =============================================================================
+
+def run_micro_probe(
+    input_path: Path,
+    compression_mode: str,
+    max_pages: int = PROBE_SAMPLE_PAGES,
+) -> Dict:
+    """
+    Compress a small sample (first few pages) to predict inflation/throughput.
+
+    Returns a dict with success, delta_pct, elapsed, in_mb, out_mb, pages, message.
+    """
+    from PyPDF2 import PdfReader, PdfWriter
+
+    t0 = time.time()
+    sample_path = input_path.parent / f"{input_path.stem}_probe.pdf"
+    sample_out = input_path.parent / f"{input_path.stem}_probe_out.pdf"
+    result = {
+        "success": False,
+        "delta_pct": 0.0,
+        "elapsed": 0.0,
+        "in_mb": 0.0,
+        "out_mb": 0.0,
+        "pages": 0,
+        "message": "",
+    }
+    try:
+        with open(input_path, "rb") as f:
+            reader = PdfReader(f, strict=False)
+            pages = min(max_pages, len(reader.pages))
+            writer = PdfWriter()
+            for i in range(pages):
+                writer.add_page(reader.pages[i])
+            with open(sample_path, "wb") as out_f:
+                writer.write(out_f)
+        sample_bytes = sample_path.stat().st_size
+        result["in_mb"] = sample_bytes / (1024 * 1024)
+        result["pages"] = pages
+
+        compress_fn = compress_pdf_lossless if compression_mode == "lossless" else compress_pdf_with_ghostscript
+        success, message = compress_fn(
+            sample_path,
+            sample_out,
+            timeout_override=PROBE_TIME_BUDGET_SEC,
+        )
+        result["elapsed"] = time.time() - t0
+        result["message"] = message
+        if success and sample_out.exists():
+            out_bytes = sample_out.stat().st_size
+            result["out_mb"] = out_bytes / (1024 * 1024)
+            if result["in_mb"] > 0:
+                result["delta_pct"] = ((result["out_mb"] - result["in_mb"]) / result["in_mb"]) * 100
+            result["success"] = True
+        else:
+            result["success"] = False
+    except Exception as exc:
+        result["message"] = str(exc)
+    finally:
+        sample_path.unlink(missing_ok=True)
+        sample_out.unlink(missing_ok=True)
+        result["elapsed"] = time.time() - t0
+    return result
