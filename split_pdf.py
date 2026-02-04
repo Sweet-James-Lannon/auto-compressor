@@ -9,6 +9,7 @@ import math
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -39,6 +40,7 @@ try:
     SPLIT_ULTRA_JPEGQ = max(20, min(90, int(_ultra_jpegq)))
 except ValueError:
     SPLIT_ULTRA_JPEGQ = 50
+MERGE_FALLBACK_TIMEOUT_SEC = int(os.environ.get("MERGE_FALLBACK_TIMEOUT_SEC", "120"))
 _ultra_gap = float(os.environ.get("SPLIT_ULTRA_GAP_PCT", "0.12"))
 SPLIT_ULTRA_GAP_PCT: float = max(0.0, min(0.5, _ultra_gap))
 FAST_SPLIT_ENABLED = True
@@ -256,15 +258,33 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _merge_with_pypdf2(paths: List[Path], out: Path) -> None:
+        """Run PyPDF2 merge with a timeout to avoid hangs on huge files."""
+        errors = []
+
+        def _run():
+            try:
+                merger = PdfMerger()
+                for path in paths:
+                    merger.append(str(path))
+                merger.write(str(out))
+                merger.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(MERGE_FALLBACK_TIMEOUT_SEC)
+        if t.is_alive():
+            raise TimeoutError(f"PyPDF2 merge timed out after {MERGE_FALLBACK_TIMEOUT_SEC}s")
+        if errors:
+            raise errors[0]
+
     gs_cmd = get_ghostscript_command()
     if not gs_cmd:
         # Fallback to PyPDF2 if Ghostscript not available
         logger.warning("Ghostscript not found, falling back to PyPDF2 merge (may inflate file size)")
-        merger = PdfMerger()
-        for path in pdf_paths:
-            merger.append(str(path))
-        merger.write(str(output_path))
-        merger.close()
+        _merge_with_pypdf2(pdf_paths, output_path)
         logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2)")
         return
 
@@ -287,21 +307,13 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
         if result.returncode != 0:
             logger.warning(f"Ghostscript merge failed (code {result.returncode}), falling back to PyPDF2")
             # Fallback to PyPDF2
-            merger = PdfMerger()
-            for path in pdf_paths:
-                merger.append(str(path))
-            merger.write(str(output_path))
-            merger.close()
+            _merge_with_pypdf2(pdf_paths, output_path)
             logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2 fallback)")
         else:
             logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (Ghostscript)")
     except subprocess.TimeoutExpired:
         logger.warning("Ghostscript merge timed out, falling back to PyPDF2")
-        merger = PdfMerger()
-        for path in pdf_paths:
-            merger.append(str(path))
-        merger.write(str(output_path))
-        merger.close()
+        _merge_with_pypdf2(pdf_paths, output_path)
         logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2 fallback)")
 
     # === BLOAT DETECTION ===

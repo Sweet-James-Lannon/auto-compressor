@@ -36,6 +36,7 @@ PARALLEL_SPLIT_INFLATION_PCT = 0.02
 # If split inflation is high, force dedupe on split parts (targeted slow path).
 # Lower default threshold to catch modest PyPDF2 bloat before it cascades.
 PARALLEL_DEDUP_SPLIT_INFLATION_PCT = float(os.environ.get("PARALLEL_DEDUP_SPLIT_INFLATION_PCT", "0.08"))
+PARALLEL_JOB_SLA_SEC = env_int("PARALLEL_JOB_SLA_SEC", 600)
 
 
 REBALANCE_SPLIT_ENABLED = env_bool("REBALANCE_SPLIT_ENABLED", True)
@@ -60,6 +61,19 @@ GS_COLOR_IMAGE_RESOLUTION = max(1, env_int("GS_COLOR_IMAGE_RESOLUTION", 50))
 GS_GRAY_IMAGE_RESOLUTION = max(1, env_int("GS_GRAY_IMAGE_RESOLUTION", 50))
 GS_MONO_IMAGE_RESOLUTION = max(1, env_int("GS_MONO_IMAGE_RESOLUTION", 100))
 PARALLEL_SERIAL_FALLBACK = env_bool("PARALLEL_SERIAL_FALLBACK", True)
+CHUNK_TIME_BUDGET_SEC = env_int("CHUNK_TIME_BUDGET_SEC", 150)
+CHUNK_TIME_BUDGET_MIN_SEC = env_int("CHUNK_TIME_BUDGET_MIN_SEC", 90)
+CHUNK_TIME_BUDGET_MAX_SEC = env_int("CHUNK_TIME_BUDGET_MAX_SEC", 300)
+
+
+def _chunk_timeout_seconds(file_mb: float) -> int:
+    """
+    Compute a sane per-chunk timeout so Ghostscript jobs don't run indefinitely.
+    Scales with size but clamps to a reasonable window to avoid hanging workers.
+    """
+    dynamic = int(max(1.0, file_mb) * 8)  # ~8s/MB baseline
+    budget = max(CHUNK_TIME_BUDGET_MIN_SEC, min(CHUNK_TIME_BUDGET_SEC, CHUNK_TIME_BUDGET_MAX_SEC))
+    return min(max(dynamic, budget), CHUNK_TIME_BUDGET_MAX_SEC)
 
 
 def _resolve_gs_threads(num_threads: Optional[int]) -> int:
@@ -85,6 +99,7 @@ def optimize_split_part(
     input_path: Path,
     output_path: Path,
     num_threads: Optional[int] = None,
+    timeout_override: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """
     Lightweight optimization for split PDF parts - removes duplicate resources
@@ -105,6 +120,7 @@ def optimize_split_part(
         output_path,
         "Optimizing split part",
         num_threads=num_threads,
+        timeout_override=timeout_override,
     )
 
 
@@ -113,6 +129,7 @@ def _run_lossless_ghostscript(
     output_path: Path,
     label: str,
     num_threads: Optional[int] = None,
+    timeout_override: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """Run Ghostscript with lossless settings (no downsampling, pass-through images)."""
     gs_cmd = get_ghostscript_command()
@@ -151,7 +168,7 @@ def _run_lossless_ghostscript(
 
     try:
         file_mb = input_path.stat().st_size / (1024 * 1024)
-        timeout = max(300, int(file_mb * 5))
+        timeout = timeout_override or max(300, int(file_mb * 5))
 
         logger.info(f"{label} {input_path.name} ({file_mb:.1f}MB)")
 
@@ -180,6 +197,7 @@ def compress_pdf_lossless(
     input_path: Path,
     output_path: Path,
     num_threads: Optional[int] = None,
+    timeout_override: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """Lossless PDF optimization using Ghostscript (no downsampling)."""
     return _run_lossless_ghostscript(
@@ -187,6 +205,7 @@ def compress_pdf_lossless(
         output_path,
         "Lossless optimize",
         num_threads=num_threads,
+        timeout_override=timeout_override,
     )
 
 
@@ -235,6 +254,7 @@ def compress_pdf_with_ghostscript(
     input_path: Path,
     output_path: Path,
     num_threads: Optional[int] = None,
+    timeout_override: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """
     Compress scanned PDF using Ghostscript at 72 DPI with JPEG encoding.
@@ -312,7 +332,7 @@ def compress_pdf_with_ghostscript(
 
     try:
         file_mb = input_path.stat().st_size / (1024 * 1024)
-        timeout = max(600, int(file_mb * 10))  # 10 sec/MB, min 10 minutes
+        timeout = timeout_override or _chunk_timeout_seconds(file_mb)
 
         logger.info(f"Compressing {input_path.name} ({file_mb:.1f}MB)")
 
@@ -342,6 +362,7 @@ def compress_ultra_aggressive(
     output_path: Path,
     jpeg_quality: int = 50,
     num_threads: Optional[int] = None,
+    timeout_override: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """
     Ultra-aggressive compression for oversized split parts.
@@ -409,7 +430,7 @@ def compress_ultra_aggressive(
 
     try:
         file_mb = input_path.stat().st_size / (1024 * 1024)
-        timeout = max(600, int(file_mb * 10))
+        timeout = timeout_override or _chunk_timeout_seconds(file_mb)
 
         logger.info(
             f"[ULTRA] Compressing {input_path.name} ({file_mb:.1f}MB) "
@@ -489,6 +510,7 @@ def compress_parallel(
     working_dir = Path(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
     start_ts = time.time()
+    sla_deadline = start_ts + PARALLEL_JOB_SLA_SEC
 
     def report_progress(percent: int, stage: str, message: str):
         if progress_callback:
@@ -560,9 +582,11 @@ def compress_parallel(
     num_chunks_by_pages = 1
     if total_pages and max_pages_per_chunk > 0:
         num_chunks_by_pages = math.ceil(total_pages / max_pages_per_chunk)
-        # When no split is requested, cap page-driven chunking to keep merge cheap.
+        # When no split is requested, cap page-driven chunking to the parallel limit
+        # but do NOT collapse it to just a few parts; very high page counts need
+        # smaller chunks to keep Ghostscript runs within timeouts.
         if split_threshold_mb is None:
-            num_chunks_by_pages = max(1, min(num_chunks_by_pages, 3))
+            num_chunks_by_pages = max(1, min(num_chunks_by_pages, max_parallel_chunks))
 
     if original_size_mb >= 200:
         num_chunks = max(2, min(max_parallel_chunks, num_chunks_by_size))
@@ -676,29 +700,40 @@ def compress_parallel(
         )
 
     # Step 3: Compress each chunk in parallel
-    report_progress(15, "compressing", f"Compressing {num_chunks} chunks in parallel...")
 
     compress_fn = compress_pdf_lossless if compression_mode == "lossless" else compress_pdf_with_ghostscript
 
-    def compress_single_chunk(chunk_path: Path, force_dedup: bool = False) -> Tuple[Path, bool, str]:
+    def compress_single_chunk(chunk_path: Path, force_dedup: bool = False) -> Tuple[Path, bool, str, float]:
         """Compress a single chunk and return result."""
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
+        chunk_mb = get_file_size_mb(chunk_path)
+        chunk_timeout = _chunk_timeout_seconds(chunk_mb)
 
         # Always attempt dedupe first (fast, lossless), then fall through to full compression.
         dedup_path = working_dir / f"{chunk_path.stem}_{unique_id}_dedup.pdf"
-        ok, msg = optimize_split_part(chunk_path, dedup_path, num_threads=gs_threads)
+        ok, msg = optimize_split_part(
+            chunk_path,
+            dedup_path,
+            num_threads=gs_threads,
+            timeout_override=chunk_timeout,
+        )
         if ok and dedup_path.exists():
             try:
                 dedup_mb = get_file_size_mb(dedup_path)
                 orig_mb = get_file_size_mb(chunk_path)
                 if dedup_mb <= orig_mb:
-                    return dedup_path, True, f"DEDUP: {orig_mb:.1f}MB -> {dedup_mb:.1f}MB"
+                    return dedup_path, True, f"DEDUP: {orig_mb:.1f}MB -> {dedup_mb:.1f}MB", chunk_mb
                 dedup_path.unlink(missing_ok=True)
             except Exception:
                 dedup_path.unlink(missing_ok=True)
 
-        success, message = compress_fn(chunk_path, compressed_path, num_threads=gs_threads)
+        success, message = compress_fn(
+            chunk_path,
+            compressed_path,
+            num_threads=gs_threads,
+            timeout_override=chunk_timeout,
+        )
 
         # If Ghostscript "compression" makes this chunk larger, keep the original chunk.
         # This is common for vector/text-heavy PDFs where re-encoding can bloat output.
@@ -714,20 +749,166 @@ def compress_parallel(
                         chunk_path,
                         False,
                         f"Compression increased size ({original_mb:.1f}MB -> {compressed_mb:.1f}MB), using original",
+                        chunk_mb,
                     )
         except Exception:
             # If stats fail for any reason, fall back to the normal success path below.
             pass
 
-        return compressed_path, success, message
+        return compressed_path, success, message, chunk_mb
+
+    # Default threads; may be adjusted after load evaluation.
+    gs_threads = max(1, min(4, get_effective_cpu_count()))
 
     compressed_chunks = []
     failed_chunks = []
     skipped_chunks = 0
 
-    worker_count = min(max_workers, len(chunk_paths)) if chunk_paths else max_workers
+    # ------------------------------------------------------------------
+    # Probe: run the smallest chunk first to measure throughput, then
+    # dynamically retune remaining chunk sizes to hit a time budget.
+    # ------------------------------------------------------------------
+    probe_pps = None
+    probe_mbps = None
+    probe_elapsed = None
+    time_budget = max(
+        CHUNK_TIME_BUDGET_MIN_SEC,
+        min(CHUNK_TIME_BUDGET_SEC, CHUNK_TIME_BUDGET_MAX_SEC),
+    )
+
+    def _read_pages(path: Path) -> Optional[int]:
+        try:
+            from PyPDF2 import PdfReader
+
+            with open(path, "rb") as f:
+                return len(PdfReader(f, strict=False).pages)
+        except Exception:
+            return None
+
+    if chunk_paths:
+        # Pick the smallest chunk by size for the probe to keep risk low.
+        chunk_sizes = [get_file_size_mb(p) for p in chunk_paths]
+        probe_idx = chunk_sizes.index(min(chunk_sizes))
+        probe_order = probe_idx
+        probe_chunk = chunk_paths.pop(probe_idx)
+        logger.info(
+            "[PARALLEL_PROBE] Running probe on %s (%.1fMB)",
+            probe_chunk.name,
+            chunk_sizes[probe_idx],
+        )
+        probe_start = time.time()
+        probe_result = compress_single_chunk(probe_chunk, force_split_dedup)
+        probe_elapsed = time.time() - probe_start
+        try:
+            probe_path, success, message, probe_mb = probe_result
+        except Exception as exc:  # unpacking safety
+            logger.error("[PARALLEL_PROBE] failed: %s", exc)
+            success = False
+            message = str(exc)
+            probe_path = probe_chunk
+            probe_mb = get_file_size_mb(probe_chunk)
+
+        if success and probe_path.exists():
+            compressed_chunks.append((probe_order, probe_path))
+            probe_pages = _read_pages(probe_chunk)
+            if probe_elapsed > 0:
+                probe_mbps = probe_mb / probe_elapsed
+                if probe_pages:
+                    probe_pps = probe_pages / probe_elapsed
+            logger.info(
+                "[PARALLEL_PROBE] success size=%.1fMB pages=%s elapsed=%.1fs mbps=%.2f pps=%s msg=%s",
+                probe_mb,
+                probe_pages if probe_pages is not None else "unknown",
+                probe_elapsed,
+                probe_mbps or -1,
+                (f"{probe_pps:.2f}" if probe_pps else "n/a"),
+                message,
+            )
+        else:
+            logger.warning("[PARALLEL_PROBE] failed: %s", message)
+            failed_chunks.append((probe_order, probe_chunk))
+
+        # Retune remaining chunks based on probe throughput.
+        if (probe_pps or probe_mbps) and chunk_paths:
+            adjusted: List[Path] = []
+            for path in chunk_paths:
+                size_mb = get_file_size_mb(path)
+                pages = _read_pages(path)
+                ests = []
+                if probe_mbps:
+                    ests.append(size_mb / probe_mbps)
+                if probe_pps and pages:
+                    ests.append(pages / probe_pps)
+                est_time = max(ests) if ests else 0
+                if est_time > time_budget and pages and pages > 1:
+                    split_count = max(2, math.ceil(est_time / time_budget))
+                    split_count = min(split_count, pages)
+                    logger.info(
+                        "[PARALLEL_PROBE] Resplitting %s (%.1fMB, ~%.1fs est) into %s parts",
+                        path.name,
+                        size_mb,
+                        est_time,
+                        split_count,
+                    )
+                    parts = split_by_pages(path, working_dir, split_count, path.stem)
+                    path.unlink(missing_ok=True)
+                    adjusted.extend(parts)
+                else:
+                    adjusted.append(path)
+            chunk_paths = adjusted
+
+    # Build execution plan with stable order keys (page order).
+    tasks: List[Tuple[int, Path]] = []
+    plan_list: List[Optional[Path]] = list(chunk_paths)
+    if "probe_chunk" in locals():
+        insert_at = min(probe_idx, len(plan_list))
+        plan_list.insert(insert_at, None)  # placeholder for probe
+
+    order_idx = 0
+    for item in plan_list:
+        if item is None:
+            if "probe_path" in locals() and success and probe_path.exists():
+                compressed_chunks.append((order_idx, probe_path))
+            else:
+                failed_chunks.append((order_idx, probe_chunk))
+        else:
+            tasks.append((order_idx, item))
+        order_idx += 1
+
+    num_chunks = order_idx
+    logger.info("[PARALLEL] Post-probe chunk count: %s (tasks=%s, probe=%s)", num_chunks, len(tasks), "yes" if "probe_chunk" in locals() else "no")
+
+    worker_count = max(1, min(max_workers, len(tasks))) if tasks else 1
     effective_cpu = get_effective_cpu_count()
     per_worker_cap = max(1, effective_cpu // max(worker_count, 1))
+
+    try:
+        load1 = os.getloadavg()[0]
+    except Exception:
+        load1 = None
+
+    if load1 is not None and effective_cpu > 0:
+        if load1 > effective_cpu * 0.8 and worker_count > 1:
+            new_workers = max(1, int(effective_cpu * 0.6))
+            if new_workers < worker_count:
+                logger.info(
+                    "[PARALLEL] High load %.2f (cpu=%s); reducing workers %s->%s",
+                    load1,
+                    effective_cpu,
+                    worker_count,
+                    new_workers,
+                )
+                worker_count = max(1, new_workers)
+                per_worker_cap = max(1, effective_cpu // worker_count)
+        elif load1 < effective_cpu * 0.5 and worker_count < max_workers:
+            logger.info(
+                "[PARALLEL] Load healthy %.2f (cpu=%s); keeping workers=%s",
+                load1,
+                effective_cpu,
+                worker_count,
+            )
+
+    report_progress(15, "compressing", f"Compressing {num_chunks} chunks in parallel...")
 
     env_threads = os.environ.get("GS_NUM_RENDERING_THREADS")
     if env_threads:
@@ -757,31 +938,48 @@ def compress_parallel(
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         # Submit all compression jobs
         futures = {
-            executor.submit(compress_single_chunk, chunk, force_split_dedup): (i, chunk)
-            for i, chunk in enumerate(chunk_paths)
+            executor.submit(compress_single_chunk, chunk, force_split_dedup): (idx, chunk)
+            for idx, chunk in tasks
         }
 
         # Collect results as they complete
         for future in as_completed(futures):
             chunk_idx, original_chunk = futures[future]
+            chunk_mb_val: Optional[float] = None
             try:
-                compressed_path, success, message = future.result()
+                compressed_path, success, message, chunk_mb = future.result()
+                chunk_mb_val = chunk_mb
+            except Exception as e:
+                logger.error(f"[PARALLEL] Chunk {chunk_idx + 1} error: {e}")
+                failed_chunks.append((chunk_idx, original_chunk))
+            else:
                 skipped = isinstance(message, str) and message.startswith("SKIPPED:")
                 if success and compressed_path.exists():
                     compressed_chunks.append((chunk_idx, compressed_path))
                     if skipped:
                         skipped_chunks += 1
                         skip_reason = message.split(":", 1)[1].strip() if ":" in message else message
-                        logger.info("[PARALLEL] Chunk %s skipped (%s)", chunk_idx + 1, skip_reason)
+                        logger.info(
+                            "[PARALLEL_CHUNK] idx=%s size=%.1fMB status=skipped reason=%s",
+                            chunk_idx + 1,
+                            chunk_mb,
+                            skip_reason,
+                        )
                     else:
-                        logger.info(f"[PARALLEL] Chunk {chunk_idx + 1} compressed successfully")
+                        logger.info(
+                            "[PARALLEL_CHUNK] idx=%s size=%.1fMB status=compressed msg=%s",
+                            chunk_idx + 1,
+                            chunk_mb,
+                            message,
+                        )
                 else:
-                    # Compression failed - use original chunk
-                    logger.warning(f"[PARALLEL] Chunk {chunk_idx + 1} compression failed: {message}")
+                    logger.warning(
+                        "[PARALLEL_CHUNK] idx=%s size=%.1fMB status=failed msg=%s",
+                        chunk_idx + 1,
+                        chunk_mb_val if chunk_mb_val is not None else -1,
+                        message,
+                    )
                     failed_chunks.append((chunk_idx, original_chunk))
-            except Exception as e:
-                logger.error(f"[PARALLEL] Chunk {chunk_idx + 1} error: {e}")
-                failed_chunks.append((chunk_idx, original_chunk))
 
             # Update progress
             done = len(compressed_chunks) + len(failed_chunks)
@@ -802,6 +1000,13 @@ def compress_parallel(
     )
     compress_time = time.time() - start_ts - split_time
     logger.info("[PERF] Compress: %.1fs", compress_time)
+    sla_exceeded = time.time() > sla_deadline
+    if sla_exceeded:
+        logger.warning(
+            "[PARALLEL] SLA %.0fs exceeded (elapsed %.1fs); minimizing post-processing",
+            PARALLEL_JOB_SLA_SEC,
+            time.time() - start_ts,
+        )
 
     # Step 4: Merge compressed chunks for consistent results, then split if required.
     split_enabled = split_threshold_mb is not None and split_threshold_mb > 0
@@ -854,7 +1059,10 @@ def compress_parallel(
         )
 
     # Cleanup original chunk files
-    for chunk in chunk_paths:
+    source_chunks: List[Path] = [c for _, c in tasks]
+    if "probe_chunk" in locals():
+        source_chunks.append(probe_chunk)
+    for chunk in source_chunks:
         chunk.unlink(missing_ok=True)
     for _, compressed in compressed_chunks:
         compressed.unlink(missing_ok=True)
@@ -888,7 +1096,7 @@ def compress_parallel(
 
     merge_fallback_used = False
     merge_fallback_time = 0.0
-    if split_enabled and PARALLEL_MERGE_ON_BLOAT and original_size_mb > 0:
+    if split_enabled and PARALLEL_MERGE_ON_BLOAT and original_size_mb > 0 and not sla_exceeded:
         bloat_ratio = (combined_mb / original_size_mb) - 1
         if bloat_ratio > PARALLEL_BLOAT_PCT:
             bloat_pct = bloat_ratio * 100
@@ -951,7 +1159,13 @@ def compress_parallel(
     rebalance_size_after_mb = None
     rebalance_time = 0.0
 
-    if split_enabled and REBALANCE_SPLIT_ENABLED and split_threshold_mb > 0 and rebalance_parts_before > 1:
+    if (
+        split_enabled
+        and REBALANCE_SPLIT_ENABLED
+        and not sla_exceeded
+        and split_threshold_mb > 0
+        and rebalance_parts_before > 1
+    ):
         part_sizes_mb = [p.stat().st_size / (1024 * 1024) for p in verified_parts]
         max_part_mb = max(part_sizes_mb) if part_sizes_mb else 0.0
         min_parts = max(1, math.ceil(combined_mb / split_threshold_mb))
@@ -1108,7 +1322,7 @@ def compress_parallel(
     logger.info(
         "[PARALLEL] Summary: %.1fMB -> %.1fMB (%.1f%%), parts=%s, compressed=%s, skipped=%s, "
         "used_original=%s, split_inflation=%s (%.1f%%), dedupe_parts=%s, merge_fallback=%s, "
-        "bloat_detected=%s, bloat_action=%s, bloat_pct=%.1f%%",
+        "bloat_detected=%s, bloat_action=%s, bloat_pct=%.1f%%, sla_exceeded=%s",
         original_size_mb,
         combined_mb,
         reduction_percent,
@@ -1123,15 +1337,17 @@ def compress_parallel(
         "yes" if bloat_detected else "no",
         bloat_action or "none",
         bloat_pct,
+        "yes" if sla_exceeded else "no",
     )
     total_time = time.time() - start_ts
     logger.info(
-        "[PARALLEL_METRICS] total=%.1fs split=%.1fs compress=%.1fs split_parts=%.1fs merge_fallback=%.1fs",
+        "[PARALLEL_METRICS] total=%.1fs split=%.1fs compress=%.1fs split_parts=%.1fs merge_fallback=%.1fs sla=%s",
         total_time,
         split_time,
         compress_time,
         split_total,
         merge_fallback_time,
+        "hit" if sla_exceeded else "ok",
     )
 
     return {
@@ -1164,4 +1380,5 @@ def compress_parallel(
         "bloat_detected": bloat_detected,
         "bloat_pct": bloat_pct,
         "bloat_action": bloat_action,
+        "sla_exceeded": sla_exceeded,
     }

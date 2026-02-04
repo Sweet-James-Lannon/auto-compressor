@@ -290,8 +290,13 @@ def compress_pdf(
                 max_chunk_mb,
             )
         else:
-            # No-split path: favor fewer, larger chunks to speed merge and avoid PyPDF2 fallback.
-            if not split_requested and original_size <= 150.0:
+            # If we were forced into parallel due to page count, keep chunks small so
+            # each Ghostscript run handles fewer pages and avoids long timeouts.
+            if reason == "page_count":
+                target_chunk_mb = max(DEFAULT_TARGET_CHUNK_MB, 40.0)
+                max_chunk_mb = max(DEFAULT_MAX_CHUNK_MB, target_chunk_mb * 1.5)
+            # Otherwise, no-split path can favor fewer, larger chunks to speed merge.
+            elif not split_requested and original_size <= 150.0:
                 target_chunk_mb = max(target_chunk_mb, 80.0)
                 max_chunk_mb = max(max_chunk_mb, target_chunk_mb * 1.5)
             logger.info(
