@@ -193,17 +193,9 @@ def compress_pdf(
     if composition["already_compressed"]:
         compression_mode = "lossless"
         logger.info("[compress] Detected already-compressed PDF (%s); forcing lossless path", composition["already_reason"])
-    elif compression_mode == "aggressive" and not composition["scanned"]:
-        # Mixed/vector-heavy PDFs bloat when forced through /screen; prefer lossless.
-        compression_mode = "lossless"
-        logger.info("[compress] Not scanned (or low confidence); preferring lossless to avoid inflation")
-    elif compression_mode == "aggressive" and composition["scanned"] and composition["scan_confidence"] < SCANNED_CONFIDENCE_FOR_AGGRESSIVE:
-        compression_mode = "lossless"
-        logger.info(
-            "[compress] Scanned but low confidence (%.1f%% < %.1f%%); using lossless",
-            composition["scan_confidence"],
-            SCANNED_CONFIDENCE_FOR_AGGRESSIVE,
-        )
+    elif compression_mode == "adaptive" and composition["scanned"] and composition["scan_confidence"] >= SCANNED_CONFIDENCE_FOR_AGGRESSIVE:
+        compression_mode = "aggressive"
+        logger.info("[compress] Adaptive: high-confidence scanned; choosing aggressive")
 
     logger.info(f"[compress] Compression mode: {compression_mode} (allow_lossy={ALLOW_LOSSY_COMPRESSION})")
     effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
@@ -281,8 +273,8 @@ def compress_pdf(
             probe_info = compress_ghostscript.run_micro_probe(input_path, "lossless")
             probe_bad = (
                 not probe_info.get("success")
-                or probe_info.get("delta_pct", 0) > 3
-                or probe_info.get("elapsed", 0) > compress_ghostscript.PROBE_TIME_BUDGET_SEC
+                or probe_info.get("delta_pct", 0) > 20
+                or probe_info.get("elapsed", 0) > compress_ghostscript.PROBE_TIME_BUDGET_SEC * 1.5
             )
             logger.info(
                 "[compress] Micro-probe pages=%s delta=%.1f%% elapsed=%.1fs success=%s",
@@ -295,8 +287,8 @@ def compress_pdf(
             logger.warning("[compress] Micro-probe failed (will ignore): %s", exc)
 
     # If probe indicates risk, downgrade to lossless path to protect quality/SLA.
-    if probe_bad and compression_mode == "aggressive":
-        logger.info("[compress] Probe indicated risk; downgrading to lossless path")
+    if probe_bad and compression_mode == "aggressive" and original_size > 200:
+        logger.info("[compress] Probe indicated risk on large file; downgrading to lossless path")
         compression_mode = "lossless"
         quality_mode = "lossless"
 

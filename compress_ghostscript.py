@@ -64,8 +64,8 @@ PARALLEL_SERIAL_FALLBACK = env_bool("PARALLEL_SERIAL_FALLBACK", True)
 CHUNK_TIME_BUDGET_SEC = 60
 CHUNK_TIME_BUDGET_MIN_SEC = 40
 CHUNK_TIME_BUDGET_MAX_SEC = 90
-PROBE_TIME_BUDGET_SEC = 10          # seconds
-PROBE_INFLATION_ABORT_PCT = 0.03    # 3% growth triggers bailout
+PROBE_TIME_BUDGET_SEC = 45          # seconds
+PROBE_INFLATION_ABORT_PCT = 0.20    # 20% growth triggers bailout
 PROBE_SAMPLE_PAGES = 3
 PARALLEL_JOB_SLA_SEC = 300          # hard cap for parallel job
 SLA_MAX_PARALLEL_CHUNKS = 5         # cap chunk fan-out in aggressive mode
@@ -822,7 +822,7 @@ def compress_parallel(
         except Exception:
             return None
 
-    if chunk_paths:
+    if chunk_paths and compression_mode != "lossless":
         # Pick the smallest chunk by size for the probe to keep risk low.
         chunk_sizes = [get_file_size_mb(p) for p in chunk_paths]
         probe_idx = chunk_sizes.index(min(chunk_sizes))
