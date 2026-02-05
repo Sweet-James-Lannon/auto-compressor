@@ -1465,15 +1465,50 @@ def compress_parallel(
                 combined_mb,
                 bloat_pct,
             )
-            merged_path = verified_parts[0] if verified_parts else (working_dir / f"{input_path.stem}_compressed.pdf")
-            if merged_path.resolve() != input_path.resolve():
-                merged_path.unlink(missing_ok=True)
-                shutil.copy2(input_path, merged_path)
-            verified_parts = [merged_path]
-            combined_mb = original_size_mb
-            reduction_percent = 0.0
-            bloat_action = "return_original"
-            bloat_pct = 0.0
+            lossless_used = False
+            lossless_path = working_dir / f"{input_path.stem}_lossless_fallback.pdf"
+            try:
+                lossless_timeout = min(240, max(90, int(original_size_mb * 1.2)))
+                ok_lossless, msg_lossless = compress_pdf_lossless(
+                    input_path,
+                    lossless_path,
+                    timeout_override=lossless_timeout,
+                )
+                if ok_lossless and lossless_path.exists():
+                    lossless_mb = get_file_size_mb(lossless_path)
+                    if lossless_mb < combined_mb:
+                        for part in verified_parts:
+                            part.unlink(missing_ok=True)
+                        verified_parts = [lossless_path]
+                        combined_bytes = lossless_path.stat().st_size
+                        combined_mb = combined_bytes / (1024 * 1024)
+                        reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
+                        bloat_action = "lossless_fallback"
+                        bloat_detected = False
+                        bloat_pct = round(((combined_mb / original_size_mb) - 1) * 100, 1) if original_size_mb > 0 else 0.0
+                        lossless_used = True
+                        logger.info(
+                            "[PARALLEL] Lossless fallback after bloat succeeded: %.1fMB -> %.1fMB (timeout=%ss)",
+                            original_size_mb,
+                            combined_mb,
+                            lossless_timeout,
+                        )
+                    else:
+                        lossless_path.unlink(missing_ok=True)
+            except Exception as exc:
+                logger.warning("[PARALLEL] Lossless fallback after bloat failed: %s", exc)
+                lossless_path.unlink(missing_ok=True)
+
+            if not lossless_used:
+                merged_path = verified_parts[0] if verified_parts else (working_dir / f"{input_path.stem}_compressed.pdf")
+                if merged_path.resolve() != input_path.resolve():
+                    merged_path.unlink(missing_ok=True)
+                    shutil.copy2(input_path, merged_path)
+                verified_parts = [merged_path]
+                combined_mb = original_size_mb
+                reduction_percent = 0.0
+                bloat_action = "return_original"
+                bloat_pct = 0.0
 
     strategy_outcome["merge_path"] = strategy_outcome["merge_path"] or merge_used
     strategy_outcome["timeouts"]["job_sla_hit"] = sla_exceeded

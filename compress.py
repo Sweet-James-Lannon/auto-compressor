@@ -66,6 +66,8 @@ ALLOW_LOSSY_COMPRESSION = os.environ.get("ALLOW_LOSSY_COMPRESSION", "1").lower()
 SCANNED_CONFIDENCE_FOR_AGGRESSIVE = float(os.environ.get("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", "70"))
 DEFAULT_TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "40"))
 DEFAULT_MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(DEFAULT_TARGET_CHUNK_MB * 1.5)))
+PROBE_INFLATION_WARN_PCT = env_float("PROBE_INFLATION_WARN_PCT", 12.0)
+PROBE_INFLATION_FORCE_LOSSLESS_PCT = env_float("PROBE_INFLATION_FORCE_LOSSLESS_PCT", 60.0)
 
 
 def resolve_compression_mode(input_path: Path) -> str:
@@ -144,6 +146,8 @@ def compress_pdf(
 
     probe_info = None
     probe_bad = False
+    probe_force_lossless = False
+    probe_action = None
     bytes_per_page = None
     composition = {
         "already_compressed": False,
@@ -212,6 +216,7 @@ def compress_pdf(
                 "bytes_per_page": bytes_per_page,
                 "probe": probe_info,
                 "probe_bad": probe_bad,
+                "probe_action": probe_action,
                 "composition": composition,
             },
         )
@@ -267,22 +272,27 @@ def compress_pdf(
     # Optional micro-probe to predict inflation/throughput on aggressive mode
     probe_info = None
     probe_bad = False
+    probe_delta_pct = 0.0
+    probe_elapsed = 0.0
     if compression_mode == "aggressive" and original_size >= PARALLEL_THRESHOLD_MB and original_size <= 400 and page_count:
         try:
             # Micro-probe uses the SAME mode as actual compression to accurately predict inflation
             probe_info = compress_ghostscript.run_micro_probe(input_path, compression_mode)
-            # Threshold: 5% inflation on probe sample indicates likely incompressible
-            # Lower than original 20% to catch bloat earlier, but not 0% which triggers on noise
+            probe_delta_pct = probe_info.get("delta_pct", 0.0)
+            probe_elapsed = probe_info.get("elapsed", 0.0)
+            probe_force_lossless = (not probe_info.get("success")) or probe_delta_pct >= PROBE_INFLATION_FORCE_LOSSLESS_PCT
+            # Threshold: mild inflation (>PROBE_INFLATION_WARN_PCT) signals risk; extreme inflation
+            # forces a lossless path rather than skipping compression entirely.
             probe_bad = (
                 not probe_info.get("success")
-                or probe_info.get("delta_pct", 0) > 5
-                or probe_info.get("elapsed", 0) > compress_ghostscript.PROBE_TIME_BUDGET_SEC * 1.5
+                or probe_delta_pct > PROBE_INFLATION_WARN_PCT
+                or probe_elapsed > compress_ghostscript.PROBE_TIME_BUDGET_SEC * 1.5
             )
             logger.info(
                 "[compress] Micro-probe pages=%s delta=%.1f%% elapsed=%.1fs success=%s",
                 probe_info.get("pages"),
-                probe_info.get("delta_pct", 0.0),
-                probe_info.get("elapsed", 0.0),
+                probe_delta_pct,
+                probe_elapsed,
                 probe_info.get("success"),
             )
         except Exception as exc:
@@ -293,54 +303,20 @@ def compress_pdf(
     # while allowing files with minor probe fluctuations to proceed.
     if probe_bad and original_size > PARALLEL_THRESHOLD_MB:
         delta_pct = probe_info.get("delta_pct", 0) if probe_info else 0
-        logger.info(
-            "[compress] Probe showed inflation (%.1f%%); skipping compression and returning original",
-            delta_pct,
-        )
-        # Still split if above threshold
-        if split_threshold_mb and effective_split_trigger and original_size > effective_split_trigger:
-            output_paths = split_pdf.split_for_delivery(
-                input_path, working_dir, input_path.stem,
-                threshold_mb=split_threshold_mb,
-                progress_callback=progress_callback,
-                prefer_binary=True,
-                skip_optimization_under_threshold=True,
+        if compression_mode == "aggressive" and (probe_force_lossless or delta_pct >= PROBE_INFLATION_WARN_PCT):
+            logger.info(
+                "[compress] Probe showed inflation (%.1f%%); switching to lossless path instead of skipping",
+                delta_pct,
             )
-            return _augment({
-                "output_path": str(output_paths[0]),
-                "output_paths": [str(p) for p in output_paths],
-                "original_size_mb": round(original_size, 2),
-                "compressed_size_mb": round(original_size, 2),
-                "reduction_percent": 0.0,
-                "compression_method": "skipped",
-                "compression_mode": compression_mode,
-                "was_split": len(output_paths) > 1,
-                "total_parts": len(output_paths),
-                "success": True,
-                "note": f"Probe showed {delta_pct:.1f}% inflation; split only",
-                "page_count": page_count,
-                "part_sizes": [p.stat().st_size for p in output_paths],
-                "probe_skipped": True,
-                "probe_delta_pct": round(delta_pct, 1),
-            })
-
-        return _augment({
-            "output_path": str(input_path),
-            "output_paths": [str(input_path)],
-            "original_size_mb": round(original_size, 2),
-            "compressed_size_mb": round(original_size, 2),
-            "reduction_percent": 0.0,
-            "compression_method": "skipped",
-            "compression_mode": compression_mode,
-            "was_split": False,
-            "total_parts": 1,
-            "success": True,
-            "note": f"Probe showed {delta_pct:.1f}% inflation; returning original",
-            "page_count": page_count,
-            "part_sizes": [original_bytes],
-            "probe_skipped": True,
-            "probe_delta_pct": round(delta_pct, 1),
-        })
+            compression_mode = "lossless"
+            quality_mode = "lossless"
+            probe_action = "forced_lossless"
+        else:
+            probe_action = "warn_only"
+            logger.info(
+                "[compress] Probe warning (%.1f%%); continuing with conservative settings",
+                delta_pct,
+            )
 
     # =========================================================================
     # ROUTE: Large files use parallel compression for speed
@@ -535,66 +511,110 @@ def compress_pdf(
 
     report_progress(60, "compressing", "Compression complete, verifying...")
 
-    # If compression made it bigger, return original
+    # If aggressive compression made it bigger, try lossless before giving up
+    lossless_retry_worked = False
     if compressed_size >= original_size:
         bloat_pct = ((compressed_size - original_size) / original_size) * 100 if original_size > 0 else 0.0
-        logger.warning(
-            "Compression increased size (%.2fMB -> %.2fMB, +%.1f%%), returning original",
-            original_size,
-            compressed_size,
-            bloat_pct,
-        )
-        output_path.unlink()
-        shutil.copy2(input_path, output_path)
-        compressed_size = original_size
 
-        # Check if we still need to split the original
-        if split_threshold_mb and effective_split_trigger and compressed_size > effective_split_trigger:
-            output_paths = split_pdf.split_for_delivery(
-                output_path, working_dir, input_path.stem,
-                threshold_mb=split_threshold_mb,
-                progress_callback=progress_callback,
-                prefer_binary=True,
-                skip_optimization_under_threshold=True,
+        # Safety net: if aggressive bloated, try lossless
+        if compression_mode == "aggressive":
+            logger.warning(
+                "Aggressive bloated (%.2fMB -> %.2fMB, +%.1f%%); retrying lossless",
+                original_size,
+                compressed_size,
+                bloat_pct,
             )
+            output_path.unlink(missing_ok=True)
+            lossless_ok, lossless_msg = compress_ghostscript.compress_pdf_lossless(input_path, output_path)
+            if lossless_ok and output_path.exists():
+                compressed_size = get_file_size_mb(output_path)
+                compressed_bytes = output_path.stat().st_size
+                logger.info(
+                    "[compress] Lossless retry: %.2fMB -> %.2fMB",
+                    original_size,
+                    compressed_size,
+                )
+                # If lossless worked, skip the "return original" block
+                if compressed_size < original_size:
+                    compression_mode = "lossless"
+                    quality_mode = "lossless"
+                    lossless_retry_worked = True
+                else:
+                    bloat_pct = ((compressed_size - original_size) / original_size) * 100 if original_size > 0 else 0.0
+                    logger.warning(
+                        "Lossless also bloated (%.2fMB -> %.2fMB, +%.1f%%); returning original",
+                        original_size,
+                        compressed_size,
+                        bloat_pct,
+                    )
+                    output_path.unlink()
+                    shutil.copy2(input_path, output_path)
+                    compressed_size = original_size
+            else:
+                logger.warning("Lossless retry failed: %s; returning original", lossless_msg)
+                output_path.unlink(missing_ok=True)
+                shutil.copy2(input_path, output_path)
+                compressed_size = original_size
+        else:
+            logger.warning(
+                "Compression increased size (%.2fMB -> %.2fMB, +%.1f%%), returning original",
+                original_size,
+                compressed_size,
+                bloat_pct,
+            )
+            output_path.unlink()
+            shutil.copy2(input_path, output_path)
+            compressed_size = original_size
+
+        # If lossless retry worked, skip the "return original" block and continue to success path
+        if not lossless_retry_worked:
+            # Check if we still need to split the original
+            if split_threshold_mb and effective_split_trigger and compressed_size > effective_split_trigger:
+                output_paths = split_pdf.split_for_delivery(
+                    output_path, working_dir, input_path.stem,
+                    threshold_mb=split_threshold_mb,
+                    progress_callback=progress_callback,
+                    prefer_binary=True,
+                    skip_optimization_under_threshold=True,
+                )
+                return _augment({
+                    "output_path": str(output_paths[0]),
+                    "output_paths": [str(p) for p in output_paths],
+                    "original_size_mb": round(original_size, 2),
+                    "compressed_size_mb": round(original_size, 2),
+                    "reduction_percent": 0.0,
+                    "compression_method": "none",
+                    "compression_mode": compression_mode,
+                    "was_split": len(output_paths) > 1,
+                    "total_parts": len(output_paths),
+                    "success": True,
+                    "note": "Already optimized, split for size",
+                    "page_count": page_count,
+                    "part_sizes": [p.stat().st_size for p in output_paths],
+                    "bloat_detected": True,
+                    "bloat_pct": round(bloat_pct, 1),
+                    "bloat_action": "return_original",
+                })
+
+            single_size = output_path.stat().st_size
             return _augment({
-                "output_path": str(output_paths[0]),
-                "output_paths": [str(p) for p in output_paths],
+                "output_path": str(output_path),
+                "output_paths": [str(output_path)],
                 "original_size_mb": round(original_size, 2),
                 "compressed_size_mb": round(original_size, 2),
                 "reduction_percent": 0.0,
                 "compression_method": "none",
                 "compression_mode": compression_mode,
-                "was_split": len(output_paths) > 1,
-                "total_parts": len(output_paths),
+                "was_split": False,
+                "total_parts": 1,
                 "success": True,
-                "note": "Already optimized, split for size",
+                "note": "Already optimized",
                 "page_count": page_count,
-                "part_sizes": [p.stat().st_size for p in output_paths],
+                "part_sizes": [single_size],
                 "bloat_detected": True,
                 "bloat_pct": round(bloat_pct, 1),
                 "bloat_action": "return_original",
             })
-
-        single_size = output_path.stat().st_size
-        return _augment({
-            "output_path": str(output_path),
-            "output_paths": [str(output_path)],
-            "original_size_mb": round(original_size, 2),
-            "compressed_size_mb": round(original_size, 2),
-            "reduction_percent": 0.0,
-            "compression_method": "none",
-            "compression_mode": compression_mode,
-            "was_split": False,
-            "total_parts": 1,
-            "success": True,
-            "note": "Already optimized",
-            "page_count": page_count,
-            "part_sizes": [single_size],
-            "bloat_detected": True,
-            "bloat_pct": round(bloat_pct, 1),
-            "bloat_action": "return_original",
-        })
 
     reduction = ((original_size - compressed_size) / original_size) * 100
 
