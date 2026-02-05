@@ -30,6 +30,7 @@ from exceptions import (
     MetadataCorruptionError,
     SplitError,
     DownloadError,
+    ProcessingTimeoutError,
 )
 import job_queue
 import utils
@@ -906,6 +907,8 @@ def get_error_status_code(error: Exception) -> int:
     if isinstance(error, DownloadError):
         # DownloadError carries its own status code for clarity
         return getattr(error, "status_code", 400)
+    if isinstance(error, ProcessingTimeoutError):
+        return 504
     if isinstance(error, (EncryptionError, StructureError, MetadataCorruptionError, SplitError)):
         return 422  # Unprocessable Entity - valid request but can't process the PDF
     if isinstance(error, FileNotFoundError):

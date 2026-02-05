@@ -16,6 +16,7 @@ from exceptions import (
     StructureError,
     MetadataCorruptionError,
     SplitError,
+    ProcessingTimeoutError,
 )
 from utils import env_bool, env_float, env_int, get_file_size_mb, get_effective_cpu_count
 
@@ -351,13 +352,10 @@ def compress_pdf(
     )
     force_parallel_by_pages = page_parallel_candidate and original_size >= PARALLEL_PAGE_FORCE_MIN_MB
     # For no-split flows, be more conservative about parallelizing midsize files to avoid
-    # heavy split/merge overhead. Require >150MB before size-based parallel if split is off.
+    # heavy split/merge overhead. Require >PARALLEL_SERIAL_CUTOFF_MB for size-based parallel.
     size_parallel = (
         original_size > PARALLEL_THRESHOLD_MB
-        and (
-            (split_requested and original_size > PARALLEL_SERIAL_CUTOFF_MB)
-            or (not split_requested and original_size > 200.0)
-        )
+        and original_size > PARALLEL_SERIAL_CUTOFF_MB
         and est_chunks > 3
     )
     use_parallel = force_parallel_by_pages or size_parallel or page_parallel_candidate
@@ -501,7 +499,7 @@ def compress_pdf(
                 out_mb,
             )
             return _augment(result)
-        if timed_out and not split_requested and use_parallel:
+        if timed_out and not split_requested:
             logger.warning(
                 "[compress] Serial compression timed out; falling back to parallel for %s",
                 input_path.name,
@@ -518,6 +516,8 @@ def compress_pdf(
             )
             return _augment(result)
         # Map error message to specific exception type
+        if timed_out:
+            raise ProcessingTimeoutError.for_file(input_path.name)
         if 'password' in msg_lower or 'encrypt' in msg_lower or 'locked' in msg_lower:
             raise EncryptionError.for_file(input_path.name)
         elif 'corrupted' in msg_lower or 'damaged' in msg_lower or 'structure' in msg_lower:

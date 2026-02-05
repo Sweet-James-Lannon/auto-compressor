@@ -929,6 +929,7 @@ def compress_parallel(
     probe_pps = None
     probe_mbps = None
     probe_elapsed = None
+    probe_reinserted = False
     time_budget = max(
         CHUNK_TIME_BUDGET_MIN_SEC,
         min(CHUNK_TIME_BUDGET_SEC, CHUNK_TIME_BUDGET_MAX_SEC),
@@ -1000,7 +1001,7 @@ def compress_parallel(
         probe_out_mb = get_file_size_mb(probe_path) if probe_path.exists() else probe_mb
         probe_inflated = success and probe_out_mb > probe_mb * (1 + PROBE_INFLATION_ABORT_PCT)
         probe_slow = probe_elapsed is not None and probe_elapsed > PROBE_TIME_BUDGET_SEC
-        if probe_inflated or probe_slow:
+        if probe_inflated:
             bailout_reason = []
             if probe_inflated:
                 bailout_reason.append(
@@ -1084,8 +1085,30 @@ def compress_parallel(
                 "probe_bailout": True,
                 "probe_bailout_reason": ", ".join(bailout_reason),
                 "lossless_fallback_used": lossless_used,
-                "note": "Probe showed inflation/slow path; applied lossless fallback before returning",
+                "note": "Probe showed inflation; applied lossless fallback before returning",
             }
+        elif probe_slow and not probe_inflated and not success:
+            logger.warning(
+                "[PARALLEL_PROBE] Probe timed out (%.1fs > %ss) but no inflation; "
+                "continuing with chunk compression (re-inserting probe chunk)",
+                probe_elapsed,
+                PROBE_TIME_BUDGET_SEC,
+            )
+            strategy_outcome["probe_status"] = "timeout_continue"
+            strategy_outcome["timeouts"]["probe_timeout"] += 1
+
+            failed_chunks = [
+                (idx, path) for idx, path in failed_chunks
+                if path != probe_chunk
+            ]
+
+            insert_pos = min(probe_idx, len(chunk_paths))
+            chunk_paths.insert(insert_pos, probe_chunk)
+
+            if probe_path != probe_chunk and probe_path.exists():
+                probe_path.unlink(missing_ok=True)
+
+            probe_reinserted = True
 
         # Retune remaining chunks based on probe throughput.
         if (probe_pps or probe_mbps) and chunk_paths:
@@ -1119,7 +1142,7 @@ def compress_parallel(
     # Build execution plan with stable order keys (page order).
     tasks: List[Tuple[int, Path]] = []
     plan_list: List[Optional[Path]] = list(chunk_paths)
-    if "probe_chunk" in locals():
+    if "probe_chunk" in locals() and not probe_reinserted:
         insert_at = min(probe_idx, len(plan_list))
         plan_list.insert(insert_at, None)  # placeholder for probe
 
@@ -1336,7 +1359,7 @@ def compress_parallel(
 
     # Cleanup original chunk files
     source_chunks: List[Path] = [c for _, c in tasks]
-    if "probe_chunk" in locals():
+    if "probe_chunk" in locals() and not probe_reinserted:
         source_chunks.append(probe_chunk)
     for chunk in source_chunks:
         chunk.unlink(missing_ok=True)

@@ -89,6 +89,19 @@ class StructureError(PDFCompressionError):
         )
 
 
+class ProcessingTimeoutError(PDFCompressionError):
+    """PDF processing exceeded the time limit."""
+
+    error_type: str = "ProcessingTimeoutError"
+    status_code: int = 504
+
+    @staticmethod
+    def for_file(filename: str, detail: str = "Processing timed out.") -> "ProcessingTimeoutError":
+        return ProcessingTimeoutError(
+            f"'{filename}' processing timed out. {detail} Try again or split the PDF into smaller parts."
+        )
+
+
 class SplitError(PDFCompressionError):
     """PDF cannot be split into small enough parts for email.
 
