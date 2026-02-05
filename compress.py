@@ -271,9 +271,11 @@ def compress_pdf(
         try:
             # Micro-probe uses the SAME mode as actual compression to accurately predict inflation
             probe_info = compress_ghostscript.run_micro_probe(input_path, compression_mode)
+            # Threshold: 5% inflation on probe sample indicates likely incompressible
+            # Lower than original 20% to catch bloat earlier, but not 0% which triggers on noise
             probe_bad = (
                 not probe_info.get("success")
-                or probe_info.get("delta_pct", 0) > 0  # ANY inflation = skip compression
+                or probe_info.get("delta_pct", 0) > 5
                 or probe_info.get("elapsed", 0) > compress_ghostscript.PROBE_TIME_BUDGET_SEC * 1.5
             )
             logger.info(
@@ -286,8 +288,9 @@ def compress_pdf(
         except Exception as exc:
             logger.warning("[compress] Micro-probe failed (will ignore): %s", exc)
 
-    # If probe indicates risk (any inflation), skip compression entirely and return original.
-    # Even lossless mode can bloat already-optimized PDFs (+155% seen in Azure logs).
+    # If probe indicates significant risk (>5% inflation), skip compression entirely.
+    # This catches truly incompressible PDFs (+37%, +58%, +155% seen in Azure logs)
+    # while allowing files with minor probe fluctuations to proceed.
     if probe_bad and original_size > PARALLEL_THRESHOLD_MB:
         delta_pct = probe_info.get("delta_pct", 0) if probe_info else 0
         logger.info(
