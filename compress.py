@@ -269,11 +269,11 @@ def compress_pdf(
     probe_bad = False
     if compression_mode == "aggressive" and original_size >= PARALLEL_THRESHOLD_MB and original_size <= 400 and page_count:
         try:
-            # Micro-probe always uses lossless to avoid inflate-y aggressive test runs
-            probe_info = compress_ghostscript.run_micro_probe(input_path, "lossless")
+            # Micro-probe uses the SAME mode as actual compression to accurately predict inflation
+            probe_info = compress_ghostscript.run_micro_probe(input_path, compression_mode)
             probe_bad = (
                 not probe_info.get("success")
-                or probe_info.get("delta_pct", 0) > 20
+                or probe_info.get("delta_pct", 0) > 0  # ANY inflation = skip compression
                 or probe_info.get("elapsed", 0) > compress_ghostscript.PROBE_TIME_BUDGET_SEC * 1.5
             )
             logger.info(
@@ -286,11 +286,58 @@ def compress_pdf(
         except Exception as exc:
             logger.warning("[compress] Micro-probe failed (will ignore): %s", exc)
 
-    # If probe indicates risk, downgrade to lossless path to protect quality/SLA.
-    if probe_bad and compression_mode == "aggressive" and original_size > 200:
-        logger.info("[compress] Probe indicated risk on large file; downgrading to lossless path")
-        compression_mode = "lossless"
-        quality_mode = "lossless"
+    # If probe indicates risk (any inflation), skip compression entirely and return original.
+    # Even lossless mode can bloat already-optimized PDFs (+155% seen in Azure logs).
+    if probe_bad and original_size > PARALLEL_THRESHOLD_MB:
+        delta_pct = probe_info.get("delta_pct", 0) if probe_info else 0
+        logger.info(
+            "[compress] Probe showed inflation (%.1f%%); skipping compression and returning original",
+            delta_pct,
+        )
+        # Still split if above threshold
+        if split_threshold_mb and effective_split_trigger and original_size > effective_split_trigger:
+            output_paths = split_pdf.split_for_delivery(
+                input_path, working_dir, input_path.stem,
+                threshold_mb=split_threshold_mb,
+                progress_callback=progress_callback,
+                prefer_binary=True,
+                skip_optimization_under_threshold=True,
+            )
+            return _augment({
+                "output_path": str(output_paths[0]),
+                "output_paths": [str(p) for p in output_paths],
+                "original_size_mb": round(original_size, 2),
+                "compressed_size_mb": round(original_size, 2),
+                "reduction_percent": 0.0,
+                "compression_method": "skipped",
+                "compression_mode": compression_mode,
+                "was_split": len(output_paths) > 1,
+                "total_parts": len(output_paths),
+                "success": True,
+                "note": f"Probe showed {delta_pct:.1f}% inflation; split only",
+                "page_count": page_count,
+                "part_sizes": [p.stat().st_size for p in output_paths],
+                "probe_skipped": True,
+                "probe_delta_pct": round(delta_pct, 1),
+            })
+
+        return _augment({
+            "output_path": str(input_path),
+            "output_paths": [str(input_path)],
+            "original_size_mb": round(original_size, 2),
+            "compressed_size_mb": round(original_size, 2),
+            "reduction_percent": 0.0,
+            "compression_method": "skipped",
+            "compression_mode": compression_mode,
+            "was_split": False,
+            "total_parts": 1,
+            "success": True,
+            "note": f"Probe showed {delta_pct:.1f}% inflation; returning original",
+            "page_count": page_count,
+            "part_sizes": [original_bytes],
+            "probe_skipped": True,
+            "probe_delta_pct": round(delta_pct, 1),
+        })
 
     # =========================================================================
     # ROUTE: Large files use parallel compression for speed
