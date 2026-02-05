@@ -56,9 +56,9 @@ GS_GRAY_DOWNSAMPLE_TYPE = env_choice(
 )
 GS_BAND_HEIGHT = env_int("GS_BAND_HEIGHT", 100)
 GS_BAND_BUFFER_SPACE_MB = env_int("GS_BAND_BUFFER_SPACE_MB", 500)
-GS_COLOR_IMAGE_RESOLUTION = max(150, env_int("GS_COLOR_IMAGE_RESOLUTION", 150))
-GS_GRAY_IMAGE_RESOLUTION = max(200, env_int("GS_GRAY_IMAGE_RESOLUTION", 200))
-GS_MONO_IMAGE_RESOLUTION = max(300, env_int("GS_MONO_IMAGE_RESOLUTION", 300))
+GS_COLOR_IMAGE_RESOLUTION = env_int("GS_COLOR_IMAGE_RESOLUTION", 72)
+GS_GRAY_IMAGE_RESOLUTION = env_int("GS_GRAY_IMAGE_RESOLUTION", 72)
+GS_MONO_IMAGE_RESOLUTION = env_int("GS_MONO_IMAGE_RESOLUTION", 300)
 PARALLEL_SERIAL_FALLBACK = env_bool("PARALLEL_SERIAL_FALLBACK", True)
 # Fixed SLA/quality guardrails (non-configurable)
 CHUNK_TIME_BUDGET_SEC = 60
@@ -339,6 +339,14 @@ def compress_pdf_with_ghostscript(
         file_mb = input_path.stat().st_size / (1024 * 1024)
         timeout = timeout_override or _chunk_timeout_seconds(file_mb)
 
+        logger.info(
+            "[DIAG] GS aggressive cmd: dpi=%s/%s/%s downsample=%s/%s "
+            "threads=%s timeout=%ss fast_web=%s band_height=%s band_buffer_mb=%s",
+            GS_COLOR_IMAGE_RESOLUTION, GS_GRAY_IMAGE_RESOLUTION, GS_MONO_IMAGE_RESOLUTION,
+            GS_COLOR_DOWNSAMPLE_TYPE, GS_GRAY_DOWNSAMPLE_TYPE,
+            threads, timeout,
+            GS_FAST_WEB_VIEW, GS_BAND_HEIGHT, GS_BAND_BUFFER_SPACE_MB,
+        )
         logger.info(f"Compressing {input_path.name} ({file_mb:.1f}MB)")
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -585,6 +593,7 @@ def compress_parallel(
     target_chunk_mb: Optional[float] = None,
     max_chunk_mb: Optional[float] = None,
     input_page_count: Optional[int] = None,
+    allow_lossy: bool = False,
 ) -> Dict:
     """
     Parallel compression strategy for large PDFs.
@@ -694,6 +703,12 @@ def compress_parallel(
     )
     logger.info(
         f"[PARALLEL] Chunking target {target_chunk_mb:.1f}MB (max {max_chunk_mb:.1f}MB, cap {max_parallel_chunks}, max pages/chunk {max_pages_per_chunk})"
+    )
+    logger.info(
+        "[DIAG] === PARALLEL JOB START === file=%s size_mb=%.2f mode=%s "
+        "allow_lossy=%s workers=%s target_chunk=%.1f max_chunk=%.1f",
+        input_path.name, original_size_mb, compression_mode,
+        allow_lossy, max_workers, target_chunk_mb, max_chunk_mb,
     )
 
     # Step 1: Calculate number of chunks targeting the configured size.
@@ -1605,7 +1620,56 @@ def compress_parallel(
                 logger.warning("[PARALLEL] Lossless fallback after bloat failed: %s", exc)
                 lossless_path.unlink(missing_ok=True)
 
-            if not lossless_used:
+            # If lossless didn't help and lossy is allowed, try ultra fallback.
+            ultra_used = False
+            if not lossless_used and allow_lossy:
+                ultra_path = working_dir / f"{input_path.stem}_ultra_parallel.pdf"
+                ultra_timeout = min(240, max(90, int(original_size_mb * 1.2)))
+                try:
+                    logger.info(
+                        "[PARALLEL] Trying ultra fallback after bloat (%.1fMB, timeout=%ss)",
+                        original_size_mb,
+                        ultra_timeout,
+                    )
+                    ok_ultra, msg_ultra = compress_ultra_fallback(
+                        input_path,
+                        ultra_path,
+                        timeout_override=ultra_timeout,
+                    )
+                    if ok_ultra and ultra_path.exists():
+                        ultra_mb = get_file_size_mb(ultra_path)
+                        if ultra_mb < original_size_mb:
+                            for part in verified_parts:
+                                part.unlink(missing_ok=True)
+                            verified_parts = [ultra_path]
+                            combined_bytes = ultra_path.stat().st_size
+                            combined_mb = combined_bytes / (1024 * 1024)
+                            reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
+                            bloat_action = "ultra_fallback"
+                            bloat_detected = False
+                            bloat_pct = 0.0
+                            ultra_used = True
+                            logger.info(
+                                "[PARALLEL] Ultra fallback succeeded: %.1fMB -> %.1fMB (%.1f%%)",
+                                original_size_mb,
+                                combined_mb,
+                                reduction_percent,
+                            )
+                        else:
+                            logger.warning(
+                                "[PARALLEL] Ultra fallback also inflated (%.1fMB -> %.1fMB); returning original",
+                                original_size_mb,
+                                ultra_mb,
+                            )
+                            ultra_path.unlink(missing_ok=True)
+                    else:
+                        logger.warning("[PARALLEL] Ultra fallback failed: %s", msg_ultra)
+                        ultra_path.unlink(missing_ok=True)
+                except Exception as exc:
+                    logger.warning("[PARALLEL] Ultra fallback error: %s", exc)
+                    ultra_path.unlink(missing_ok=True)
+
+            if not lossless_used and not ultra_used:
                 merged_path = verified_parts[0] if verified_parts else (working_dir / f"{input_path.stem}_compressed.pdf")
                 if merged_path.resolve() != input_path.resolve():
                     merged_path.unlink(missing_ok=True)
@@ -1664,7 +1728,7 @@ def compress_parallel(
         "reduction_percent": round(reduction_percent, 1),
         "compression_method": "ghostscript_parallel",
         "compression_mode": compression_mode,
-        "quality_mode": "aggressive_150dpi" if compression_mode == "aggressive" else "lossless",
+        "quality_mode": "aggressive_72dpi" if compression_mode == "aggressive" else "lossless",
         "was_split": len(verified_parts) > 1,
         "total_parts": len(verified_parts),
         "success": True,

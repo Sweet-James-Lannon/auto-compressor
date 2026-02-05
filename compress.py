@@ -205,10 +205,7 @@ def compress_pdf(
         logger.warning(f"[compress] Composition detection failed (continuing): {exc}")
 
     if composition["already_compressed"]:
-        compression_mode = "lossless"
-        logger.info("[compress] Detected already-compressed PDF (%s); forcing lossless path", composition["already_reason"])
-        force_serial_for_already = not ALLOW_PARALLEL_ON_ALREADY
-        serial_timeout_override = LOSSLESS_ALREADY_TIMEOUT_SEC
+        logger.info("[compress] Detected already-compressed PDF (%s); proceeding with %s mode (advisory only)", composition["already_reason"], compression_mode)
     elif compression_mode == "adaptive" and composition["scanned"] and composition["scan_confidence"] >= SCANNED_CONFIDENCE_FOR_AGGRESSIVE:
         compression_mode = "aggressive"
         logger.info("[compress] Adaptive: high-confidence scanned; choosing aggressive")
@@ -217,7 +214,18 @@ def compress_pdf(
     effective_split_trigger = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
     split_requested = split_threshold_mb is not None and split_threshold_mb > 0
     bytes_per_page = (original_bytes / max(page_count, 1)) if page_count else None
-    quality_mode = "aggressive_150dpi" if compression_mode == "aggressive" else "lossless"
+    quality_mode = "aggressive_72dpi" if compression_mode == "aggressive" else "lossless"
+
+    logger.info(
+        "[DIAG] GS settings: color_dpi=%s gray_dpi=%s mono_dpi=%s "
+        "color_downsample=%s gray_downsample=%s quality_mode=%s",
+        compress_ghostscript.GS_COLOR_IMAGE_RESOLUTION,
+        compress_ghostscript.GS_GRAY_IMAGE_RESOLUTION,
+        compress_ghostscript.GS_MONO_IMAGE_RESOLUTION,
+        compress_ghostscript.GS_COLOR_DOWNSAMPLE_TYPE,
+        compress_ghostscript.GS_GRAY_DOWNSAMPLE_TYPE,
+        quality_mode,
+    )
 
     def _augment(resp: Dict) -> Dict:
         resp.setdefault("quality_mode", quality_mode)
@@ -279,7 +287,17 @@ def compress_pdf(
             "part_sizes": [original_bytes]
         })
 
-    logger.info(f"[SIZE_CHECK] Input: {input_path.name} = {original_bytes} bytes ({original_size:.2f}MB)")
+    logger.info(
+        "[DIAG] === JOB START === file=%s size_mb=%.2f pages=%s bytes_per_page=%s "
+        "mode=%s allow_lossy=%s already_compressed=%s(%s) scanned=%s(%.0f%%) "
+        "split_requested=%s split_threshold=%s",
+        input_path.name, original_size, page_count,
+        f"{bytes_per_page:.0f}" if bytes_per_page else "unknown",
+        compression_mode, ALLOW_LOSSY_COMPRESSION,
+        composition["already_compressed"], composition["already_reason"] or "n/a",
+        composition["scanned"], composition["scan_confidence"],
+        split_requested, split_threshold_mb,
+    )
 
     # Optional micro-probe to predict inflation/throughput on aggressive mode
     probe_info = None
@@ -310,25 +328,15 @@ def compress_pdf(
         except Exception as exc:
             logger.warning("[compress] Micro-probe failed (will ignore): %s", exc)
 
-    # If probe indicates significant risk (>5% inflation), skip compression entirely.
-    # This catches truly incompressible PDFs (+37%, +58%, +155% seen in Azure logs)
-    # while allowing files with minor probe fluctuations to proceed.
+    # Micro-probe is advisory only — log the warning but let compression run.
+    # The bloat handler after compression catches inflation and falls back.
     if probe_bad and original_size > PARALLEL_THRESHOLD_MB:
         delta_pct = probe_info.get("delta_pct", 0) if probe_info else 0
-        if compression_mode == "aggressive" and (probe_force_lossless or delta_pct >= PROBE_INFLATION_WARN_PCT):
-            logger.info(
-                "[compress] Probe showed inflation (%.1f%%); switching to lossless path instead of skipping",
-                delta_pct,
-            )
-            compression_mode = "lossless"
-            quality_mode = "lossless"
-            probe_action = "forced_lossless"
-        else:
-            probe_action = "warn_only"
-            logger.info(
-                "[compress] Probe warning (%.1f%%); continuing with conservative settings",
-                delta_pct,
-            )
+        probe_action = "warn_only"
+        logger.info(
+            "[compress] Probe warning (%.1f%%); proceeding — bloat handler will catch inflation",
+            delta_pct,
+        )
 
     # =========================================================================
     # ROUTE: Large files use parallel compression for speed
@@ -354,16 +362,15 @@ def compress_pdf(
     )
     use_parallel = force_parallel_by_pages or size_parallel or page_parallel_candidate
 
-    if force_serial_for_already:
-        force_parallel_by_pages = False
-        page_parallel_candidate = False
-        size_parallel = False
-        use_parallel = False
-        logger.info("[compress] Already-compressed detected; forcing serial lossless path (no parallel)")
+    logger.info(
+        "[DIAG] Route decision: use_parallel=%s (size_parallel=%s force_by_pages=%s "
+        "page_candidate=%s) est_chunks=%s file_mb=%.1f",
+        use_parallel, size_parallel, force_parallel_by_pages,
+        page_parallel_candidate, est_chunks, original_size,
+    )
 
-    # If probe shows inflation/slow path and we weren't forced by pages, prefer serial to protect quality/SLA.
-    if probe_bad and not force_parallel_by_pages:
-        use_parallel = False
+    # Note: force_serial_for_already removed — let normal size-based routing decide.
+    # "Already compressed" detection is now advisory only.
 
     if page_parallel_candidate and not force_parallel_by_pages:
         logger.info(
@@ -437,6 +444,7 @@ def compress_pdf(
             target_chunk_mb=target_chunk_mb,
             max_chunk_mb=max_chunk_mb,
             input_page_count=page_count,
+            allow_lossy=ALLOW_LOSSY_COMPRESSION,
         )
 
     if force_parallel_by_pages:
@@ -575,15 +583,56 @@ def compress_pdf(
                 shutil.copy2(input_path, output_path)
                 compressed_size = original_size
         else:
-            logger.warning(
-                "Compression increased size (%.2fMB -> %.2fMB, +%.1f%%), returning original",
-                original_size,
-                compressed_size,
-                bloat_pct,
-            )
-            output_path.unlink()
-            shutil.copy2(input_path, output_path)
-            compressed_size = original_size
+            # Lossless mode bloated. If this file was flagged "already compressed" and
+            # lossy is allowed, try aggressive compression before giving up — the
+            # "already compressed" detection may have been a false positive.
+            if composition["already_compressed"] and ALLOW_LOSSY_COMPRESSION:
+                logger.info(
+                    "[compress] Lossless bloated on 'already-compressed' file (%.2fMB -> %.2fMB, +%.1f%%); "
+                    "trying aggressive fallback",
+                    original_size,
+                    compressed_size,
+                    bloat_pct,
+                )
+                output_path.unlink(missing_ok=True)
+                agg_ok, agg_msg = compress_ghostscript.compress_pdf_with_ghostscript(input_path, output_path)
+                if agg_ok and output_path.exists():
+                    agg_size = get_file_size_mb(output_path)
+                    if agg_size < original_size:
+                        compressed_size = agg_size
+                        compressed_bytes = output_path.stat().st_size
+                        compression_mode = "aggressive"
+                        quality_mode = "aggressive_72dpi"
+                        lossless_retry_worked = True
+                        logger.info(
+                            "[compress] Aggressive fallback succeeded: %.2fMB -> %.2fMB",
+                            original_size,
+                            agg_size,
+                        )
+                    else:
+                        logger.warning(
+                            "[compress] Aggressive fallback also bloated (%.2fMB -> %.2fMB); returning original",
+                            original_size,
+                            agg_size,
+                        )
+                        output_path.unlink(missing_ok=True)
+                        shutil.copy2(input_path, output_path)
+                        compressed_size = original_size
+                else:
+                    logger.warning("[compress] Aggressive fallback failed: %s; returning original", agg_msg)
+                    output_path.unlink(missing_ok=True)
+                    shutil.copy2(input_path, output_path)
+                    compressed_size = original_size
+            else:
+                logger.warning(
+                    "Compression increased size (%.2fMB -> %.2fMB, +%.1f%%), returning original",
+                    original_size,
+                    compressed_size,
+                    bloat_pct,
+                )
+                output_path.unlink()
+                shutil.copy2(input_path, output_path)
+                compressed_size = original_size
 
         # If lossless retry worked, skip the "return original" block and continue to success path
         if not lossless_retry_worked:
@@ -651,6 +700,12 @@ def compress_pdf(
             ULTRA_FALLBACK_GRAY_DPI,
             ULTRA_FALLBACK_MONO_DPI,
         )
+        # Save pre-ultra output so we can restore if ultra inflates.
+        pre_ultra_path = working_dir / f"{input_path.stem}_pre_ultra.pdf"
+        shutil.copy2(output_path, pre_ultra_path)
+        pre_ultra_size = compressed_size
+        pre_ultra_bytes = compressed_bytes
+
         ultra_ok, ultra_msg = compress_ghostscript.compress_ultra_fallback(
             input_path,
             output_path,
@@ -660,17 +715,51 @@ def compress_pdf(
             mono_res=ULTRA_FALLBACK_MONO_DPI,
         )
         if ultra_ok and output_path.exists():
-            compressed_size = get_file_size_mb(output_path)
-            compressed_bytes = output_path.stat().st_size
-            reduction = ((original_size - compressed_size) / original_size) * 100 if original_size > 0 else 0.0
-            compression_mode = "aggressive"
-            quality_mode = "aggressive_150dpi"
-            ultra_used = True
-            logger.info("[compress] Ultra fallback: %.1fMB -> %.1fMB (%.1f%%)", original_size, compressed_size, reduction)
+            ultra_size = get_file_size_mb(output_path)
+            # Guard: if ultra output is larger than original, discard it.
+            if ultra_size >= original_size:
+                logger.warning(
+                    "[compress] Ultra fallback inflated (%.1fMB -> %.1fMB); restoring pre-ultra output",
+                    original_size,
+                    ultra_size,
+                )
+                output_path.unlink(missing_ok=True)
+                shutil.move(str(pre_ultra_path), str(output_path))
+                compressed_size = pre_ultra_size
+                compressed_bytes = pre_ultra_bytes
+                reduction = ((original_size - compressed_size) / original_size) * 100 if original_size > 0 else 0.0
+            else:
+                compressed_size = ultra_size
+                compressed_bytes = output_path.stat().st_size
+                reduction = ((original_size - compressed_size) / original_size) * 100 if original_size > 0 else 0.0
+                compression_mode = "aggressive"
+                quality_mode = "aggressive_72dpi"
+                ultra_used = True
+                logger.info("[compress] Ultra fallback: %.1fMB -> %.1fMB (%.1f%%)", original_size, compressed_size, reduction)
         else:
-            logger.warning("[compress] Ultra fallback failed: %s; keeping previous output", ultra_msg)
+            logger.warning("[compress] Ultra fallback failed: %s; restoring pre-ultra output", ultra_msg)
+            # Restore the pre-ultra output in case ultra corrupted the file.
+            if pre_ultra_path.exists():
+                output_path.unlink(missing_ok=True)
+                shutil.move(str(pre_ultra_path), str(output_path))
+                compressed_size = pre_ultra_size
+                compressed_bytes = pre_ultra_bytes
+                reduction = ((original_size - compressed_size) / original_size) * 100 if original_size > 0 else 0.0
 
-    logger.info(f"Done: {original_size:.1f}MB -> {compressed_size:.1f}MB ({reduction:.1f}%)")
+        pre_ultra_path.unlink(missing_ok=True)
+
+    logger.info(
+        "[DIAG] === JOB END === file=%s original_mb=%.2f compressed_mb=%.2f "
+        "reduction=%.1f%% method=%s mode=%s quality=%s ultra=%s "
+        "bloat_detected=%s split=%s parts=%s",
+        input_path.name, original_size, compressed_size,
+        reduction,
+        "ghostscript_ultra" if ultra_used else "ghostscript",
+        compression_mode, quality_mode, ultra_used,
+        compressed_size >= original_size and not lossless_retry_worked,
+        split_requested,
+        1,
+    )
 
     # Check if splitting is needed
     if split_threshold_mb and effective_split_trigger and compressed_size > effective_split_trigger:

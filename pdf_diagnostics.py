@@ -107,7 +107,7 @@ def detect_already_compressed(pdf_path: Path) -> Tuple[bool, str]:
         "ghostscript",
         "ilovepdf",
         "smallpdf",
-        "adobe acrobat",
+
         "pdf compressor",
         "nitro",
         "foxit",
@@ -133,9 +133,6 @@ def detect_already_compressed(pdf_path: Path) -> Tuple[bool, str]:
         # Less than 20KB per page is quite compressed
         if bytes_per_page < 20000:
             return True, f"Low bytes/page ratio ({bytes_per_page/1024:.1f}KB/page)"
-        # Less than 50KB per page might be compressed
-        elif bytes_per_page < 50000:
-            return True, f"Moderate compression detected ({bytes_per_page/1024:.1f}KB/page)"
 
     return False, ""
 
