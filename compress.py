@@ -68,6 +68,14 @@ DEFAULT_TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "40"))
 DEFAULT_MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(DEFAULT_TARGET_CHUNK_MB * 1.5)))
 PROBE_INFLATION_WARN_PCT = env_float("PROBE_INFLATION_WARN_PCT", 12.0)
 PROBE_INFLATION_FORCE_LOSSLESS_PCT = env_float("PROBE_INFLATION_FORCE_LOSSLESS_PCT", 60.0)
+ULTRA_FALLBACK_MIN_REDUCTION_PCT = env_float("ULTRA_FALLBACK_MIN_REDUCTION_PCT", 5.0)
+ULTRA_FALLBACK_MIN_SIZE_MB = env_float("ULTRA_FALLBACK_MIN_SIZE_MB", 50.0)
+ULTRA_FALLBACK_JPEGQ = env_int("ULTRA_FALLBACK_JPEGQ", 55)
+ULTRA_FALLBACK_COLOR_DPI = env_int("ULTRA_FALLBACK_COLOR_DPI", 120)
+ULTRA_FALLBACK_GRAY_DPI = env_int("ULTRA_FALLBACK_GRAY_DPI", 150)
+ULTRA_FALLBACK_MONO_DPI = env_int("ULTRA_FALLBACK_MONO_DPI", 300)
+LOSSLESS_ALREADY_TIMEOUT_SEC = env_int("LOSSLESS_ALREADY_TIMEOUT_SEC", 240)
+ALLOW_PARALLEL_ON_ALREADY = env_bool("ALLOW_PARALLEL_ON_ALREADY", False)
 
 
 def resolve_compression_mode(input_path: Path) -> str:
@@ -155,6 +163,8 @@ def compress_pdf(
         "scanned": False,
         "scan_confidence": 0.0,
     }
+    force_serial_for_already = False
+    serial_timeout_override = None
 
     # Validate PDF before processing - catch encrypted files early
     page_count = None
@@ -197,6 +207,8 @@ def compress_pdf(
     if composition["already_compressed"]:
         compression_mode = "lossless"
         logger.info("[compress] Detected already-compressed PDF (%s); forcing lossless path", composition["already_reason"])
+        force_serial_for_already = not ALLOW_PARALLEL_ON_ALREADY
+        serial_timeout_override = LOSSLESS_ALREADY_TIMEOUT_SEC
     elif compression_mode == "adaptive" and composition["scanned"] and composition["scan_confidence"] >= SCANNED_CONFIDENCE_FOR_AGGRESSIVE:
         compression_mode = "aggressive"
         logger.info("[compress] Adaptive: high-confidence scanned; choosing aggressive")
@@ -342,6 +354,13 @@ def compress_pdf(
     )
     use_parallel = force_parallel_by_pages or size_parallel or page_parallel_candidate
 
+    if force_serial_for_already:
+        force_parallel_by_pages = False
+        page_parallel_candidate = False
+        size_parallel = False
+        use_parallel = False
+        logger.info("[compress] Already-compressed detected; forcing serial lossless path (no parallel)")
+
     # If probe shows inflation/slow path and we weren't forced by pages, prefer serial to protect quality/SLA.
     if probe_bad and not force_parallel_by_pages:
         use_parallel = False
@@ -453,7 +472,7 @@ def compress_pdf(
         if compression_mode == "lossless"
         else compress_ghostscript.compress_pdf_with_ghostscript
     )
-    success, message = compress_fn(input_path, output_path)
+    success, message = compress_fn(input_path, output_path, timeout_override=serial_timeout_override)
 
     if not success:
         msg_lower = message.lower()
@@ -617,6 +636,39 @@ def compress_pdf(
             })
 
     reduction = ((original_size - compressed_size) / original_size) * 100
+    # If we barely saved anything and lossy is allowed, try an ultra fallback with lower DPI/JPEGQ.
+    ultra_used = False
+    if (
+        ALLOW_LOSSY_COMPRESSION
+        and original_size >= ULTRA_FALLBACK_MIN_SIZE_MB
+        and reduction < ULTRA_FALLBACK_MIN_REDUCTION_PCT
+    ):
+        logger.warning(
+            "[compress] Low savings (%.1f%%); running ultra fallback (JPEGQ=%s, DPI=%s/%s/%s)",
+            reduction,
+            ULTRA_FALLBACK_JPEGQ,
+            ULTRA_FALLBACK_COLOR_DPI,
+            ULTRA_FALLBACK_GRAY_DPI,
+            ULTRA_FALLBACK_MONO_DPI,
+        )
+        ultra_ok, ultra_msg = compress_ghostscript.compress_ultra_fallback(
+            input_path,
+            output_path,
+            jpeg_quality=ULTRA_FALLBACK_JPEGQ,
+            color_res=ULTRA_FALLBACK_COLOR_DPI,
+            gray_res=ULTRA_FALLBACK_GRAY_DPI,
+            mono_res=ULTRA_FALLBACK_MONO_DPI,
+        )
+        if ultra_ok and output_path.exists():
+            compressed_size = get_file_size_mb(output_path)
+            compressed_bytes = output_path.stat().st_size
+            reduction = ((original_size - compressed_size) / original_size) * 100 if original_size > 0 else 0.0
+            compression_mode = "aggressive"
+            quality_mode = "aggressive_150dpi"
+            ultra_used = True
+            logger.info("[compress] Ultra fallback: %.1fMB -> %.1fMB (%.1f%%)", original_size, compressed_size, reduction)
+        else:
+            logger.warning("[compress] Ultra fallback failed: %s; keeping previous output", ultra_msg)
 
     logger.info(f"Done: {original_size:.1f}MB -> {compressed_size:.1f}MB ({reduction:.1f}%)")
 
@@ -667,7 +719,7 @@ def compress_pdf(
         "original_size_mb": round(original_size, 2),
         "compressed_size_mb": round(compressed_size, 2),
         "reduction_percent": round(reduction, 1),
-        "compression_method": "ghostscript",
+        "compression_method": "ghostscript_ultra" if ultra_used else "ghostscript",
         "compression_mode": compression_mode,
         "was_split": False,
         "total_parts": 1,

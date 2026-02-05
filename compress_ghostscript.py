@@ -463,6 +463,112 @@ def compress_ultra_aggressive(
         return False, str(e)
 
 
+def compress_ultra_fallback(
+    input_path: Path,
+    output_path: Path,
+    jpeg_quality: int = 55,
+    color_res: int = 120,
+    gray_res: int = 150,
+    mono_res: int = 300,
+    num_threads: Optional[int] = None,
+    timeout_override: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """
+    Ultra fallback for stubborn files: lower DPI + JPEGQ to force size reduction.
+    """
+    gs_cmd = get_ghostscript_command()
+    if not gs_cmd:
+        return False, "Ghostscript not installed"
+
+    if not input_path.exists():
+        return False, f"File not found: {input_path}"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    threads = _resolve_gs_threads(num_threads)
+    cmd = [
+        gs_cmd,
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        "-dPDFSETTINGS=/screen",
+        "-dNOPAUSE",
+        "-dBATCH",
+        "-dQUIET",
+        f"-dJPEGQ={int(max(10, min(jpeg_quality, 95)))}",
+        "-dAutoFilterColorImages=false",
+        "-dColorImageFilter=/DCTEncode",
+        "-dAutoFilterGrayImages=false",
+        "-dGrayImageFilter=/DCTEncode",
+        "-dDownsampleColorImages=true",
+        f"-dColorImageDownsampleType={GS_COLOR_DOWNSAMPLE_TYPE}",
+        f"-dColorImageResolution={max(72, color_res)}",
+        "-dColorImageDownsampleThreshold=1.0",
+        "-dDownsampleGrayImages=true",
+        f"-dGrayImageDownsampleType={GS_GRAY_DOWNSAMPLE_TYPE}",
+        f"-dGrayImageResolution={max(72, gray_res)}",
+        "-dGrayImageDownsampleThreshold=1.0",
+        "-dDownsampleMonoImages=true",
+        "-dMonoImageDownsampleType=/Subsample",
+        f"-dMonoImageResolution={max(150, mono_res)}",
+        "-dMonoImageDownsampleThreshold=1.0",
+        "-dDetectDuplicateImages=true",
+        "-dCompressFonts=true",
+        "-dSubsetFonts=true",
+        f"-dNumRenderingThreads={threads}",
+    ]
+    if GS_FAST_WEB_VIEW:
+        cmd.append("-dFastWebView=true")
+    if GS_BAND_HEIGHT > 0:
+        cmd.append(f"-dBandHeight={GS_BAND_HEIGHT}")
+    if GS_BAND_BUFFER_SPACE_MB > 0:
+        cmd.append(f"-dBandBufferSpace={GS_BAND_BUFFER_SPACE_MB * 1024 * 1024}")
+    cmd.extend(
+        [
+            f"-sOutputFile={output_path}",
+            str(input_path),
+        ]
+    )
+
+    try:
+        file_mb = input_path.stat().st_size / (1024 * 1024)
+        timeout = timeout_override or _chunk_timeout_seconds(file_mb)
+
+        logger.info(
+            "[ULTRA_FALLBACK] Compressing %s (%.1fMB) JPEGQ=%s DPI=%s/%s/%s",
+            input_path.name,
+            file_mb,
+            jpeg_quality,
+            color_res,
+            gray_res,
+            mono_res,
+        )
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+        if result.returncode != 0:
+            return False, translate_ghostscript_error(result.stderr, result.returncode)
+
+        if not output_path.exists():
+            return False, "Output file not created"
+
+        out_mb = output_path.stat().st_size / (1024 * 1024)
+        reduction = ((file_mb - out_mb) / file_mb) * 100 if file_mb > 0 else 0.0
+
+        logger.info(
+            "[ULTRA_FALLBACK] Result: %.1fMB -> %.1fMB (%.1f%% reduction)",
+            file_mb,
+            out_mb,
+            reduction,
+        )
+
+        return True, f"{reduction:.1f}% reduction"
+
+    except subprocess.TimeoutExpired:
+        return False, "Timeout exceeded"
+    except Exception as e:
+        return False, str(e)
+
+
 # =============================================================================
 # PARALLEL COMPRESSION - Uses multiple CPU cores
 # =============================================================================
