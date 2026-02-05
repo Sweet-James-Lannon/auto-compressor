@@ -1046,8 +1046,10 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         elif isinstance(task_data.get("download_url"), str):
             name_hint = task_data["download_url"]
 
-        split_requested = _is_truthy(task_data.get("split"))
-        split_override = _resolve_split_threshold_mb(task_data.get("split_threshold_mb")) if split_requested else None
+        split_override = _resolve_split_threshold_mb(
+            task_data.get("split_threshold_mb") or task_data.get("splitSizeMB")
+        )
+        split_requested = _is_truthy(task_data.get("split")) or split_override is not None
         if split_requested and split_override is None:
             split_override = BASE_SPLIT_THRESHOLD_MB
         split_threshold_mb = split_override if split_requested else None
@@ -1468,6 +1470,7 @@ def compress_async():
         split_override = _resolve_split_threshold_mb(split_override_raw)
         if split_override is not None:
             task_data["split_threshold_mb"] = split_override
+            task_data["split"] = True
 
         # Option 1: URL to download PDF
         download_url = data.get('file_download_link') or data.get('url') or data.get('file_url')
@@ -1530,6 +1533,7 @@ def compress_async():
         split_override = _resolve_split_threshold_mb(split_override_raw)
         if split_override is not None:
             task_data["split_threshold_mb"] = split_override
+            task_data["split"] = True
 
         upload = request.files.get('pdf') or request.files.get('file')
         if not upload:
