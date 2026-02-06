@@ -23,11 +23,11 @@ MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
 # Minimum chunk size to avoid spawning tiny Ghostscript jobs that add overhead.
 # Keep hardcoded (no env tuning) for predictable behavior.
 MIN_CHUNK_MB = 5.0
-# Large-file tuning defaults (used only when chunk env vars are not set).
-LARGE_FILE_TUNE_MIN_MB = 200.0
-LARGE_FILE_TARGET_CHUNK_MB = 60.0
-LARGE_FILE_MAX_CHUNK_MB = 90.0
-LARGE_FILE_MAX_PARALLEL_CHUNKS = 12
+# Large-file tuning defaults (used only when chunk overrides are not set).
+LARGE_FILE_TUNE_MIN_MB = float(os.environ.get("LARGE_FILE_TUNE_MIN_MB", "200"))
+LARGE_FILE_TARGET_CHUNK_MB = float(os.environ.get("LARGE_FILE_TARGET_CHUNK_MB", "60"))
+LARGE_FILE_MAX_CHUNK_MB = float(os.environ.get("LARGE_FILE_MAX_CHUNK_MB", "90"))
+LARGE_FILE_MAX_PARALLEL_CHUNKS = int(os.environ.get("LARGE_FILE_MAX_PARALLEL_CHUNKS", "12"))
 # Guardrail: only trigger merge fallback when output is meaningfully larger than input.
 PARALLEL_BLOAT_PCT = 0.08
 PARALLEL_MERGE_ON_BLOAT = env_bool("PARALLEL_MERGE_ON_BLOAT", True)
@@ -68,7 +68,10 @@ PROBE_TIME_BUDGET_SEC = 45          # seconds
 PROBE_INFLATION_ABORT_PCT = 0.20    # 20% growth triggers bailout
 PROBE_SAMPLE_PAGES = 3
 PARALLEL_JOB_SLA_SEC = 300          # hard cap for parallel job
-SLA_MAX_PARALLEL_CHUNKS = 5         # cap chunk fan-out in aggressive mode
+SLA_MAX_PARALLEL_CHUNKS = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS", 8))
+SLA_MAX_PARALLEL_CHUNKS_LARGE = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS_LARGE", 12))
+HARD_MAX_PARALLEL_CHUNKS = max(2, env_int("HARD_MAX_PARALLEL_CHUNKS", 24))
+PARALLEL_SPLIT_DELIVER_CHUNKS = env_bool("PARALLEL_SPLIT_DELIVER_CHUNKS", True)
 
 
 def _chunk_timeout_seconds(file_mb: float) -> int:
@@ -670,13 +673,17 @@ def compress_parallel(
     tuned_target = effective_target_chunk_mb
     tuned_max_chunk = effective_max_chunk_mb
     tuned_max_chunks = max(2, MAX_PARALLEL_CHUNKS)
-    if compression_mode == "aggressive":
-        tuned_max_chunks = max(2, min(tuned_max_chunks, SLA_MAX_PARALLEL_CHUNKS))
+    if compression_mode == "aggressive" and split_threshold_mb is None:
+        sla_cap = SLA_MAX_PARALLEL_CHUNKS
+        if original_size_mb >= LARGE_FILE_TUNE_MIN_MB:
+            sla_cap = max(sla_cap, SLA_MAX_PARALLEL_CHUNKS_LARGE)
+        tuned_max_chunks = max(2, min(tuned_max_chunks, sla_cap))
     tuned_max_pages = MAX_PAGES_PER_CHUNK
 
     has_chunk_env = "TARGET_CHUNK_MB" in os.environ or "MAX_CHUNK_MB" in os.environ
+    explicit_chunk_override = target_chunk_mb is not None or max_chunk_mb is not None
     if original_size_mb >= LARGE_FILE_TUNE_MIN_MB and compression_mode == "aggressive":
-        if not has_chunk_env:
+        if not has_chunk_env and not explicit_chunk_override:
             tuned_target = max(tuned_target, LARGE_FILE_TARGET_CHUNK_MB)
             tuned_max_chunk = max(tuned_max_chunk, max(LARGE_FILE_MAX_CHUNK_MB, tuned_target * 1.5))
             tuned_max_chunks = min(tuned_max_chunks, LARGE_FILE_MAX_PARALLEL_CHUNKS)
@@ -690,13 +697,14 @@ def compress_parallel(
             )
         else:
             logger.info(
-                "[PARALLEL] Large file tuning skipped; explicit chunk env override present",
+                "[PARALLEL] Large file tuning skipped; explicit chunk override present",
             )
 
     target_chunk_mb = max(MIN_CHUNK_MB, tuned_target)
     max_chunk_mb = max(target_chunk_mb, tuned_max_chunk)
     max_parallel_chunks = max(2, tuned_max_chunks)
     max_pages_per_chunk = max(1, tuned_max_pages)
+    hard_max_parallel_chunks = max(max_parallel_chunks, HARD_MAX_PARALLEL_CHUNKS)
     logger.info(
         f"[PARALLEL] Starting parallel compression for {input_path.name} "
         f"({original_size_mb:.1f}MB, mode={compression_mode})"
@@ -767,10 +775,26 @@ def compress_parallel(
                 balanced.append(chunk_path)
                 continue
 
-            remaining_slots = max_parallel_chunks - (len(balanced) + len(pending))
+            soft_remaining = max_parallel_chunks - (len(balanced) + len(pending))
+            hard_remaining = hard_max_parallel_chunks - (len(balanced) + len(pending))
+            if hard_remaining <= 0:
+                balanced.append(chunk_path)
+                continue
+
+            oversized = size_mb > max_chunk_mb and size_mb > MIN_CHUNK_MB
+            remaining_slots = hard_remaining if oversized else soft_remaining
             if remaining_slots <= 0:
                 balanced.append(chunk_path)
                 continue
+
+            if oversized and soft_remaining <= 0:
+                logger.info(
+                    "[PARALLEL] Soft cap %s hit; allowing extra split up to hard cap %s for %s (%.1fMB)",
+                    max_parallel_chunks,
+                    hard_max_parallel_chunks,
+                    chunk_path.name,
+                    size_mb,
+                )
 
             split_count = max(2, math.ceil(size_mb / target_chunk_mb))
             try:
@@ -1304,66 +1328,124 @@ def compress_parallel(
     effective_split_trigger_mb = split_trigger_mb if split_trigger_mb is not None else split_threshold_mb
 
     split_start = time.time()
-    report_progress(75, "merging", "Merging compressed chunks...")
     merged_path = working_dir / f"{base_name}_compressed.pdf"
     merged_path.unlink(missing_ok=True)
 
-    merge_used = "gs"
-    if len(ordered_paths) == 1:
-        ordered_paths[0].rename(merged_path)
-        merge_used = "skipped"
-    else:
-        try:
-            merge_pdfs(ordered_paths, merged_path)
-            merge_used = "gs"
-        except Exception as exc:
-            merge_used = "pypdf2"
-            strategy_outcome["timeouts"]["merge_timeout"] += 1 if isinstance(exc, TimeoutError) else 0
-            raise
+    direct_delivery = False
+    merge_used = "skipped"
+    merged_mb = 0.0
+    final_parts: List[Path] = []
 
-    if not merged_path.exists() or merged_path.stat().st_size == 0:
-        raise SplitError(f"Merged output missing or empty: {merged_path.name}")
-
-    final_parts = [merged_path]
-    merged_mb = get_file_size_mb(merged_path)
-
-    if split_enabled and effective_split_trigger_mb is not None:
-        logger.info(
-            "[PARALLEL] Split check: merged=%.1fMB trigger=%.1fMB threshold=%.1fMB",
-            merged_mb,
-            effective_split_trigger_mb,
-            split_threshold_mb,
-        )
-        if merged_mb > effective_split_trigger_mb:
-            report_progress(80, "splitting", "Splitting merged output...")
-            final_parts = split_for_delivery(
-                merged_path,
+    def _build_direct_parts(paths: List[Path]) -> List[Path]:
+        parts: List[Path] = []
+        if split_threshold_mb is None or split_threshold_mb <= 0:
+            return parts
+        for idx, path in enumerate(paths, start=1):
+            size_mb = get_file_size_mb(path)
+            if size_mb <= split_threshold_mb:
+                parts.append(path)
+                continue
+            logger.info(
+                "[PARALLEL] Chunk %s is %.1fMB > %.1fMB; splitting for delivery",
+                path.name,
+                size_mb,
+                split_threshold_mb,
+            )
+            chunk_base = f"{base_name}_direct_{idx}"
+            chunk_parts = split_for_delivery(
+                path,
                 working_dir,
-                f"{base_name}_merged",
+                chunk_base,
                 split_threshold_mb,
                 progress_callback=progress_callback,
                 skip_optimization_under_threshold=not force_split_dedup,
             )
-            merged_path.unlink(missing_ok=True)
-            logger.info("[PARALLEL] Split merged output into %s part(s)", len(final_parts))
+            if path not in chunk_parts:
+                path.unlink(missing_ok=True)
+            parts.extend(chunk_parts)
+        return parts
+
+    direct_total_mb = None
+    if split_enabled:
+        try:
+            direct_total_mb = sum(get_file_size_mb(p) for p in ordered_paths)
+        except Exception:
+            direct_total_mb = None
+
+    if (
+        split_enabled
+        and PARALLEL_SPLIT_DELIVER_CHUNKS
+        and (effective_split_trigger_mb is None or (direct_total_mb and direct_total_mb > effective_split_trigger_mb))
+    ):
+        direct_delivery = True
+        report_progress(75, "splitting", "Preparing split parts...")
+        final_parts = _build_direct_parts(ordered_paths)
+        merge_used = "direct"
+        merged_mb = sum(p.stat().st_size for p in final_parts) / (1024 * 1024) if final_parts else 0.0
+        logger.info("[PARALLEL] Split delivery: using %s chunk-derived part(s)", len(final_parts))
+    else:
+        report_progress(75, "merging", "Merging compressed chunks...")
+        merge_used = "gs"
+        if len(ordered_paths) == 1:
+            ordered_paths[0].rename(merged_path)
+            merge_used = "skipped"
+        else:
+            try:
+                merge_pdfs(ordered_paths, merged_path)
+                merge_used = "gs"
+            except Exception as exc:
+                merge_used = "pypdf2"
+                strategy_outcome["timeouts"]["merge_timeout"] += 1 if isinstance(exc, TimeoutError) else 0
+                raise
+
+        if not merged_path.exists() or merged_path.stat().st_size == 0:
+            raise SplitError(f"Merged output missing or empty: {merged_path.name}")
+
+        final_parts = [merged_path]
+        merged_mb = get_file_size_mb(merged_path)
+
+        if split_enabled and effective_split_trigger_mb is not None:
+            logger.info(
+                "[PARALLEL] Split check: merged=%.1fMB trigger=%.1fMB threshold=%.1fMB",
+                merged_mb,
+                effective_split_trigger_mb,
+                split_threshold_mb,
+            )
+            if merged_mb > effective_split_trigger_mb:
+                report_progress(80, "splitting", "Splitting merged output...")
+                final_parts = split_for_delivery(
+                    merged_path,
+                    working_dir,
+                    f"{base_name}_merged",
+                    split_threshold_mb,
+                    progress_callback=progress_callback,
+                    skip_optimization_under_threshold=not force_split_dedup,
+                )
+                merged_path.unlink(missing_ok=True)
+                logger.info("[PARALLEL] Split merged output into %s part(s)", len(final_parts))
+            else:
+                logger.info(
+                    "[PARALLEL] Split not required; merged output kept as a single file",
+                )
         else:
             logger.info(
-                "[PARALLEL] Split not required; merged output kept as a single file",
+                "[PARALLEL] Split disabled; merged %s chunk(s) into %s",
+                len(ordered_paths),
+                merged_path.name,
             )
-    else:
-        logger.info(
-            "[PARALLEL] Split disabled; merged %s chunk(s) into %s",
-            len(ordered_paths),
-            merged_path.name,
-        )
 
     # Cleanup original chunk files
+    final_part_set = {p.resolve() for p in final_parts}
     source_chunks: List[Path] = [c for _, c in tasks]
     if "probe_chunk" in locals() and not probe_reinserted:
         source_chunks.append(probe_chunk)
     for chunk in source_chunks:
+        if chunk.resolve() in final_part_set:
+            continue
         chunk.unlink(missing_ok=True)
     for _, compressed in compressed_chunks:
+        if compressed.resolve() in final_part_set:
+            continue
         compressed.unlink(missing_ok=True)
 
     split_total = time.time() - split_start
@@ -1395,7 +1477,7 @@ def compress_parallel(
 
     merge_fallback_used = False
     merge_fallback_time = 0.0
-    if split_enabled and PARALLEL_MERGE_ON_BLOAT and original_size_mb > 0 and not sla_exceeded:
+    if split_enabled and PARALLEL_MERGE_ON_BLOAT and original_size_mb > 0 and not sla_exceeded and not direct_delivery:
         bloat_ratio = (combined_mb / original_size_mb) - 1
         if bloat_ratio > PARALLEL_BLOAT_PCT:
             bloat_pct = bloat_ratio * 100
@@ -1465,6 +1547,7 @@ def compress_parallel(
         and not sla_exceeded
         and split_threshold_mb > 0
         and rebalance_parts_before > 1
+        and not direct_delivery
     ):
         part_sizes_mb = [p.stat().st_size / (1024 * 1024) for p in verified_parts]
         max_part_mb = max(part_sizes_mb) if part_sizes_mb else 0.0
@@ -1561,7 +1644,15 @@ def compress_parallel(
     if original_size_mb > 0 and combined_mb >= original_size_mb:
         bloat_detected = True
         bloat_pct = round(((combined_mb / original_size_mb) - 1) * 100, 1)
-        if split_enabled:
+        if split_enabled and direct_delivery:
+            logger.warning(
+                "[PARALLEL] Output larger than input (%.1fMB -> %.1fMB, +%.1f%%); keeping split parts",
+                original_size_mb,
+                combined_mb,
+                bloat_pct,
+            )
+            bloat_action = "direct_parts"
+        elif split_enabled:
             logger.warning(
                 "[PARALLEL] Output larger than input (%.1fMB -> %.1fMB, +%.1f%%); splitting original instead",
                 original_size_mb,
