@@ -35,7 +35,7 @@ PARALLEL_MERGE_ON_BLOAT = env_bool("PARALLEL_MERGE_ON_BLOAT", True)
 PARALLEL_SPLIT_INFLATION_PCT = 0.02
 # If split inflation is high, force dedupe on split parts (targeted slow path).
 # Lower default threshold to catch modest PyPDF2 bloat before it cascades.
-PARALLEL_DEDUP_SPLIT_INFLATION_PCT = float(os.environ.get("PARALLEL_DEDUP_SPLIT_INFLATION_PCT", "0.08"))
+PARALLEL_DEDUP_SPLIT_INFLATION_PCT = float(os.environ.get("PARALLEL_DEDUP_SPLIT_INFLATION_PCT", "0.25"))
 
 
 REBALANCE_SPLIT_ENABLED = env_bool("REBALANCE_SPLIT_ENABLED", True)
@@ -46,19 +46,19 @@ REBALANCE_MAX_PART_PCT = float(os.environ.get("REBALANCE_MAX_PART_PCT", "0.85"))
 GS_FAST_WEB_VIEW = env_bool("GS_FAST_WEB_VIEW", True)
 GS_COLOR_DOWNSAMPLE_TYPE = env_choice(
     "GS_COLOR_DOWNSAMPLE_TYPE",
-    "/Bicubic",
+    "/Subsample",
     ("/Subsample", "/Average", "/Bicubic"),
 )
 GS_GRAY_DOWNSAMPLE_TYPE = env_choice(
     "GS_GRAY_DOWNSAMPLE_TYPE",
-    "/Bicubic",
+    "/Subsample",
     ("/Subsample", "/Average", "/Bicubic"),
 )
 GS_BAND_HEIGHT = env_int("GS_BAND_HEIGHT", 100)
 GS_BAND_BUFFER_SPACE_MB = env_int("GS_BAND_BUFFER_SPACE_MB", 500)
 GS_COLOR_IMAGE_RESOLUTION = env_int("GS_COLOR_IMAGE_RESOLUTION", 72)
 GS_GRAY_IMAGE_RESOLUTION = env_int("GS_GRAY_IMAGE_RESOLUTION", 72)
-GS_MONO_IMAGE_RESOLUTION = env_int("GS_MONO_IMAGE_RESOLUTION", 300)
+GS_MONO_IMAGE_RESOLUTION = env_int("GS_MONO_IMAGE_RESOLUTION", 200)
 PARALLEL_SERIAL_FALLBACK = env_bool("PARALLEL_SERIAL_FALLBACK", True)
 # Fixed SLA/quality guardrails (non-configurable)
 CHUNK_TIME_BUDGET_SEC = 60
@@ -69,10 +69,11 @@ PROBE_TIME_BUDGET_SEC = 45          # seconds
 PROBE_INFLATION_ABORT_PCT = 0.20    # 20% growth triggers bailout
 PROBE_SAMPLE_PAGES = 3
 PROBE_TIMEOUT_BAILOUT_SLA_PCT = env_float("PROBE_TIMEOUT_BAILOUT_SLA_PCT", 12.0)  # bail if probe uses >X% of SLA
+PROBE_BAILOUT_ENABLED = env_bool("PROBE_BAILOUT_ENABLED", False)
 PARALLEL_JOB_SLA_SEC = 300          # hard cap for parallel job
 PARALLEL_JOB_SLA_LARGE_MIN_MB = 200.0
 PARALLEL_JOB_SLA_LARGE_SEC_PER_MB = 2.5
-PARALLEL_JOB_SLA_MAX_SEC = 900
+PARALLEL_JOB_SLA_MAX_SEC = 300
 FALLBACK_MIN_SEC_PER_MB = 0.8
 MICRO_PROBE_SKIP_REDUCTION_PCT = 20.0
 SLA_MAX_PARALLEL_CHUNKS = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS", 8))
@@ -88,8 +89,8 @@ EXTREME_FALLBACK_GRAY_DPI = env_int("EXTREME_FALLBACK_GRAY_DPI", 50)
 EXTREME_FALLBACK_MONO_DPI = env_int("EXTREME_FALLBACK_MONO_DPI", 200)
 
 # Early termination: stop chunk processing when failure rate is high.
-EARLY_TERMINATION_FAILURE_PCT = env_float("EARLY_TERMINATION_FAILURE_PCT", 0.50)
-EARLY_TERMINATION_MIN_COMPLETED = env_int("EARLY_TERMINATION_MIN_COMPLETED", 3)
+EARLY_TERMINATION_FAILURE_PCT = env_float("EARLY_TERMINATION_FAILURE_PCT", 0.85)
+EARLY_TERMINATION_MIN_COMPLETED = env_int("EARLY_TERMINATION_MIN_COMPLETED", 5)
 
 
 def _chunk_timeout_seconds(file_mb: float, large_file: bool = False) -> int:
@@ -349,7 +350,7 @@ def compress_pdf_with_ghostscript(
         "-dPassThroughJPEGImages=false",
         "-dPassThroughJPXImages=false",
         # Explicit JPEG quality (GS default ~75; lower = smaller)
-        f"-dJPEGQ={env_int('GS_JPEGQ', 60)}",
+        f"-dJPEGQ={env_int('GS_JPEGQ', 50)}",
         # Optimization
         "-dDetectDuplicateImages=true",
         "-dCompressFonts=true",
@@ -991,10 +992,35 @@ def compress_parallel(
                     compressed_path.unlink(missing_ok=True)
                     original_mb = original_bytes / (1024 * 1024)
                     compressed_mb = compressed_bytes / (1024 * 1024)
+                    if allow_lossy and compression_mode != "lossless":
+                        ultra_path = working_dir / f"{chunk_path.stem}_{unique_id}_ultra.pdf"
+                        ultra_ok, ultra_msg = compress_ultra_fallback(
+                            chunk_path,
+                            ultra_path,
+                            jpeg_quality=EXTREME_FALLBACK_JPEGQ,
+                            color_res=EXTREME_FALLBACK_COLOR_DPI,
+                            gray_res=EXTREME_FALLBACK_GRAY_DPI,
+                            mono_res=EXTREME_FALLBACK_MONO_DPI,
+                            num_threads=gs_threads,
+                            timeout_override=chunk_timeout,
+                        )
+                        if ultra_ok and ultra_path.exists():
+                            ultra_mb = get_file_size_mb(ultra_path)
+                            if ultra_mb < original_mb:
+                                return (
+                                    ultra_path,
+                                    True,
+                                    f"ULTRA: {original_mb:.1f}MB -> {ultra_mb:.1f}MB",
+                                    chunk_mb,
+                                )
+                            ultra_path.unlink(missing_ok=True)
+                        else:
+                            ultra_path.unlink(missing_ok=True)
+                            logger.warning("[PARALLEL_CHUNK] Ultra fallback failed: %s", ultra_msg)
                     return (
                         chunk_path,
-                        False,
-                        f"Compression increased size ({original_mb:.1f}MB -> {compressed_mb:.1f}MB), using original",
+                        True,
+                        f"SKIPPED: Compression increased size ({original_mb:.1f}MB -> {compressed_mb:.1f}MB), using original",
                         chunk_mb,
                     )
         except Exception:
@@ -1098,7 +1124,7 @@ def compress_parallel(
         # Early exit if probe inflates or is slow; avoid spending minutes on bad strategy.
         probe_out_mb = get_file_size_mb(probe_path) if probe_path.exists() else probe_mb
         inflation_message = "Compression increased size" in (message or "")
-        probe_inflated = (
+        probe_inflated = PROBE_BAILOUT_ENABLED and (
             probe_out_mb > probe_mb * (1 + PROBE_INFLATION_ABORT_PCT)
             or inflation_message
         )

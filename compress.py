@@ -97,15 +97,16 @@ DEFAULT_TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "30"))
 DEFAULT_MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", "50"))
 PROBE_INFLATION_WARN_PCT = env_float("PROBE_INFLATION_WARN_PCT", 12.0)
 PROBE_INFLATION_FORCE_LOSSLESS_PCT = env_float("PROBE_INFLATION_FORCE_LOSSLESS_PCT", 60.0)
-ULTRA_FALLBACK_MIN_REDUCTION_PCT = env_float("ULTRA_FALLBACK_MIN_REDUCTION_PCT", 5.0)
-ULTRA_FALLBACK_MIN_SIZE_MB = env_float("ULTRA_FALLBACK_MIN_SIZE_MB", 50.0)
-ULTRA_FALLBACK_JPEGQ = env_int("ULTRA_FALLBACK_JPEGQ", 55)
-ULTRA_FALLBACK_COLOR_DPI = env_int("ULTRA_FALLBACK_COLOR_DPI", 120)
-ULTRA_FALLBACK_GRAY_DPI = env_int("ULTRA_FALLBACK_GRAY_DPI", 150)
-ULTRA_FALLBACK_MONO_DPI = env_int("ULTRA_FALLBACK_MONO_DPI", 300)
+ULTRA_FALLBACK_MIN_REDUCTION_PCT = env_float("ULTRA_FALLBACK_MIN_REDUCTION_PCT", 40.0)
+ULTRA_FALLBACK_MIN_SIZE_MB = env_float("ULTRA_FALLBACK_MIN_SIZE_MB", 20.0)
+ULTRA_FALLBACK_JPEGQ = env_int("ULTRA_FALLBACK_JPEGQ", 40)
+ULTRA_FALLBACK_COLOR_DPI = env_int("ULTRA_FALLBACK_COLOR_DPI", 72)
+ULTRA_FALLBACK_GRAY_DPI = env_int("ULTRA_FALLBACK_GRAY_DPI", 72)
+ULTRA_FALLBACK_MONO_DPI = env_int("ULTRA_FALLBACK_MONO_DPI", 200)
 LOSSLESS_ALREADY_TIMEOUT_SEC = env_int("LOSSLESS_ALREADY_TIMEOUT_SEC", 240)
 ALLOW_PARALLEL_ON_ALREADY = env_bool("ALLOW_PARALLEL_ON_ALREADY", False)
 ALREADY_COMPRESSED_PROBE_MIN_REDUCTION_PCT = 5.0
+RESPECT_ALREADY_COMPRESSED = env_bool("RESPECT_ALREADY_COMPRESSED", False)
 
 
 def resolve_compression_mode(input_path: Path) -> str:
@@ -129,7 +130,7 @@ def resolve_compression_mode(input_path: Path) -> str:
         from pdf_diagnostics import detect_already_compressed, detect_scanned_document
 
         already_compressed, _ = detect_already_compressed(input_path)
-        if already_compressed:
+        if already_compressed and RESPECT_ALREADY_COMPRESSED:
             return "lossless"
 
         is_scanned, confidence = detect_scanned_document(input_path)
@@ -368,7 +369,7 @@ def compress_pdf(
             delta_pct,
         )
 
-    if composition["already_compressed"] and probe_info and probe_info.get("success"):
+    if RESPECT_ALREADY_COMPRESSED and composition["already_compressed"] and probe_info and probe_info.get("success"):
         if probe_delta_pct > -ALREADY_COMPRESSED_PROBE_MIN_REDUCTION_PCT:
             logger.info(
                 "[compress] Already-compressed + micro-probe delta %.1f%%; switching to lossless",
@@ -585,6 +586,7 @@ def compress_pdf(
     report_progress(60, "compressing", "Compression complete, verifying...")
 
     # If aggressive compression made it bigger, try lossless before giving up
+    ultra_used = False
     lossless_retry_worked = False
     if compressed_size >= original_size:
         bloat_pct = ((compressed_size - original_size) / original_size) * 100 if original_size > 0 else 0.0
@@ -615,19 +617,95 @@ def compress_pdf(
                 else:
                     bloat_pct = ((compressed_size - original_size) / original_size) * 100 if original_size > 0 else 0.0
                     logger.warning(
-                        "Lossless also bloated (%.2fMB -> %.2fMB, +%.1f%%); returning original",
+                        "Lossless also bloated (%.2fMB -> %.2fMB, +%.1f%%); trying ultra fallback",
                         original_size,
                         compressed_size,
                         bloat_pct,
                     )
-                    output_path.unlink()
+                    output_path.unlink(missing_ok=True)
+                    if ALLOW_LOSSY_COMPRESSION:
+                        ultra_ok, ultra_msg = compress_ghostscript.compress_ultra_fallback(
+                            input_path,
+                            output_path,
+                            jpeg_quality=ULTRA_FALLBACK_JPEGQ,
+                            color_res=ULTRA_FALLBACK_COLOR_DPI,
+                            gray_res=ULTRA_FALLBACK_GRAY_DPI,
+                            mono_res=ULTRA_FALLBACK_MONO_DPI,
+                        )
+                        if ultra_ok and output_path.exists():
+                            ultra_size = get_file_size_mb(output_path)
+                            if ultra_size < original_size:
+                                compressed_size = ultra_size
+                                compressed_bytes = output_path.stat().st_size
+                                compression_mode = "aggressive"
+                                quality_mode = "aggressive_72dpi"
+                                lossless_retry_worked = True
+                                ultra_used = True
+                                logger.info(
+                                    "[compress] Ultra fallback succeeded: %.2fMB -> %.2fMB",
+                                    original_size,
+                                    ultra_size,
+                                )
+                            else:
+                                logger.warning(
+                                    "[compress] Ultra fallback also bloated (%.2fMB -> %.2fMB); returning original",
+                                    original_size,
+                                    ultra_size,
+                                )
+                                output_path.unlink(missing_ok=True)
+                                shutil.copy2(input_path, output_path)
+                                compressed_size = original_size
+                        else:
+                            logger.warning("[compress] Ultra fallback failed: %s; returning original", ultra_msg)
+                            output_path.unlink(missing_ok=True)
+                            shutil.copy2(input_path, output_path)
+                            compressed_size = original_size
+                    else:
+                        shutil.copy2(input_path, output_path)
+                        compressed_size = original_size
+            else:
+                logger.warning("Lossless retry failed: %s; trying ultra fallback", lossless_msg)
+                output_path.unlink(missing_ok=True)
+                if ALLOW_LOSSY_COMPRESSION:
+                    ultra_ok, ultra_msg = compress_ghostscript.compress_ultra_fallback(
+                        input_path,
+                        output_path,
+                        jpeg_quality=ULTRA_FALLBACK_JPEGQ,
+                        color_res=ULTRA_FALLBACK_COLOR_DPI,
+                        gray_res=ULTRA_FALLBACK_GRAY_DPI,
+                        mono_res=ULTRA_FALLBACK_MONO_DPI,
+                    )
+                    if ultra_ok and output_path.exists():
+                        ultra_size = get_file_size_mb(output_path)
+                        if ultra_size < original_size:
+                            compressed_size = ultra_size
+                            compressed_bytes = output_path.stat().st_size
+                            compression_mode = "aggressive"
+                            quality_mode = "aggressive_72dpi"
+                            lossless_retry_worked = True
+                            ultra_used = True
+                            logger.info(
+                                "[compress] Ultra fallback succeeded: %.2fMB -> %.2fMB",
+                                original_size,
+                                ultra_size,
+                            )
+                        else:
+                            logger.warning(
+                                "[compress] Ultra fallback also bloated (%.2fMB -> %.2fMB); returning original",
+                                original_size,
+                                ultra_size,
+                            )
+                            output_path.unlink(missing_ok=True)
+                            shutil.copy2(input_path, output_path)
+                            compressed_size = original_size
+                    else:
+                        logger.warning("[compress] Ultra fallback failed: %s; returning original", ultra_msg)
+                        output_path.unlink(missing_ok=True)
+                        shutil.copy2(input_path, output_path)
+                        compressed_size = original_size
+                else:
                     shutil.copy2(input_path, output_path)
                     compressed_size = original_size
-            else:
-                logger.warning("Lossless retry failed: %s; returning original", lossless_msg)
-                output_path.unlink(missing_ok=True)
-                shutil.copy2(input_path, output_path)
-                compressed_size = original_size
         else:
             # Lossless mode bloated. If this file was flagged "already compressed" and
             # lossy is allowed, try aggressive compression before giving up — the
@@ -657,28 +735,142 @@ def compress_pdf(
                         )
                     else:
                         logger.warning(
-                            "[compress] Aggressive fallback also bloated (%.2fMB -> %.2fMB); returning original",
+                            "[compress] Aggressive fallback also bloated (%.2fMB -> %.2fMB); trying ultra fallback",
                             original_size,
                             agg_size,
                         )
                         output_path.unlink(missing_ok=True)
+                        if ALLOW_LOSSY_COMPRESSION:
+                            ultra_ok, ultra_msg = compress_ghostscript.compress_ultra_fallback(
+                                input_path,
+                                output_path,
+                                jpeg_quality=ULTRA_FALLBACK_JPEGQ,
+                                color_res=ULTRA_FALLBACK_COLOR_DPI,
+                                gray_res=ULTRA_FALLBACK_GRAY_DPI,
+                                mono_res=ULTRA_FALLBACK_MONO_DPI,
+                            )
+                            if ultra_ok and output_path.exists():
+                                ultra_size = get_file_size_mb(output_path)
+                                if ultra_size < original_size:
+                                    compressed_size = ultra_size
+                                    compressed_bytes = output_path.stat().st_size
+                                    compression_mode = "aggressive"
+                                    quality_mode = "aggressive_72dpi"
+                                    lossless_retry_worked = True
+                                    ultra_used = True
+                                    logger.info(
+                                        "[compress] Ultra fallback succeeded: %.2fMB -> %.2fMB",
+                                        original_size,
+                                        ultra_size,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "[compress] Ultra fallback also bloated (%.2fMB -> %.2fMB); returning original",
+                                        original_size,
+                                        ultra_size,
+                                    )
+                                    output_path.unlink(missing_ok=True)
+                                    shutil.copy2(input_path, output_path)
+                                    compressed_size = original_size
+                            else:
+                                logger.warning("[compress] Ultra fallback failed: %s; returning original", ultra_msg)
+                                output_path.unlink(missing_ok=True)
+                                shutil.copy2(input_path, output_path)
+                                compressed_size = original_size
+                        else:
+                            shutil.copy2(input_path, output_path)
+                            compressed_size = original_size
+                else:
+                    logger.warning("[compress] Aggressive fallback failed: %s; trying ultra fallback", agg_msg)
+                    output_path.unlink(missing_ok=True)
+                    if ALLOW_LOSSY_COMPRESSION:
+                        ultra_ok, ultra_msg = compress_ghostscript.compress_ultra_fallback(
+                            input_path,
+                            output_path,
+                            jpeg_quality=ULTRA_FALLBACK_JPEGQ,
+                            color_res=ULTRA_FALLBACK_COLOR_DPI,
+                            gray_res=ULTRA_FALLBACK_GRAY_DPI,
+                            mono_res=ULTRA_FALLBACK_MONO_DPI,
+                        )
+                        if ultra_ok and output_path.exists():
+                            ultra_size = get_file_size_mb(output_path)
+                            if ultra_size < original_size:
+                                compressed_size = ultra_size
+                                compressed_bytes = output_path.stat().st_size
+                                compression_mode = "aggressive"
+                                quality_mode = "aggressive_72dpi"
+                                lossless_retry_worked = True
+                                ultra_used = True
+                                logger.info(
+                                    "[compress] Ultra fallback succeeded: %.2fMB -> %.2fMB",
+                                    original_size,
+                                    ultra_size,
+                                )
+                            else:
+                                logger.warning(
+                                    "[compress] Ultra fallback also bloated (%.2fMB -> %.2fMB); returning original",
+                                    original_size,
+                                    ultra_size,
+                                )
+                                output_path.unlink(missing_ok=True)
+                                shutil.copy2(input_path, output_path)
+                                compressed_size = original_size
+                        else:
+                            logger.warning("[compress] Ultra fallback failed: %s; returning original", ultra_msg)
+                            output_path.unlink(missing_ok=True)
+                            shutil.copy2(input_path, output_path)
+                            compressed_size = original_size
+                    else:
                         shutil.copy2(input_path, output_path)
                         compressed_size = original_size
-                else:
-                    logger.warning("[compress] Aggressive fallback failed: %s; returning original", agg_msg)
-                    output_path.unlink(missing_ok=True)
-                    shutil.copy2(input_path, output_path)
-                    compressed_size = original_size
             else:
                 logger.warning(
-                    "Compression increased size (%.2fMB -> %.2fMB, +%.1f%%), returning original",
+                    "Compression increased size (%.2fMB -> %.2fMB, +%.1f%%), trying ultra fallback",
                     original_size,
                     compressed_size,
                     bloat_pct,
                 )
-                output_path.unlink()
-                shutil.copy2(input_path, output_path)
-                compressed_size = original_size
+                output_path.unlink(missing_ok=True)
+                if ALLOW_LOSSY_COMPRESSION:
+                    ultra_ok, ultra_msg = compress_ghostscript.compress_ultra_fallback(
+                        input_path,
+                        output_path,
+                        jpeg_quality=ULTRA_FALLBACK_JPEGQ,
+                        color_res=ULTRA_FALLBACK_COLOR_DPI,
+                        gray_res=ULTRA_FALLBACK_GRAY_DPI,
+                        mono_res=ULTRA_FALLBACK_MONO_DPI,
+                    )
+                    if ultra_ok and output_path.exists():
+                        ultra_size = get_file_size_mb(output_path)
+                        if ultra_size < original_size:
+                            compressed_size = ultra_size
+                            compressed_bytes = output_path.stat().st_size
+                            compression_mode = "aggressive"
+                            quality_mode = "aggressive_72dpi"
+                            lossless_retry_worked = True
+                            ultra_used = True
+                            logger.info(
+                                "[compress] Ultra fallback succeeded: %.2fMB -> %.2fMB",
+                                original_size,
+                                ultra_size,
+                            )
+                        else:
+                            logger.warning(
+                                "[compress] Ultra fallback also bloated (%.2fMB -> %.2fMB); returning original",
+                                original_size,
+                                ultra_size,
+                            )
+                            output_path.unlink(missing_ok=True)
+                            shutil.copy2(input_path, output_path)
+                            compressed_size = original_size
+                    else:
+                        logger.warning("[compress] Ultra fallback failed: %s; returning original", ultra_msg)
+                        output_path.unlink(missing_ok=True)
+                        shutil.copy2(input_path, output_path)
+                        compressed_size = original_size
+                else:
+                    shutil.copy2(input_path, output_path)
+                    compressed_size = original_size
 
         # If lossless retry worked, skip the "return original" block and continue to success path
         if not lossless_retry_worked:
@@ -732,11 +924,11 @@ def compress_pdf(
 
     reduction = ((original_size - compressed_size) / original_size) * 100
     # If we barely saved anything and lossy is allowed, try an ultra fallback with lower DPI/JPEGQ.
-    ultra_used = False
     if (
         ALLOW_LOSSY_COMPRESSION
         and original_size >= ULTRA_FALLBACK_MIN_SIZE_MB
         and reduction < ULTRA_FALLBACK_MIN_REDUCTION_PCT
+        and not ultra_used
     ):
         logger.warning(
             "[compress] Low savings (%.1f%%); running ultra fallback (JPEGQ=%s, DPI=%s/%s/%s)",
