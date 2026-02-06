@@ -118,6 +118,103 @@ logger.info(
 )
 
 
+def _format_env_value(name: str, effective: Any, default_label: str = "default") -> str:
+    raw = os.environ.get(name)
+    if raw is None:
+        return f"{effective} ({default_label})"
+    return f"{effective} (env:{raw})"
+
+
+def _truncate(value: Any, width: int) -> str:
+    text = str(value)
+    if len(text) <= width:
+        return text
+    return text[: max(0, width - 3)] + "..."
+
+
+def _box(title: str, rows: list[tuple[str, str]]) -> list[str]:
+    border = "+" + "-" * 70 + "+"
+    lines = [border, f"| {title:<68} |", border]
+    for label, value in rows:
+        safe_value = _truncate(value, 33)
+        lines.append(f"| {label:<32} : {safe_value:<33} |")
+    lines.append(border)
+    return lines
+
+
+def _format_split_label(split_requested: bool, split_threshold_mb: float | None, origin: str) -> str:
+    if not split_requested or split_threshold_mb is None:
+        return "off"
+    suffix = origin or "request"
+    return f"{split_threshold_mb:.1f}MB ({suffix})"
+
+
+def _log_effective_config() -> None:
+    try:
+        import compress_ghostscript as gs_cfg
+        import split_pdf as split_cfg
+    except Exception as exc:
+        logger.warning("Config snapshot skipped: %s", exc)
+        return
+
+    async_raw = os.environ.get("ASYNC_WORKERS")
+    async_value = ASYNC_WORKERS
+    async_display = f"{async_value} (env:{async_raw})" if async_raw else f"{async_value} (auto)"
+
+    parallel_raw = os.environ.get("PARALLEL_MAX_WORKERS")
+    parallel_display = parallel_raw or "auto"
+
+    gs_threads_raw = os.environ.get("GS_NUM_RENDERING_THREADS")
+    gs_threads_display = gs_threads_raw or "auto"
+
+    rows_concurrency = [
+        ("ASYNC_WORKERS", async_display),
+        ("MAX_ACTIVE_COMPRESSIONS", str(MAX_ACTIVE_COMPRESSIONS)),
+        ("PARALLEL_MAX_WORKERS", parallel_display),
+        ("GS_NUM_RENDERING_THREADS", gs_threads_display),
+    ]
+
+    rows_chunking = [
+        ("TARGET_CHUNK_MB", _format_env_value("TARGET_CHUNK_MB", gs_cfg.TARGET_CHUNK_MB)),
+        ("MAX_CHUNK_MB", _format_env_value("MAX_CHUNK_MB", gs_cfg.MAX_CHUNK_MB)),
+        ("MAX_PARALLEL_CHUNKS", _format_env_value("MAX_PARALLEL_CHUNKS", gs_cfg.MAX_PARALLEL_CHUNKS)),
+        ("MAX_PAGES_PER_CHUNK", _format_env_value("MAX_PAGES_PER_CHUNK", gs_cfg.MAX_PAGES_PER_CHUNK)),
+        ("SLA_MAX_PARALLEL_CHUNKS", _format_env_value("SLA_MAX_PARALLEL_CHUNKS", gs_cfg.SLA_MAX_PARALLEL_CHUNKS)),
+        ("SLA_MAX_PARALLEL_CHUNKS_LARGE", _format_env_value("SLA_MAX_PARALLEL_CHUNKS_LARGE", gs_cfg.SLA_MAX_PARALLEL_CHUNKS_LARGE)),
+        ("HARD_MAX_PARALLEL_CHUNKS", _format_env_value("HARD_MAX_PARALLEL_CHUNKS", gs_cfg.HARD_MAX_PARALLEL_CHUNKS)),
+    ]
+
+    rows_split = [
+        ("SPLIT_THRESHOLD_MB", _format_env_value("SPLIT_THRESHOLD_MB", SPLIT_THRESHOLD_MB)),
+        ("SPLIT_TRIGGER_MB", _format_env_value("SPLIT_TRIGGER_MB", SPLIT_TRIGGER_MB)),
+        ("SPLIT_MINIMIZE_PARTS", _format_env_value("SPLIT_MINIMIZE_PARTS", utils.env_bool("SPLIT_MINIMIZE_PARTS", True))),
+        ("PARALLEL_SPLIT_DELIVER_CHUNKS", _format_env_value("PARALLEL_SPLIT_DELIVER_CHUNKS", gs_cfg.PARALLEL_SPLIT_DELIVER_CHUNKS)),
+        ("MERGE_TIMEOUT_SEC", _format_env_value("MERGE_TIMEOUT_SEC", split_cfg.MERGE_TIMEOUT_SEC)),
+        ("MERGE_FALLBACK_TIMEOUT_SEC", _format_env_value("MERGE_FALLBACK_TIMEOUT_SEC", split_cfg.MERGE_FALLBACK_TIMEOUT_SEC)),
+    ]
+
+    rows_quality = [
+        ("COMPRESSION_MODE", _format_env_value("COMPRESSION_MODE", os.environ.get("COMPRESSION_MODE", "aggressive"))),
+        ("ALLOW_LOSSY_COMPRESSION", _format_env_value("ALLOW_LOSSY_COMPRESSION", utils.env_bool("ALLOW_LOSSY_COMPRESSION", True))),
+        ("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", _format_env_value("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", utils.env_float("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", 70.0))),
+        ("GS_COLOR_IMAGE_RESOLUTION", _format_env_value("GS_COLOR_IMAGE_RESOLUTION", utils.env_int("GS_COLOR_IMAGE_RESOLUTION", 72))),
+        ("GS_GRAY_IMAGE_RESOLUTION", _format_env_value("GS_GRAY_IMAGE_RESOLUTION", utils.env_int("GS_GRAY_IMAGE_RESOLUTION", 72))),
+        ("GS_MONO_IMAGE_RESOLUTION", _format_env_value("GS_MONO_IMAGE_RESOLUTION", utils.env_int("GS_MONO_IMAGE_RESOLUTION", 300))),
+        ("GS_COLOR_DOWNSAMPLE_TYPE", _format_env_value("GS_COLOR_DOWNSAMPLE_TYPE", os.environ.get("GS_COLOR_DOWNSAMPLE_TYPE", "/Bicubic"))),
+        ("GS_GRAY_DOWNSAMPLE_TYPE", _format_env_value("GS_GRAY_DOWNSAMPLE_TYPE", os.environ.get("GS_GRAY_DOWNSAMPLE_TYPE", "/Bicubic"))),
+    ]
+
+    lines = ["CONFIG SNAPSHOT (startup)"]
+    lines += _box("Concurrency", rows_concurrency)
+    lines += _box("Chunking", rows_chunking)
+    lines += _box("Split and Merge", rows_split)
+    lines += _box("Quality", rows_quality)
+    logger.info("\n%s", "\n".join(lines))
+
+
+_log_effective_config()
+
+
 def require_auth(f):
     """Decorator to require Bearer token authentication."""
     @wraps(f)
@@ -243,6 +340,95 @@ def _log_job_header(
         split_label,
         trigger_label,
     )
+
+
+def _log_job_snapshot(
+    job_id: str,
+    source: str,
+    input_path: Path,
+    name_hint: str | None,
+    split_threshold_mb: float | None,
+    split_trigger_mb: float | None,
+    split_origin: str,
+) -> None:
+    try:
+        import compress_ghostscript as gs_cfg
+        import split_pdf as split_cfg
+    except Exception as exc:
+        logger.warning("[%s] Job snapshot skipped: %s", job_id, exc)
+        return
+
+    try:
+        size_mb = input_path.stat().st_size / (1024 * 1024)
+        size_label = f"{size_mb:.1f}MB"
+    except OSError:
+        size_label = "unknown"
+
+    name_label = _normalize_display_base(name_hint)
+    split_requested = split_threshold_mb is not None
+    split_label = _format_split_label(split_requested, split_threshold_mb, split_origin)
+    trigger_label = "off"
+    if split_trigger_mb is not None:
+        trigger_label = f"{split_trigger_mb:.1f}MB (effective)"
+
+    parallel_workers = os.environ.get("PARALLEL_MAX_WORKERS") or "auto"
+    gs_threads = os.environ.get("GS_NUM_RENDERING_THREADS") or "auto"
+
+    rows_job = [
+        ("JOB_ID", job_id),
+        ("SOURCE", source),
+        ("INPUT_FILE", input_path.name),
+        ("INPUT_SIZE", size_label),
+        ("NAME_HINT", name_label),
+        ("ASYNC_MAX_MB", f"{ASYNC_MAX_MB:.0f}MB"),
+    ]
+
+    rows_split = [
+        ("SPLIT_REQUESTED", "yes" if split_requested else "no"),
+        ("SPLIT_THRESHOLD_MB", split_label),
+        ("SPLIT_TRIGGER_MB", trigger_label),
+        ("SPLIT_MINIMIZE_PARTS", _format_env_value("SPLIT_MINIMIZE_PARTS", utils.env_bool("SPLIT_MINIMIZE_PARTS", True))),
+        ("DELIVER_CHUNKS_DIRECT", _format_env_value("PARALLEL_SPLIT_DELIVER_CHUNKS", gs_cfg.PARALLEL_SPLIT_DELIVER_CHUNKS)),
+        ("MERGE_TIMEOUT_SEC", _format_env_value("MERGE_TIMEOUT_SEC", split_cfg.MERGE_TIMEOUT_SEC)),
+        ("MERGE_FALLBACK_TIMEOUT", _format_env_value("MERGE_FALLBACK_TIMEOUT_SEC", split_cfg.MERGE_FALLBACK_TIMEOUT_SEC)),
+    ]
+
+    rows_parallel = [
+        ("PARALLEL_MAX_WORKERS", _format_env_value("PARALLEL_MAX_WORKERS", parallel_workers)),
+        ("GS_NUM_RENDERING_THREADS", _format_env_value("GS_NUM_RENDERING_THREADS", gs_threads)),
+        ("TARGET_CHUNK_MB", _format_env_value("TARGET_CHUNK_MB", f"{gs_cfg.TARGET_CHUNK_MB:.1f}MB")),
+        ("MAX_CHUNK_MB", _format_env_value("MAX_CHUNK_MB", f"{gs_cfg.MAX_CHUNK_MB:.1f}MB")),
+        ("MAX_PARALLEL_CHUNKS", _format_env_value("MAX_PARALLEL_CHUNKS", gs_cfg.MAX_PARALLEL_CHUNKS)),
+        ("MAX_PAGES_PER_CHUNK", _format_env_value("MAX_PAGES_PER_CHUNK", gs_cfg.MAX_PAGES_PER_CHUNK)),
+        ("SLA_MAX_PARALLEL_CHUNKS", _format_env_value("SLA_MAX_PARALLEL_CHUNKS", gs_cfg.SLA_MAX_PARALLEL_CHUNKS)),
+        ("SLA_MAX_PARALLEL_CHUNKS_LARGE", _format_env_value("SLA_MAX_PARALLEL_CHUNKS_LARGE", gs_cfg.SLA_MAX_PARALLEL_CHUNKS_LARGE)),
+        ("HARD_MAX_PARALLEL_CHUNKS", _format_env_value("HARD_MAX_PARALLEL_CHUNKS", gs_cfg.HARD_MAX_PARALLEL_CHUNKS)),
+        ("LARGE_FILE_TUNE_MIN_MB", _format_env_value("LARGE_FILE_TUNE_MIN_MB", f"{gs_cfg.LARGE_FILE_TUNE_MIN_MB:.1f}MB")),
+        ("LARGE_FILE_TARGET_MB", _format_env_value("LARGE_FILE_TARGET_CHUNK_MB", f"{gs_cfg.LARGE_FILE_TARGET_CHUNK_MB:.1f}MB")),
+        ("LARGE_FILE_MAX_MB", _format_env_value("LARGE_FILE_MAX_CHUNK_MB", f"{gs_cfg.LARGE_FILE_MAX_CHUNK_MB:.1f}MB")),
+        ("LARGE_FILE_MAX_CHUNKS", _format_env_value("LARGE_FILE_MAX_PARALLEL_CHUNKS", gs_cfg.LARGE_FILE_MAX_PARALLEL_CHUNKS)),
+    ]
+
+    rows_quality = [
+        ("COMPRESSION_MODE", _format_env_value("COMPRESSION_MODE", os.environ.get("COMPRESSION_MODE", "aggressive"))),
+        ("ALLOW_LOSSY", _format_env_value("ALLOW_LOSSY_COMPRESSION", utils.env_bool("ALLOW_LOSSY_COMPRESSION", True))),
+        ("SCANNED_CONFIDENCE", _format_env_value("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", utils.env_float("SCANNED_CONFIDENCE_FOR_AGGRESSIVE", 70.0))),
+        ("PROBE_TIME_SEC", str(gs_cfg.PROBE_TIME_BUDGET_SEC)),
+        ("CHUNK_TIME_MAX_SEC", str(gs_cfg.CHUNK_TIME_BUDGET_MAX_SEC)),
+        ("PARALLEL_JOB_SLA_SEC", str(gs_cfg.PARALLEL_JOB_SLA_SEC)),
+        ("GS_COLOR_DPI", _format_env_value("GS_COLOR_IMAGE_RESOLUTION", gs_cfg.GS_COLOR_IMAGE_RESOLUTION)),
+        ("GS_GRAY_DPI", _format_env_value("GS_GRAY_IMAGE_RESOLUTION", gs_cfg.GS_GRAY_IMAGE_RESOLUTION)),
+        ("GS_MONO_DPI", _format_env_value("GS_MONO_IMAGE_RESOLUTION", gs_cfg.GS_MONO_IMAGE_RESOLUTION)),
+        ("GS_COLOR_DOWNSAMPLE", _format_env_value("GS_COLOR_DOWNSAMPLE_TYPE", gs_cfg.GS_COLOR_DOWNSAMPLE_TYPE)),
+        ("GS_GRAY_DOWNSAMPLE", _format_env_value("GS_GRAY_DOWNSAMPLE_TYPE", gs_cfg.GS_GRAY_DOWNSAMPLE_TYPE)),
+    ]
+
+    lines = [f"JOB SNAPSHOT [{job_id}]"]
+    lines += _box("Job", rows_job)
+    lines += _box("Split and Delivery", rows_split)
+    lines += _box("Parallel Plan", rows_parallel)
+    lines += _box("Quality and Timeouts", rows_quality)
+    logger.info("\n%s", "\n".join(lines))
 
 
 def _log_job_result(job_id: str, result: dict, output_paths: list[Path]) -> None:
@@ -1046,10 +1232,12 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
         elif isinstance(task_data.get("download_url"), str):
             name_hint = task_data["download_url"]
 
-        split_override = _resolve_split_threshold_mb(
-            task_data.get("split_threshold_mb") or task_data.get("splitSizeMB")
-        )
+        split_override_raw = task_data.get("split_threshold_mb") or task_data.get("splitSizeMB")
+        split_override = _resolve_split_threshold_mb(split_override_raw)
         split_requested = _is_truthy(task_data.get("split")) or split_override is not None
+        split_origin = "off"
+        if split_requested:
+            split_origin = "request" if split_override is not None else "default"
         if split_requested and split_override is None:
             split_override = BASE_SPLIT_THRESHOLD_MB
         split_threshold_mb = split_override if split_requested else None
@@ -1194,6 +1382,15 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             name_hint,
             split_threshold_mb=split_threshold_mb,
             split_trigger_mb=split_trigger_mb,
+        )
+        _log_job_snapshot(
+            job_id,
+            source_label,
+            input_path,
+            name_hint,
+            split_threshold_mb,
+            split_trigger_mb,
+            split_origin,
         )
 
         download_time = round(time.time() - start_time, 2)

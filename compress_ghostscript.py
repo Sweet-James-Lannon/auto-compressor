@@ -16,8 +16,8 @@ from utils import get_effective_cpu_count, env_bool, env_int, env_choice
 
 logger = logging.getLogger(__name__)
 
-TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "40"))
-MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", str(TARGET_CHUNK_MB * 1.5)))
+TARGET_CHUNK_MB = float(os.environ.get("TARGET_CHUNK_MB", "30"))
+MAX_CHUNK_MB = float(os.environ.get("MAX_CHUNK_MB", "50"))
 MAX_PARALLEL_CHUNKS = int(os.environ.get("MAX_PARALLEL_CHUNKS", "16"))
 MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
 # Minimum chunk size to avoid spawning tiny Ghostscript jobs that add overhead.
@@ -25,8 +25,8 @@ MAX_PAGES_PER_CHUNK = int(os.environ.get("MAX_PAGES_PER_CHUNK", "200"))
 MIN_CHUNK_MB = 5.0
 # Large-file tuning defaults (used only when chunk overrides are not set).
 LARGE_FILE_TUNE_MIN_MB = float(os.environ.get("LARGE_FILE_TUNE_MIN_MB", "200"))
-LARGE_FILE_TARGET_CHUNK_MB = float(os.environ.get("LARGE_FILE_TARGET_CHUNK_MB", "60"))
-LARGE_FILE_MAX_CHUNK_MB = float(os.environ.get("LARGE_FILE_MAX_CHUNK_MB", "90"))
+LARGE_FILE_TARGET_CHUNK_MB = float(os.environ.get("LARGE_FILE_TARGET_CHUNK_MB", "50"))
+LARGE_FILE_MAX_CHUNK_MB = float(os.environ.get("LARGE_FILE_MAX_CHUNK_MB", "75"))
 LARGE_FILE_MAX_PARALLEL_CHUNKS = int(os.environ.get("LARGE_FILE_MAX_PARALLEL_CHUNKS", "12"))
 # Guardrail: only trigger merge fallback when output is meaningfully larger than input.
 PARALLEL_BLOAT_PCT = 0.08

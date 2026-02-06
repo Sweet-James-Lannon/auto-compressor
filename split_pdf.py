@@ -40,8 +40,8 @@ try:
     SPLIT_ULTRA_JPEGQ = max(20, min(90, int(_ultra_jpegq)))
 except ValueError:
     SPLIT_ULTRA_JPEGQ = 50
-MERGE_TIMEOUT_SEC = env_int("MERGE_TIMEOUT_SEC", 45)
-MERGE_FALLBACK_TIMEOUT_SEC = env_int("MERGE_FALLBACK_TIMEOUT_SEC", 60)
+MERGE_TIMEOUT_SEC = env_int("MERGE_TIMEOUT_SEC", 120)
+MERGE_FALLBACK_TIMEOUT_SEC = env_int("MERGE_FALLBACK_TIMEOUT_SEC", 120)
 MERGE_BLOAT_ABORT_PCT = 0.02
 _ultra_gap = float(os.environ.get("SPLIT_ULTRA_GAP_PCT", "0.12"))
 SPLIT_ULTRA_GAP_PCT: float = max(0.0, min(0.5, _ultra_gap))
