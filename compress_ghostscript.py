@@ -64,24 +64,39 @@ PARALLEL_SERIAL_FALLBACK = env_bool("PARALLEL_SERIAL_FALLBACK", True)
 CHUNK_TIME_BUDGET_SEC = 60
 CHUNK_TIME_BUDGET_MIN_SEC = 40
 CHUNK_TIME_BUDGET_MAX_SEC = 90
+CHUNK_TIME_BUDGET_MAX_SEC_LARGE = 120  # for files >= 200MB
 PROBE_TIME_BUDGET_SEC = 45          # seconds
 PROBE_INFLATION_ABORT_PCT = 0.20    # 20% growth triggers bailout
 PROBE_SAMPLE_PAGES = 3
+PROBE_TIMEOUT_BAILOUT_SLA_PCT = 12.0  # bail if probe uses >12% of SLA
 PARALLEL_JOB_SLA_SEC = 300          # hard cap for parallel job
 SLA_MAX_PARALLEL_CHUNKS = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS", 8))
 SLA_MAX_PARALLEL_CHUNKS_LARGE = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS_LARGE", 12))
 HARD_MAX_PARALLEL_CHUNKS = max(2, env_int("HARD_MAX_PARALLEL_CHUNKS", 24))
 PARALLEL_SPLIT_DELIVER_CHUNKS = env_bool("PARALLEL_SPLIT_DELIVER_CHUNKS", True)
 
+# Extreme fallback: last resort when all other compression fails.
+# JPEGQ=30 at 50 DPI will force size reduction on any image-based PDF.
+EXTREME_FALLBACK_JPEGQ = env_int("EXTREME_FALLBACK_JPEGQ", 30)
+EXTREME_FALLBACK_COLOR_DPI = env_int("EXTREME_FALLBACK_COLOR_DPI", 50)
+EXTREME_FALLBACK_GRAY_DPI = env_int("EXTREME_FALLBACK_GRAY_DPI", 50)
+EXTREME_FALLBACK_MONO_DPI = env_int("EXTREME_FALLBACK_MONO_DPI", 200)
 
-def _chunk_timeout_seconds(file_mb: float) -> int:
+# Early termination: stop chunk processing when failure rate is high.
+EARLY_TERMINATION_FAILURE_PCT = 0.50
+EARLY_TERMINATION_MIN_COMPLETED = 3
+
+
+def _chunk_timeout_seconds(file_mb: float, large_file: bool = False) -> int:
     """
     Compute a sane per-chunk timeout so Ghostscript jobs don't run indefinitely.
     Scales with size but clamps to a reasonable window to avoid hanging workers.
+    For files >= 200MB, uses a higher ceiling to handle dense content chunks.
     """
+    cap = CHUNK_TIME_BUDGET_MAX_SEC_LARGE if large_file else CHUNK_TIME_BUDGET_MAX_SEC
     dynamic = int(max(1.0, file_mb) * 8)  # ~8s/MB baseline
-    budget = max(CHUNK_TIME_BUDGET_MIN_SEC, min(CHUNK_TIME_BUDGET_SEC, CHUNK_TIME_BUDGET_MAX_SEC))
-    return min(max(dynamic, budget), CHUNK_TIME_BUDGET_MAX_SEC)
+    budget = max(CHUNK_TIME_BUDGET_MIN_SEC, min(CHUNK_TIME_BUDGET_SEC, cap))
+    return min(max(dynamic, budget), cap)
 
 
 def _resolve_gs_threads(num_threads: Optional[int]) -> int:
@@ -316,6 +331,11 @@ def compress_pdf_with_ghostscript(
         "-dMonoImageDownsampleType=/Subsample",  # Faster for 1-bit images
         f"-dMonoImageResolution={GS_MONO_IMAGE_RESOLUTION}",  # Raised for readable scanned text
         "-dMonoImageDownsampleThreshold=1.0",
+        # Force re-encode existing compressed images (ROOT CAUSE FIX)
+        "-dPassThroughJPEGImages=false",
+        "-dPassThroughJPXImages=false",
+        # Explicit JPEG quality (GS default ~75; lower = smaller)
+        f"-dJPEGQ={env_int('GS_JPEGQ', 60)}",
         # Optimization
         "-dDetectDuplicateImages=true",
         "-dCompressFonts=true",
@@ -407,6 +427,9 @@ def compress_ultra_aggressive(
         "-dBATCH",
         "-dQUIET",
         f"-dJPEGQ={int(jpeg_quality)}",
+        # Force re-encode existing compressed images
+        "-dPassThroughJPEGImages=false",
+        "-dPassThroughJPXImages=false",
         # Force JPEG encoding (converts JPEG2000 to JPEG)
         "-dAutoFilterColorImages=false",
         "-dColorImageFilter=/DCTEncode",
@@ -506,21 +529,24 @@ def compress_ultra_fallback(
         "-dBATCH",
         "-dQUIET",
         f"-dJPEGQ={int(max(10, min(jpeg_quality, 95)))}",
+        # Force re-encode existing compressed images
+        "-dPassThroughJPEGImages=false",
+        "-dPassThroughJPXImages=false",
         "-dAutoFilterColorImages=false",
         "-dColorImageFilter=/DCTEncode",
         "-dAutoFilterGrayImages=false",
         "-dGrayImageFilter=/DCTEncode",
         "-dDownsampleColorImages=true",
         f"-dColorImageDownsampleType={GS_COLOR_DOWNSAMPLE_TYPE}",
-        f"-dColorImageResolution={max(72, color_res)}",
+        f"-dColorImageResolution={max(36, color_res)}",
         "-dColorImageDownsampleThreshold=1.0",
         "-dDownsampleGrayImages=true",
         f"-dGrayImageDownsampleType={GS_GRAY_DOWNSAMPLE_TYPE}",
-        f"-dGrayImageResolution={max(72, gray_res)}",
+        f"-dGrayImageResolution={max(36, gray_res)}",
         "-dGrayImageDownsampleThreshold=1.0",
         "-dDownsampleMonoImages=true",
         "-dMonoImageDownsampleType=/Subsample",
-        f"-dMonoImageResolution={max(150, mono_res)}",
+        f"-dMonoImageResolution={max(72, mono_res)}",
         "-dMonoImageDownsampleThreshold=1.0",
         "-dDetectDuplicateImages=true",
         "-dCompressFonts=true",
@@ -888,7 +914,9 @@ def compress_parallel(
         unique_id = str(uuid.uuid4())[:8]
         compressed_path = working_dir / f"{chunk_path.stem}_{unique_id}_compressed.pdf"
         chunk_mb = get_file_size_mb(chunk_path)
-        chunk_timeout = timeout_override or _chunk_timeout_seconds(chunk_mb)
+        chunk_timeout = timeout_override or _chunk_timeout_seconds(
+            chunk_mb, large_file=(original_size_mb >= LARGE_FILE_TUNE_MIN_MB)
+        )
 
         should_dedupe = compression_mode == "lossless" or force_dedup
         if should_dedupe:
@@ -1112,27 +1140,162 @@ def compress_parallel(
                 "note": "Probe showed inflation; applied lossless fallback before returning",
             }
         elif probe_slow and not probe_inflated and not success:
-            logger.warning(
-                "[PARALLEL_PROBE] Probe timed out (%.1fs > %ss) but no inflation; "
-                "continuing with chunk compression (re-inserting probe chunk)",
-                probe_elapsed,
-                PROBE_TIME_BUDGET_SEC,
-            )
-            strategy_outcome["probe_status"] = "timeout_continue"
-            strategy_outcome["timeouts"]["probe_timeout"] += 1
+            sla_pct_used = (probe_elapsed / PARALLEL_JOB_SLA_SEC * 100) if probe_elapsed else 0
+            if sla_pct_used >= PROBE_TIMEOUT_BAILOUT_SLA_PCT:
+                # Probe used too much SLA budget on the SMALLEST chunk — file is
+                # likely incompressible within SLA. Bail to fallback chain.
+                bailout_reason = [
+                    f"probe_timeout {probe_elapsed:.1f}s ({sla_pct_used:.0f}% of SLA)"
+                ]
+                logger.warning(
+                    "[PARALLEL_PROBE] Bailout: probe timed out using %.0f%% of SLA "
+                    "(%.1fs / %ss); falling back to lossless + extreme",
+                    sla_pct_used,
+                    probe_elapsed,
+                    PARALLEL_JOB_SLA_SEC,
+                )
+                strategy_outcome["probe_status"] = "timeout_bailout"
+                strategy_outcome["timeouts"]["probe_timeout"] += 1
 
-            failed_chunks = [
-                (idx, path) for idx, path in failed_chunks
-                if path != probe_chunk
-            ]
+                # Cleanup temp chunks
+                for p in chunk_paths:
+                    p.unlink(missing_ok=True)
+                if probe_path != probe_chunk and probe_path.exists():
+                    probe_path.unlink(missing_ok=True)
+                if probe_chunk.exists():
+                    probe_chunk.unlink(missing_ok=True)
 
-            insert_pos = min(probe_idx, len(chunk_paths))
-            chunk_paths.insert(insert_pos, probe_chunk)
+                merged_path = working_dir / f"{base_name}_compressed.pdf"
+                merged_path.unlink(missing_ok=True)
 
-            if probe_path != probe_chunk and probe_path.exists():
-                probe_path.unlink(missing_ok=True)
+                # Try lossless with reduced timeout
+                lossless_timeout = min(120, max(60, int(original_size_mb * 0.5)))
+                lossless_used = False
+                try:
+                    lossless_path = working_dir / f"{base_name}_lossless_bailout.pdf"
+                    ok_ll, msg_ll = compress_pdf_lossless(
+                        input_path, lossless_path, timeout_override=lossless_timeout,
+                    )
+                    if ok_ll and lossless_path.exists():
+                        ll_mb = get_file_size_mb(lossless_path)
+                        if ll_mb < original_size_mb:
+                            lossless_used = True
+                            shutil.copy2(lossless_path, merged_path)
+                            logger.info(
+                                "[PARALLEL_PROBE] Lossless bailout: %.1fMB -> %.1fMB",
+                                original_size_mb, ll_mb,
+                            )
+                        lossless_path.unlink(missing_ok=True)
+                    else:
+                        lossless_path.unlink(missing_ok=True)
+                except Exception as exc:
+                    logger.warning("[PARALLEL_PROBE] Lossless bailout failed: %s", exc)
 
-            probe_reinserted = True
+                # Try extreme fallback if lossless didn't help
+                extreme_used = False
+                if not lossless_used and allow_lossy:
+                    extreme_timeout = min(120, max(60, int(original_size_mb * 0.5)))
+                    extreme_path = working_dir / f"{base_name}_extreme_bailout.pdf"
+                    try:
+                        logger.info(
+                            "[EXTREME_FALLBACK] Probe bailout: trying JPEGQ=%s DPI=%s/%s/%s",
+                            EXTREME_FALLBACK_JPEGQ,
+                            EXTREME_FALLBACK_COLOR_DPI,
+                            EXTREME_FALLBACK_GRAY_DPI,
+                            EXTREME_FALLBACK_MONO_DPI,
+                        )
+                        ok_ext, msg_ext = compress_ultra_fallback(
+                            input_path, extreme_path,
+                            jpeg_quality=EXTREME_FALLBACK_JPEGQ,
+                            color_res=EXTREME_FALLBACK_COLOR_DPI,
+                            gray_res=EXTREME_FALLBACK_GRAY_DPI,
+                            mono_res=EXTREME_FALLBACK_MONO_DPI,
+                            timeout_override=extreme_timeout,
+                        )
+                        if ok_ext and extreme_path.exists():
+                            ext_mb = get_file_size_mb(extreme_path)
+                            if ext_mb < original_size_mb:
+                                extreme_used = True
+                                merged_path.unlink(missing_ok=True)
+                                shutil.copy2(extreme_path, merged_path)
+                                logger.info(
+                                    "[EXTREME_FALLBACK] Probe bailout succeeded: %.1fMB -> %.1fMB",
+                                    original_size_mb, ext_mb,
+                                )
+                            else:
+                                logger.warning(
+                                    "[EXTREME_FALLBACK] Also inflated (%.1fMB -> %.1fMB)",
+                                    original_size_mb, ext_mb,
+                                )
+                            extreme_path.unlink(missing_ok=True)
+                        else:
+                            logger.warning("[EXTREME_FALLBACK] Failed: %s", msg_ext)
+                            extreme_path.unlink(missing_ok=True)
+                    except Exception as exc:
+                        logger.warning("[EXTREME_FALLBACK] Error: %s", exc)
+                        extreme_path.unlink(missing_ok=True)
+
+                # If nothing worked, return original
+                if not merged_path.exists():
+                    shutil.copy2(input_path, merged_path)
+
+                compressed_mb = get_file_size_mb(merged_path)
+                reduction_pct = 0.0
+                if compressed_mb < original_size_mb and original_size_mb > 0:
+                    reduction_pct = ((original_size_mb - compressed_mb) / original_size_mb) * 100
+
+                method = "extreme" if extreme_used else "lossless" if lossless_used else "none"
+                total_time = time.time() - start_ts
+                return {
+                    "output_path": str(merged_path),
+                    "output_paths": [str(merged_path)],
+                    "original_size_mb": round(original_size_mb, 2),
+                    "compressed_size_mb": round(compressed_mb, 2),
+                    "reduction_percent": round(reduction_pct, 1),
+                    "compression_method": method,
+                    "compression_mode": compression_mode,
+                    "quality_mode": "extreme" if extreme_used else "lossless",
+                    "was_split": False,
+                    "total_parts": 1,
+                    "success": True,
+                    "page_count": total_pages,
+                    "part_sizes": [merged_path.stat().st_size],
+                    "bloat_detected": not (lossless_used or extreme_used),
+                    "bloat_action": f"{method}_fallback" if (lossless_used or extreme_used) else "probe_timeout_bailout",
+                    "probe_bailout": True,
+                    "probe_bailout_reason": ", ".join(bailout_reason),
+                    "lossless_fallback_used": lossless_used,
+                    "extreme_fallback_used": extreme_used,
+                    "note": "Probe timed out; applied fallback chain",
+                    "timings": {
+                        "total_seconds": round(total_time, 2),
+                        "probe_seconds": round(probe_elapsed, 2) if probe_elapsed else 0,
+                    },
+                }
+            else:
+                # Probe was slow but hasn't used much SLA — re-insert and continue
+                logger.warning(
+                    "[PARALLEL_PROBE] Probe timed out (%.1fs > %ss, %.0f%% SLA) but under "
+                    "bailout threshold; continuing with chunk compression",
+                    probe_elapsed,
+                    PROBE_TIME_BUDGET_SEC,
+                    sla_pct_used,
+                )
+                strategy_outcome["probe_status"] = "timeout_continue"
+                strategy_outcome["timeouts"]["probe_timeout"] += 1
+
+                failed_chunks = [
+                    (idx, path) for idx, path in failed_chunks
+                    if path != probe_chunk
+                ]
+
+                insert_pos = min(probe_idx, len(chunk_paths))
+                chunk_paths.insert(insert_pos, probe_chunk)
+
+                if probe_path != probe_chunk and probe_path.exists():
+                    probe_path.unlink(missing_ok=True)
+
+                probe_reinserted = True
 
         # Retune remaining chunks based on probe throughput.
         if (probe_pps or probe_mbps) and chunk_paths:
@@ -1241,6 +1404,7 @@ def compress_parallel(
         effective_cpu,
         max_workers,
     )
+    early_terminated = False
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         # Submit all compression jobs
         futures = {
@@ -1300,6 +1464,30 @@ def compress_parallel(
             done = len(compressed_chunks) + len(failed_chunks)
             pct = 15 + int(55 * done / num_chunks)
             report_progress(pct, "compressing", f"Compressed {done}/{num_chunks} chunks...")
+
+            # Early termination: if most chunks are failing, cancel remaining
+            if (
+                done >= EARLY_TERMINATION_MIN_COMPLETED
+                and len(failed_chunks) > 0
+                and len(failed_chunks) / done > EARLY_TERMINATION_FAILURE_PCT
+            ):
+                remaining = [f for f in futures if not f.done()]
+                if remaining:
+                    logger.warning(
+                        "[PARALLEL] Early termination: %s/%s chunks failed (>%.0f%%); "
+                        "cancelling %s remaining futures",
+                        len(failed_chunks), done,
+                        EARLY_TERMINATION_FAILURE_PCT * 100,
+                        len(remaining),
+                    )
+                    for f in remaining:
+                        f.cancel()
+                        # Add cancelled chunks as failed
+                        if f in futures:
+                            c_idx, c_chunk = futures[f]
+                            failed_chunks.append((c_idx, c_chunk))
+                    early_terminated = True
+                    break
 
     # Sort chunks by original order and combine with failed chunks
     all_chunks = compressed_chunks + failed_chunks
@@ -1695,15 +1883,20 @@ def compress_parallel(
                 bloat_pct = 0.0
         else:
             logger.warning(
-                "[PARALLEL] Output larger than input (%.1fMB -> %.1fMB, +%.1f%%); returning original",
+                "[PARALLEL] Output larger than input (%.1fMB -> %.1fMB, +%.1f%%); running fallback chain",
                 original_size_mb,
                 combined_mb,
                 bloat_pct,
             )
+            # Scale fallback timeouts by failure severity
+            failure_ratio = len(failed_chunks) / max(num_chunks, 1) if num_chunks > 0 else 0
+            timeout_scale = 0.3 if failure_ratio >= 0.7 else 0.5 if failure_ratio >= 0.3 else 1.0
+            base_timeout = min(240, max(90, int(original_size_mb * 1.2)))
+
             lossless_used = False
             lossless_path = working_dir / f"{input_path.stem}_lossless_fallback.pdf"
+            lossless_timeout = max(60, int(base_timeout * timeout_scale))
             try:
-                lossless_timeout = min(240, max(90, int(original_size_mb * 1.2)))
                 ok_lossless, msg_lossless = compress_pdf_lossless(
                     input_path,
                     lossless_path,
@@ -1723,27 +1916,29 @@ def compress_parallel(
                         bloat_pct = round(((combined_mb / original_size_mb) - 1) * 100, 1) if original_size_mb > 0 else 0.0
                         lossless_used = True
                         logger.info(
-                            "[PARALLEL] Lossless fallback after bloat succeeded: %.1fMB -> %.1fMB (timeout=%ss)",
+                            "[PARALLEL] Lossless fallback succeeded: %.1fMB -> %.1fMB (timeout=%ss, scale=%.1f)",
                             original_size_mb,
                             combined_mb,
                             lossless_timeout,
+                            timeout_scale,
                         )
                     else:
                         lossless_path.unlink(missing_ok=True)
             except Exception as exc:
-                logger.warning("[PARALLEL] Lossless fallback after bloat failed: %s", exc)
+                logger.warning("[PARALLEL] Lossless fallback failed: %s", exc)
                 lossless_path.unlink(missing_ok=True)
 
             # If lossless didn't help and lossy is allowed, try ultra fallback.
             ultra_used = False
             if not lossless_used and allow_lossy:
                 ultra_path = working_dir / f"{input_path.stem}_ultra_parallel.pdf"
-                ultra_timeout = min(240, max(90, int(original_size_mb * 1.2)))
+                ultra_timeout = max(60, int(base_timeout * timeout_scale))
                 try:
                     logger.info(
-                        "[PARALLEL] Trying ultra fallback after bloat (%.1fMB, timeout=%ss)",
+                        "[PARALLEL] Trying ultra fallback (%.1fMB, timeout=%ss, scale=%.1f)",
                         original_size_mb,
                         ultra_timeout,
+                        timeout_scale,
                     )
                     ok_ultra, msg_ultra = compress_ultra_fallback(
                         input_path,
@@ -1771,7 +1966,7 @@ def compress_parallel(
                             )
                         else:
                             logger.warning(
-                                "[PARALLEL] Ultra fallback also inflated (%.1fMB -> %.1fMB); returning original",
+                                "[PARALLEL] Ultra fallback also inflated (%.1fMB -> %.1fMB)",
                                 original_size_mb,
                                 ultra_mb,
                             )
@@ -1783,7 +1978,63 @@ def compress_parallel(
                     logger.warning("[PARALLEL] Ultra fallback error: %s", exc)
                     ultra_path.unlink(missing_ok=True)
 
-            if not lossless_used and not ultra_used:
+            # EXTREME fallback: JPEGQ=30, DPI=50 — last resort to force size reduction
+            extreme_used = False
+            if not lossless_used and not ultra_used and allow_lossy:
+                extreme_path = working_dir / f"{input_path.stem}_extreme_parallel.pdf"
+                extreme_timeout = max(60, int(base_timeout * timeout_scale))
+                try:
+                    logger.info(
+                        "[EXTREME_FALLBACK] Bloat handler: JPEGQ=%s DPI=%s/%s/%s timeout=%ss",
+                        EXTREME_FALLBACK_JPEGQ,
+                        EXTREME_FALLBACK_COLOR_DPI,
+                        EXTREME_FALLBACK_GRAY_DPI,
+                        EXTREME_FALLBACK_MONO_DPI,
+                        extreme_timeout,
+                    )
+                    ok_ext, msg_ext = compress_ultra_fallback(
+                        input_path,
+                        extreme_path,
+                        jpeg_quality=EXTREME_FALLBACK_JPEGQ,
+                        color_res=EXTREME_FALLBACK_COLOR_DPI,
+                        gray_res=EXTREME_FALLBACK_GRAY_DPI,
+                        mono_res=EXTREME_FALLBACK_MONO_DPI,
+                        timeout_override=extreme_timeout,
+                    )
+                    if ok_ext and extreme_path.exists():
+                        ext_mb = get_file_size_mb(extreme_path)
+                        if ext_mb < original_size_mb:
+                            for part in verified_parts:
+                                part.unlink(missing_ok=True)
+                            verified_parts = [extreme_path]
+                            combined_bytes = extreme_path.stat().st_size
+                            combined_mb = combined_bytes / (1024 * 1024)
+                            reduction_percent = ((original_size_mb - combined_mb) / original_size_mb) * 100
+                            bloat_action = "extreme_fallback"
+                            bloat_detected = False
+                            bloat_pct = 0.0
+                            extreme_used = True
+                            logger.info(
+                                "[EXTREME_FALLBACK] Succeeded: %.1fMB -> %.1fMB (%.1f%%)",
+                                original_size_mb,
+                                combined_mb,
+                                reduction_percent,
+                            )
+                        else:
+                            logger.warning(
+                                "[EXTREME_FALLBACK] Also inflated (%.1fMB -> %.1fMB)",
+                                original_size_mb,
+                                ext_mb,
+                            )
+                            extreme_path.unlink(missing_ok=True)
+                    else:
+                        logger.warning("[EXTREME_FALLBACK] Failed: %s", msg_ext)
+                        extreme_path.unlink(missing_ok=True)
+                except Exception as exc:
+                    logger.warning("[EXTREME_FALLBACK] Error: %s", exc)
+                    extreme_path.unlink(missing_ok=True)
+
+            if not lossless_used and not ultra_used and not extreme_used:
                 merged_path = verified_parts[0] if verified_parts else (working_dir / f"{input_path.stem}_compressed.pdf")
                 if merged_path.resolve() != input_path.resolve():
                     merged_path.unlink(missing_ok=True)
@@ -1834,6 +2085,32 @@ def compress_parallel(
         "hit" if sla_exceeded else "ok",
     )
 
+    # SLA breach logging
+    if total_time > PARALLEL_JOB_SLA_SEC:
+        logger.error(
+            "[SLA_BREACH] file=%s size_mb=%.1f pages=%s total_time=%.1fs sla=%ss "
+            "split=%.1fs compress=%.1fs merge=%.1fs fallback=%.1fs "
+            "chunks=%s failed=%s bloat=%s action=%s early_terminated=%s",
+            input_path.name, original_size_mb, total_pages, total_time,
+            PARALLEL_JOB_SLA_SEC,
+            split_time, compress_time, split_total, merge_fallback_time,
+            num_chunks, len(failed_chunks),
+            "yes" if bloat_detected else "no",
+            bloat_action or "none",
+            "yes" if early_terminated else "no",
+        )
+
+    timings_dict = {
+        "total_seconds": round(total_time, 2),
+        "split_seconds": round(split_time, 2),
+        "compress_seconds": round(compress_time, 2),
+        "merge_seconds": round(split_total, 2),
+        "fallback_seconds": round(merge_fallback_time, 2),
+        "probe_seconds": round(probe_elapsed, 2) if probe_elapsed else 0,
+        "sla_seconds": PARALLEL_JOB_SLA_SEC,
+        "sla_breached": total_time > PARALLEL_JOB_SLA_SEC,
+    }
+
     return {
         "output_path": str(verified_parts[0]),
         "output_paths": [str(p) for p in verified_parts],
@@ -1866,8 +2143,10 @@ def compress_parallel(
         "bloat_pct": bloat_pct,
         "bloat_action": bloat_action,
         "sla_exceeded": sla_exceeded,
+        "early_terminated": early_terminated,
         "probe_bailout": False,
         "probe_bailout_reason": None,
+        "timings": timings_dict,
     }
 
 

@@ -96,7 +96,7 @@ API_TOKEN = os.environ.get('API_TOKEN')
 # Public base URL for download links (e.g., https://yourapp.azurewebsites.net)
 BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
 _EFFECTIVE_CPU = utils.get_effective_cpu_count()
-_DEFAULT_ASYNC_WORKERS = max(1, min(2, _EFFECTIVE_CPU))
+_DEFAULT_ASYNC_WORKERS = max(1, min(3, _EFFECTIVE_CPU // 2))
 try:
     ASYNC_WORKERS = max(1, int(os.environ.get("ASYNC_WORKERS", str(_DEFAULT_ASYNC_WORKERS))))
 except ValueError:
@@ -1766,6 +1766,35 @@ def compress_async():
 
     # Create job and enqueue for processing
     job_id = job_queue.create_job()
+
+    # Pre-download URL-based PDFs immediately to prevent presigned URL expiration
+    # while the job waits in queue. Falls back to worker-download on failure.
+    if 'download_url' in task_data and 'pdf_bytes' not in task_data and 'input_path' not in task_data:
+        predownload_path = UPLOAD_FOLDER / f"{job_id}_input.pdf"
+        try:
+            job_queue.download_pdf(
+                task_data['download_url'],
+                predownload_path,
+                max_download_size_bytes=int(ASYNC_MAX_MB * 1024 * 1024),
+            )
+            task_data['input_path'] = str(predownload_path)
+            # Keep download_url for name_hint but remove it from download triggers
+            task_data.pop('download_url')
+            track_file(predownload_path)
+            logger.info(
+                "[%s] Pre-downloaded %.1fMB to prevent URL expiration",
+                job_id,
+                predownload_path.stat().st_size / (1024 * 1024),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Pre-download failed (%s); will retry in worker",
+                job_id,
+                exc,
+            )
+            # Leave download_url in task_data for worker to try
+            predownload_path.unlink(missing_ok=True)
+
     try:
         job_queue.enqueue(job_id, task_data)
     except Exception as e:

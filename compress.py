@@ -55,10 +55,16 @@ def _resolve_parallel_workers(effective_cpu: Optional[int] = None) -> Tuple[int,
             env_workers = None
 
     if env_workers is not None:
+        # Warn if explicitly set too low relative to available CPUs
+        if effective_cpu >= 4 and env_workers < effective_cpu // 2:
+            logger.warning(
+                "[compress] PARALLEL_MAX_WORKERS=%s is low for %s CPUs; consider %s+",
+                env_workers, effective_cpu, effective_cpu // 2,
+            )
         return max(1, env_workers), env_workers
 
-    max_workers = env_workers if env_workers is not None else effective_cpu
-    return max(1, min(max_workers, effective_cpu)), env_workers
+    # Auto-detect: use all available CPUs
+    return max(1, effective_cpu), env_workers
 
 # Skip compression for very small files (already optimized)
 MIN_COMPRESSION_SIZE_MB = float(os.environ.get("MIN_COMPRESSION_SIZE_MB", "1.0"))
