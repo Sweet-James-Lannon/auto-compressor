@@ -6,6 +6,7 @@ identify scanned documents, and diagnose potential issues before processing.
 
 import logging
 import os
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -135,6 +136,148 @@ def detect_already_compressed(pdf_path: Path) -> Tuple[bool, str]:
             return True, f"Low bytes/page ratio ({bytes_per_page/1024:.1f}KB/page)"
 
     return False, ""
+
+
+def fingerprint_pdf(pdf_path: Path, max_pages: int = 5) -> Dict[str, Any]:
+    """Generate a lightweight PDF fingerprint for logging and diagnostics."""
+    result: Dict[str, Any] = {
+        "page_count": 0,
+        "sample_pages": 0,
+        "file_size_mb": 0.0,
+        "bytes_per_page": 0.0,
+        "producer": "",
+        "creator": "",
+        "already_compressed": False,
+        "already_reason": "",
+        "image_count": 0,
+        "image_filters": {},
+        "image_megapixels": 0.0,
+        "avg_image_dpi": None,
+        "text_pages": 0,
+        "text_chars": 0,
+        "error": None,
+    }
+
+    analysis = analyze_pdf(pdf_path)
+    if analysis.get("error"):
+        result["error"] = analysis["error"]
+        return result
+
+    result["file_size_mb"] = analysis.get("file_size_mb", 0.0)
+    result["bytes_per_page"] = analysis.get("bytes_per_page", 0.0)
+    result["producer"] = analysis.get("producer", "")
+    result["creator"] = analysis.get("creator", "")
+
+    # Inline "already compressed" detection from analysis to avoid extra IO.
+    compression_tools = [
+        "ghostscript",
+        "ilovepdf",
+        "smallpdf",
+        "pdf compressor",
+        "nitro",
+        "foxit",
+        "pdfoptim",
+        "qpdf",
+        "cpdf",
+        "pdfsizeopt",
+    ]
+    producer = analysis.get("producer", "").lower()
+    creator = analysis.get("creator", "").lower()
+    for tool in compression_tools:
+        if tool in producer:
+            result["already_compressed"] = True
+            result["already_reason"] = f"Previously processed by {tool} (Producer)"
+            break
+        if tool in creator:
+            result["already_compressed"] = True
+            result["already_reason"] = f"Previously processed by {tool} (Creator)"
+            break
+    if not result["already_compressed"]:
+        bytes_per_page = analysis.get("bytes_per_page", 0)
+        if bytes_per_page > 0 and bytes_per_page < 20000:
+            result["already_compressed"] = True
+            result["already_reason"] = f"Low bytes/page ratio ({bytes_per_page/1024:.1f}KB/page)"
+
+    try:
+        reader = PdfReader(str(pdf_path), strict=False)
+        if reader.is_encrypted:
+            result["error"] = "PDF is encrypted"
+            return result
+
+        page_count = len(reader.pages)
+        result["page_count"] = page_count
+        sample_pages = min(max_pages, page_count) if page_count else 0
+        result["sample_pages"] = sample_pages
+
+        filters = Counter()
+        image_pixels = 0.0
+        image_dpis: list[float] = []
+
+        def _resolve(obj: Any) -> Any:
+            try:
+                return obj.get_object()
+            except Exception:
+                return obj
+
+        def _clean_filter(name: Any) -> str:
+            label = str(name)
+            return label[1:] if label.startswith("/") else label
+
+        for idx in range(sample_pages):
+            page = reader.pages[idx]
+            try:
+                text = page.extract_text() or ""
+                text = text.strip()
+                if text:
+                    result["text_pages"] += 1
+                    result["text_chars"] += len(text)
+            except Exception:
+                pass
+
+            resources = _resolve(page.get("/Resources") or {})
+            xobj = resources.get("/XObject")
+            if not xobj:
+                continue
+            xobj = _resolve(xobj)
+            for _, obj in xobj.items():
+                obj = _resolve(obj)
+                if obj.get("/Subtype") != "/Image":
+                    continue
+                result["image_count"] += 1
+                width = obj.get("/Width")
+                height = obj.get("/Height")
+                if isinstance(width, (int, float)) and isinstance(height, (int, float)):
+                    image_pixels += float(width) * float(height)
+                    try:
+                        mediabox = page.mediabox
+                        page_w = float(mediabox.width)
+                        page_h = float(mediabox.height)
+                        if page_w > 0 and page_h > 0:
+                            dpi_x = float(width) / (page_w / 72.0)
+                            dpi_y = float(height) / (page_h / 72.0)
+                            image_dpis.append((dpi_x + dpi_y) / 2.0)
+                    except Exception:
+                        pass
+
+                filter_val = obj.get("/Filter")
+                if filter_val is None:
+                    filters["None"] += 1
+                elif isinstance(filter_val, list):
+                    for f_item in filter_val:
+                        filters[_clean_filter(f_item)] += 1
+                else:
+                    filters[_clean_filter(filter_val)] += 1
+
+        result["image_filters"] = dict(filters)
+        if image_pixels:
+            result["image_megapixels"] = round(image_pixels / 1_000_000, 2)
+        if image_dpis:
+            result["avg_image_dpi"] = round(sum(image_dpis) / len(image_dpis), 1)
+    except Exception as e:
+        result["error"] = f"Fingerprint error: {str(e)}"
+        logger.warning(f"[DIAGNOSTICS] Fingerprint error for {pdf_path}: {e}")
+
+    return result
 
 
 def detect_scanned_document(pdf_path: Path) -> Tuple[bool, float]:

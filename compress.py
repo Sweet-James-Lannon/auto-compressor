@@ -54,7 +54,26 @@ def _resolve_parallel_workers(effective_cpu: Optional[int] = None) -> Tuple[int,
             logger.warning("[compress] Invalid PARALLEL_MAX_WORKERS=%s; using effective CPU", env_value)
             env_workers = None
 
+    gs_threads_env = os.environ.get("GS_NUM_RENDERING_THREADS")
+    gs_threads = None
+    if gs_threads_env:
+        try:
+            gs_threads = max(1, int(gs_threads_env))
+        except ValueError:
+            logger.warning("[compress] Invalid GS_NUM_RENDERING_THREADS=%s; ignoring", gs_threads_env)
+            gs_threads = None
+
+    worker_cap = max(1, effective_cpu // gs_threads) if gs_threads else None
+
     if env_workers is not None:
+        if worker_cap is not None and env_workers > worker_cap:
+            logger.warning(
+                "[compress] PARALLEL_MAX_WORKERS=%s capped to %s to honor GS_NUM_RENDERING_THREADS=%s",
+                env_workers,
+                worker_cap,
+                gs_threads,
+            )
+            env_workers = worker_cap
         # Warn if explicitly set too low relative to available CPUs
         if effective_cpu >= 4 and env_workers < effective_cpu // 2:
             logger.warning(
@@ -64,7 +83,10 @@ def _resolve_parallel_workers(effective_cpu: Optional[int] = None) -> Tuple[int,
         return max(1, env_workers), env_workers
 
     # Auto-detect: use all available CPUs
-    return max(1, effective_cpu), env_workers
+    max_workers = max(1, effective_cpu)
+    if worker_cap is not None:
+        max_workers = min(max_workers, worker_cap)
+    return max_workers, env_workers
 
 # Skip compression for very small files (already optimized)
 MIN_COMPRESSION_SIZE_MB = float(os.environ.get("MIN_COMPRESSION_SIZE_MB", "1.0"))
@@ -83,6 +105,7 @@ ULTRA_FALLBACK_GRAY_DPI = env_int("ULTRA_FALLBACK_GRAY_DPI", 150)
 ULTRA_FALLBACK_MONO_DPI = env_int("ULTRA_FALLBACK_MONO_DPI", 300)
 LOSSLESS_ALREADY_TIMEOUT_SEC = env_int("LOSSLESS_ALREADY_TIMEOUT_SEC", 240)
 ALLOW_PARALLEL_ON_ALREADY = env_bool("ALLOW_PARALLEL_ON_ALREADY", False)
+ALREADY_COMPRESSED_PROBE_MIN_REDUCTION_PCT = 5.0
 
 
 def resolve_compression_mode(input_path: Path) -> str:
@@ -345,6 +368,14 @@ def compress_pdf(
             delta_pct,
         )
 
+    if composition["already_compressed"] and probe_info and probe_info.get("success"):
+        if probe_delta_pct > -ALREADY_COMPRESSED_PROBE_MIN_REDUCTION_PCT:
+            logger.info(
+                "[compress] Already-compressed + micro-probe delta %.1f%%; switching to lossless",
+                probe_delta_pct,
+            )
+            compression_mode = "lossless"
+
     # =========================================================================
     # ROUTE: Large files use parallel compression for speed
     # Mid-size files (<~100MB or only 1–2 chunks) stay serial to avoid extra parts
@@ -413,6 +444,7 @@ def compress_pdf(
         )
         target_chunk_mb = DEFAULT_TARGET_CHUNK_MB
         max_chunk_mb = DEFAULT_MAX_CHUNK_MB
+        use_chunk_override = True
         if compression_mode == "lossless":
             target_chunk_mb = max(DEFAULT_TARGET_CHUNK_MB, 60.0)
             max_chunk_mb = max(DEFAULT_MAX_CHUNK_MB, target_chunk_mb * 1.5)
@@ -431,6 +463,12 @@ def compress_pdf(
             elif not split_requested and original_size <= 150.0:
                 target_chunk_mb = max(target_chunk_mb, 80.0)
                 max_chunk_mb = max(max_chunk_mb, target_chunk_mb * 1.5)
+            elif original_size >= compress_ghostscript.LARGE_FILE_TUNE_MIN_MB:
+                use_chunk_override = False
+                logger.info(
+                    "[compress] Large file %.1fMB; deferring chunk sizing to parallel tuner",
+                    original_size,
+                )
             logger.info(
                 "[compress] Aggressive mode: standard chunks (target %.1fMB, max %.1fMB)",
                 target_chunk_mb,
@@ -445,10 +483,12 @@ def compress_pdf(
             progress_callback=progress_callback,
             max_workers=max_workers,
             compression_mode=compression_mode,
-            target_chunk_mb=target_chunk_mb,
-            max_chunk_mb=max_chunk_mb,
+            target_chunk_mb=target_chunk_mb if use_chunk_override else None,
+            max_chunk_mb=max_chunk_mb if use_chunk_override else None,
             input_page_count=page_count,
             allow_lossy=ALLOW_LOSSY_COMPRESSION,
+            micro_probe_delta=probe_info.get("delta_pct") if probe_info else None,
+            micro_probe_success=probe_info.get("success") if probe_info else False,
         )
 
     if force_parallel_by_pages:

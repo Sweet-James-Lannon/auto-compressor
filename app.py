@@ -22,7 +22,7 @@ from werkzeug.utils import secure_filename
 
 from compress import compress_pdf, PARALLEL_THRESHOLD_MB
 from compress_ghostscript import get_ghostscript_command
-from pdf_diagnostics import diagnose_for_job, get_quality_warnings
+from pdf_diagnostics import diagnose_for_job, get_quality_warnings, fingerprint_pdf
 from exceptions import (
     PDFCompressionError,
     EncryptionError,
@@ -49,6 +49,8 @@ app = Flask(__name__, template_folder='dashboard')
 # Constants
 MAX_CONTENT_LENGTH = MAX_DOWNLOAD_SIZE
 HARD_ASYNC_LIMIT_MB = 600.0  # Absolute ceiling for async jobs
+PDF_FINGERPRINT_ENABLED = True
+PDF_FINGERPRINT_MAX_PAGES = 5
 
 
 def resolve_upload_folder() -> Path:
@@ -125,6 +127,10 @@ def _format_env_value(name: str, effective: Any, default_label: str = "default")
     return f"{effective} (env:{raw})"
 
 
+def _format_const_value(value: Any) -> str:
+    return f"{value} (const)"
+
+
 def _truncate(value: Any, width: int) -> str:
     text = str(value)
     if len(text) <= width:
@@ -132,13 +138,34 @@ def _truncate(value: Any, width: int) -> str:
     return text[: max(0, width - 3)] + "..."
 
 
+_BOX_LABEL_WIDTH = 30
+_BOX_VALUE_WIDTH = 34
+_BOX_INNER_WIDTH = _BOX_LABEL_WIDTH + _BOX_VALUE_WIDTH + 5
+
+
+def _banner(title: str) -> list[str]:
+    title_text = f"[ {title} ]"
+    border = "+" + "=" * _BOX_INNER_WIDTH + "+"
+    return [border, f"|{title_text:^{_BOX_INNER_WIDTH}}|", border]
+
+
 def _box(title: str, rows: list[tuple[str, str]]) -> list[str]:
-    border = "+" + "-" * 70 + "+"
-    lines = [border, f"| {title:<68} |", border]
+    title_text = f" {title} "
+    title_border = "+" + "=" * _BOX_INNER_WIDTH + "+"
+    row_border = (
+        "+"
+        + "-" * (_BOX_LABEL_WIDTH + 2)
+        + "+"
+        + "-" * (_BOX_VALUE_WIDTH + 2)
+        + "+"
+    )
+    lines = [title_border, f"|{title_text:^{_BOX_INNER_WIDTH}}|", title_border]
+    lines.append(row_border)
     for label, value in rows:
-        safe_value = _truncate(value, 33)
-        lines.append(f"| {label:<32} : {safe_value:<33} |")
-    lines.append(border)
+        safe_label = _truncate(label, _BOX_LABEL_WIDTH)
+        safe_value = _truncate(value, _BOX_VALUE_WIDTH)
+        lines.append(f"| {safe_label:<{_BOX_LABEL_WIDTH}} | {safe_value:<{_BOX_VALUE_WIDTH}} |")
+    lines.append(row_border)
     return lines
 
 
@@ -202,9 +229,19 @@ def _log_effective_config() -> None:
         ("GS_MONO_IMAGE_RESOLUTION", _format_env_value("GS_MONO_IMAGE_RESOLUTION", utils.env_int("GS_MONO_IMAGE_RESOLUTION", 300))),
         ("GS_COLOR_DOWNSAMPLE_TYPE", _format_env_value("GS_COLOR_DOWNSAMPLE_TYPE", os.environ.get("GS_COLOR_DOWNSAMPLE_TYPE", "/Bicubic"))),
         ("GS_GRAY_DOWNSAMPLE_TYPE", _format_env_value("GS_GRAY_DOWNSAMPLE_TYPE", os.environ.get("GS_GRAY_DOWNSAMPLE_TYPE", "/Bicubic"))),
+        ("PROBE_TIMEOUT_BAILOUT_SLA_PCT", _format_env_value("PROBE_TIMEOUT_BAILOUT_SLA_PCT", gs_cfg.PROBE_TIMEOUT_BAILOUT_SLA_PCT)),
+        ("EARLY_TERMINATION_FAILURE_PCT", _format_env_value("EARLY_TERMINATION_FAILURE_PCT", gs_cfg.EARLY_TERMINATION_FAILURE_PCT)),
+        ("EARLY_TERMINATION_MIN_COMPLETED", _format_env_value("EARLY_TERMINATION_MIN_COMPLETED", gs_cfg.EARLY_TERMINATION_MIN_COMPLETED)),
+        ("PARALLEL_JOB_SLA_LARGE_MIN_MB", _format_env_value("PARALLEL_JOB_SLA_LARGE_MIN_MB", gs_cfg.PARALLEL_JOB_SLA_LARGE_MIN_MB)),
+        ("PARALLEL_JOB_SLA_LARGE_SEC_PER_MB", _format_env_value("PARALLEL_JOB_SLA_LARGE_SEC_PER_MB", gs_cfg.PARALLEL_JOB_SLA_LARGE_SEC_PER_MB)),
+        ("PARALLEL_JOB_SLA_MAX_SEC", _format_env_value("PARALLEL_JOB_SLA_MAX_SEC", gs_cfg.PARALLEL_JOB_SLA_MAX_SEC)),
+        ("FALLBACK_MIN_SEC_PER_MB", _format_env_value("FALLBACK_MIN_SEC_PER_MB", gs_cfg.FALLBACK_MIN_SEC_PER_MB)),
+        ("MICRO_PROBE_SKIP_REDUCTION_PCT", _format_env_value("MICRO_PROBE_SKIP_REDUCTION_PCT", gs_cfg.MICRO_PROBE_SKIP_REDUCTION_PCT)),
+        ("PDF_FINGERPRINT_ENABLED", _format_const_value(PDF_FINGERPRINT_ENABLED)),
+        ("PDF_FINGERPRINT_MAX_PAGES", _format_const_value(PDF_FINGERPRINT_MAX_PAGES)),
     ]
 
-    lines = ["CONFIG SNAPSHOT (startup)"]
+    lines = _banner("CONFIG SNAPSHOT (startup)")
     lines += _box("Concurrency", rows_concurrency)
     lines += _box("Chunking", rows_chunking)
     lines += _box("Split and Merge", rows_split)
@@ -416,6 +453,16 @@ def _log_job_snapshot(
         ("PROBE_TIME_SEC", str(gs_cfg.PROBE_TIME_BUDGET_SEC)),
         ("CHUNK_TIME_MAX_SEC", str(gs_cfg.CHUNK_TIME_BUDGET_MAX_SEC)),
         ("PARALLEL_JOB_SLA_SEC", str(gs_cfg.PARALLEL_JOB_SLA_SEC)),
+        ("PARALLEL_JOB_SLA_LARGE_MIN_MB", _format_env_value("PARALLEL_JOB_SLA_LARGE_MIN_MB", gs_cfg.PARALLEL_JOB_SLA_LARGE_MIN_MB)),
+        ("PARALLEL_JOB_SLA_LARGE_SEC_PER_MB", _format_env_value("PARALLEL_JOB_SLA_LARGE_SEC_PER_MB", gs_cfg.PARALLEL_JOB_SLA_LARGE_SEC_PER_MB)),
+        ("PARALLEL_JOB_SLA_MAX_SEC", _format_env_value("PARALLEL_JOB_SLA_MAX_SEC", gs_cfg.PARALLEL_JOB_SLA_MAX_SEC)),
+        ("PROBE_TIMEOUT_BAILOUT_SLA_PCT", _format_env_value("PROBE_TIMEOUT_BAILOUT_SLA_PCT", gs_cfg.PROBE_TIMEOUT_BAILOUT_SLA_PCT)),
+        ("EARLY_TERMINATION_FAILURE_PCT", _format_env_value("EARLY_TERMINATION_FAILURE_PCT", gs_cfg.EARLY_TERMINATION_FAILURE_PCT)),
+        ("EARLY_TERMINATION_MIN_COMPLETED", _format_env_value("EARLY_TERMINATION_MIN_COMPLETED", gs_cfg.EARLY_TERMINATION_MIN_COMPLETED)),
+        ("FALLBACK_MIN_SEC_PER_MB", _format_env_value("FALLBACK_MIN_SEC_PER_MB", gs_cfg.FALLBACK_MIN_SEC_PER_MB)),
+        ("MICRO_PROBE_SKIP_REDUCTION_PCT", _format_env_value("MICRO_PROBE_SKIP_REDUCTION_PCT", gs_cfg.MICRO_PROBE_SKIP_REDUCTION_PCT)),
+        ("PDF_FINGERPRINT_ENABLED", _format_const_value(PDF_FINGERPRINT_ENABLED)),
+        ("PDF_FINGERPRINT_MAX_PAGES", _format_const_value(PDF_FINGERPRINT_MAX_PAGES)),
         ("GS_COLOR_DPI", _format_env_value("GS_COLOR_IMAGE_RESOLUTION", gs_cfg.GS_COLOR_IMAGE_RESOLUTION)),
         ("GS_GRAY_DPI", _format_env_value("GS_GRAY_IMAGE_RESOLUTION", gs_cfg.GS_GRAY_IMAGE_RESOLUTION)),
         ("GS_MONO_DPI", _format_env_value("GS_MONO_IMAGE_RESOLUTION", gs_cfg.GS_MONO_IMAGE_RESOLUTION)),
@@ -423,11 +470,68 @@ def _log_job_snapshot(
         ("GS_GRAY_DOWNSAMPLE", _format_env_value("GS_GRAY_DOWNSAMPLE_TYPE", gs_cfg.GS_GRAY_DOWNSAMPLE_TYPE)),
     ]
 
-    lines = [f"JOB SNAPSHOT [{job_id}]"]
+    lines = _banner(f"JOB SNAPSHOT [{job_id}]")
     lines += _box("Job", rows_job)
     lines += _box("Split and Delivery", rows_split)
     lines += _box("Parallel Plan", rows_parallel)
     lines += _box("Quality and Timeouts", rows_quality)
+    logger.info("\n%s", "\n".join(lines))
+
+
+def _log_pdf_fingerprint(job_id: str, input_path: Path) -> None:
+    if not PDF_FINGERPRINT_ENABLED:
+        return
+
+    max_pages = PDF_FINGERPRINT_MAX_PAGES
+    try:
+        fp = fingerprint_pdf(input_path, max_pages=max_pages)
+    except Exception as exc:
+        logger.warning("[%s] PDF fingerprint failed: %s", job_id, exc)
+        return
+
+    if fp.get("error"):
+        logger.warning("[%s] PDF fingerprint error: %s", job_id, fp["error"])
+        return
+
+    bytes_per_page = fp.get("bytes_per_page") or 0.0
+    bytes_label = f"{bytes_per_page / 1024:.1f}KB" if bytes_per_page else "n/a"
+    producer = fp.get("producer") or "n/a"
+    creator = fp.get("creator") or "n/a"
+    already_compressed = "yes" if fp.get("already_compressed") else "no"
+    already_reason = fp.get("already_reason") or "n/a"
+
+    filters = fp.get("image_filters") or {}
+    if filters:
+        filters_label = " ".join(f"{key}:{value}" for key, value in filters.items())
+    else:
+        filters_label = "none"
+
+    avg_dpi = fp.get("avg_image_dpi")
+    avg_dpi_label = f"{avg_dpi:.1f}" if isinstance(avg_dpi, (int, float)) else "n/a"
+
+    verdict = f"{already_compressed} ({already_reason})"
+    rows_structure = [
+        ("VERDICT", verdict),
+        ("PAGES", str(fp.get("page_count") or 0)),
+        ("SAMPLE_PAGES", str(fp.get("sample_pages") or 0)),
+        ("FILE_SIZE_MB", f"{fp.get('file_size_mb', 0.0):.1f}"),
+        ("BYTES_PER_PAGE", bytes_label),
+        ("PRODUCER", producer),
+        ("CREATOR", creator),
+    ]
+
+    rows_media = [
+        ("IMAGE_COUNT", str(fp.get("image_count") or 0)),
+        ("IMAGE_FILTERS", filters_label),
+        ("IMAGE_MPIXELS", f"{fp.get('image_megapixels', 0.0):.2f}"),
+        ("AVG_IMAGE_DPI", avg_dpi_label),
+        ("TEXT_PAGES", f"{fp.get('text_pages', 0)}/{fp.get('sample_pages', 0)}"),
+        ("TEXT_CHARS", str(fp.get("text_chars") or 0)),
+    ]
+
+    lines = _banner(f"PDF FINGERPRINT [{job_id}]")
+    lines += _box("Structure", rows_structure)
+    lines += _box("Images + Text", rows_media)
     logger.info("\n%s", "\n".join(lines))
 
 
@@ -1392,6 +1496,7 @@ def process_compression_job(job_id: str, task_data: Dict[str, Any]) -> None:
             split_trigger_mb,
             split_origin,
         )
+        _log_pdf_fingerprint(job_id, input_path)
 
         download_time = round(time.time() - start_time, 2)
 

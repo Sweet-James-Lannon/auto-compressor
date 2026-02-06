@@ -42,6 +42,9 @@ except ValueError:
     SPLIT_ULTRA_JPEGQ = 50
 MERGE_TIMEOUT_SEC = env_int("MERGE_TIMEOUT_SEC", 120)
 MERGE_FALLBACK_TIMEOUT_SEC = env_int("MERGE_FALLBACK_TIMEOUT_SEC", 120)
+MERGE_TIMEOUT_SEC_PER_MB = 0.8
+MERGE_TIMEOUT_MAX_SEC = 600
+MERGE_FALLBACK_TIMEOUT_MAX_SEC = 600
 MERGE_BLOAT_ABORT_PCT = 0.02
 _ultra_gap = float(os.environ.get("SPLIT_ULTRA_GAP_PCT", "0.12"))
 SPLIT_ULTRA_GAP_PCT: float = max(0.0, min(0.5, _ultra_gap))
@@ -260,7 +263,29 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _merge_with_pypdf2(paths: List[Path], out: Path) -> None:
+    input_total_bytes = sum(p.stat().st_size for p in pdf_paths)
+    input_total_mb = input_total_bytes / (1024 * 1024)
+
+    def _scaled_timeout(base_sec: int, total_mb: float, max_sec: int) -> int:
+        scaled = int(total_mb * MERGE_TIMEOUT_SEC_PER_MB)
+        return max(60, min(max_sec, max(base_sec, scaled)))
+
+    gs_timeout = _scaled_timeout(MERGE_TIMEOUT_SEC, input_total_mb, MERGE_TIMEOUT_MAX_SEC)
+    fallback_timeout = _scaled_timeout(
+        MERGE_FALLBACK_TIMEOUT_SEC,
+        input_total_mb,
+        MERGE_FALLBACK_TIMEOUT_MAX_SEC,
+    )
+
+    logger.info(
+        "[merge_pdfs] Merge timeouts: gs=%ss fallback=%ss (inputs=%.1fMB, parts=%s)",
+        gs_timeout,
+        fallback_timeout,
+        input_total_mb,
+        len(pdf_paths),
+    )
+
+    def _merge_with_pypdf2(paths: List[Path], out: Path, timeout_sec: int) -> None:
         """Run PyPDF2 merge with a timeout to avoid hangs on huge files."""
         errors = []
 
@@ -276,9 +301,9 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
-        t.join(MERGE_FALLBACK_TIMEOUT_SEC)
+        t.join(timeout_sec)
         if t.is_alive():
-            raise TimeoutError(f"PyPDF2 merge timed out after {MERGE_FALLBACK_TIMEOUT_SEC}s")
+            raise TimeoutError(f"PyPDF2 merge timed out after {timeout_sec}s")
         if errors:
             raise errors[0]
 
@@ -286,7 +311,7 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
     if not gs_cmd:
         # Fallback to PyPDF2 if Ghostscript not available
         logger.warning("Ghostscript not found, falling back to PyPDF2 merge (may inflate file size)")
-        _merge_with_pypdf2(pdf_paths, output_path)
+        _merge_with_pypdf2(pdf_paths, output_path, fallback_timeout)
         logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2)")
         return
 
@@ -305,25 +330,23 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=MERGE_TIMEOUT_SEC)
+        result = subprocess.run(cmd, capture_output=True, timeout=gs_timeout)
         if result.returncode != 0:
             logger.warning(f"Ghostscript merge failed (code {result.returncode}), falling back to PyPDF2")
             # Fallback to PyPDF2
-            _merge_with_pypdf2(pdf_paths, output_path)
+            _merge_with_pypdf2(pdf_paths, output_path, fallback_timeout)
             logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2 fallback)")
         else:
             logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (Ghostscript)")
     except subprocess.TimeoutExpired:
         logger.warning("Ghostscript merge timed out, falling back to PyPDF2")
-        _merge_with_pypdf2(pdf_paths, output_path)
+        _merge_with_pypdf2(pdf_paths, output_path, fallback_timeout)
         logger.info(f"Merged {len(pdf_paths)} PDFs into {output_path.name} (PyPDF2 fallback)")
 
     # === BLOAT DETECTION ===
     # PyPDF2 fallback can duplicate resources, causing merged file to be larger
     # than the sum of inputs. Detect and warn loudly.
     if output_path.exists():
-        input_total_bytes = sum(p.stat().st_size for p in pdf_paths)
-        input_total_mb = input_total_bytes / (1024 * 1024)
         output_bytes = output_path.stat().st_size
         output_mb = output_bytes / (1024 * 1024)
 

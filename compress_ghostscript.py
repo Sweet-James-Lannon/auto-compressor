@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from exceptions import SplitError
-from utils import get_effective_cpu_count, env_bool, env_int, env_choice
+from utils import get_effective_cpu_count, env_bool, env_int, env_choice, env_float
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,13 @@ CHUNK_TIME_BUDGET_MAX_SEC_LARGE = 120  # for files >= 200MB
 PROBE_TIME_BUDGET_SEC = 45          # seconds
 PROBE_INFLATION_ABORT_PCT = 0.20    # 20% growth triggers bailout
 PROBE_SAMPLE_PAGES = 3
-PROBE_TIMEOUT_BAILOUT_SLA_PCT = 12.0  # bail if probe uses >12% of SLA
+PROBE_TIMEOUT_BAILOUT_SLA_PCT = env_float("PROBE_TIMEOUT_BAILOUT_SLA_PCT", 12.0)  # bail if probe uses >X% of SLA
 PARALLEL_JOB_SLA_SEC = 300          # hard cap for parallel job
+PARALLEL_JOB_SLA_LARGE_MIN_MB = 200.0
+PARALLEL_JOB_SLA_LARGE_SEC_PER_MB = 2.5
+PARALLEL_JOB_SLA_MAX_SEC = 900
+FALLBACK_MIN_SEC_PER_MB = 0.8
+MICRO_PROBE_SKIP_REDUCTION_PCT = 20.0
 SLA_MAX_PARALLEL_CHUNKS = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS", 8))
 SLA_MAX_PARALLEL_CHUNKS_LARGE = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS_LARGE", 12))
 HARD_MAX_PARALLEL_CHUNKS = max(2, env_int("HARD_MAX_PARALLEL_CHUNKS", 24))
@@ -83,8 +88,8 @@ EXTREME_FALLBACK_GRAY_DPI = env_int("EXTREME_FALLBACK_GRAY_DPI", 50)
 EXTREME_FALLBACK_MONO_DPI = env_int("EXTREME_FALLBACK_MONO_DPI", 200)
 
 # Early termination: stop chunk processing when failure rate is high.
-EARLY_TERMINATION_FAILURE_PCT = 0.50
-EARLY_TERMINATION_MIN_COMPLETED = 3
+EARLY_TERMINATION_FAILURE_PCT = env_float("EARLY_TERMINATION_FAILURE_PCT", 0.50)
+EARLY_TERMINATION_MIN_COMPLETED = env_int("EARLY_TERMINATION_MIN_COMPLETED", 3)
 
 
 def _chunk_timeout_seconds(file_mb: float, large_file: bool = False) -> int:
@@ -116,6 +121,15 @@ def _resolve_gs_threads(num_threads: Optional[int]) -> int:
 
     effective_cpu = get_effective_cpu_count()
     return max(1, min(4, effective_cpu))
+
+
+def _resolve_parallel_sla(file_mb: float) -> int:
+    """Scale the parallel SLA for large files while keeping an upper bound."""
+    job_sla = PARALLEL_JOB_SLA_SEC
+    if file_mb >= PARALLEL_JOB_SLA_LARGE_MIN_MB:
+        scaled = int(file_mb * PARALLEL_JOB_SLA_LARGE_SEC_PER_MB)
+        job_sla = max(job_sla, scaled)
+    return min(job_sla, PARALLEL_JOB_SLA_MAX_SEC)
 
 
 def optimize_split_part(
@@ -623,6 +637,8 @@ def compress_parallel(
     max_chunk_mb: Optional[float] = None,
     input_page_count: Optional[int] = None,
     allow_lossy: bool = False,
+    micro_probe_delta: Optional[float] = None,
+    micro_probe_success: bool = False,
 ) -> Dict:
     """
     Parallel compression strategy for large PDFs.
@@ -647,6 +663,8 @@ def compress_parallel(
         compression_mode: "lossless" (no downsampling) or "aggressive" (/screen).
         target_chunk_mb: Override target chunk size in MB (defaults to env TARGET_CHUNK_MB).
         max_chunk_mb: Override max chunk size in MB (defaults to env MAX_CHUNK_MB).
+        micro_probe_delta: Optional micro-probe delta percent from the serial probe.
+        micro_probe_success: True when the micro-probe completed successfully.
 
     Returns:
         Dict with output_path(s), sizes, reduction_percent, etc.
@@ -659,7 +677,6 @@ def compress_parallel(
     working_dir = Path(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
     start_ts = time.time()
-    sla_deadline = start_ts + PARALLEL_JOB_SLA_SEC
     worst_inflation_pct = 0.0
     strategy_outcome = {
         "mode": "aggressive" if compression_mode == "aggressive" else "lossless",
@@ -684,8 +701,27 @@ def compress_parallel(
         if progress_callback:
             progress_callback(percent, stage, message)
 
+    def _sla_remaining_sec() -> int:
+        return max(60, int(sla_deadline - time.time()))
+
+    def _scaled_fallback_timeout(base_timeout: int, scale: float = 1.0) -> int:
+        scaled = int(base_timeout * scale)
+        min_timeout = max(60, int(original_size_mb * FALLBACK_MIN_SEC_PER_MB))
+        timeout = max(scaled, min_timeout)
+        timeout = min(timeout, _sla_remaining_sec())
+        return max(60, timeout)
+
     original_size_mb = get_file_size_mb(input_path)
     original_bytes = input_path.stat().st_size
+    job_sla_sec = _resolve_parallel_sla(original_size_mb)
+    sla_deadline = start_ts + job_sla_sec
+    if job_sla_sec != PARALLEL_JOB_SLA_SEC:
+        logger.info(
+            "[PARALLEL] SLA scaled for size: base=%ss effective=%ss (%.1fMB)",
+            PARALLEL_JOB_SLA_SEC,
+            job_sla_sec,
+            original_size_mb,
+        )
 
     compression_mode = (compression_mode or "lossless").lower()
     if compression_mode not in ("lossless", "aggressive"):
@@ -996,7 +1032,17 @@ def compress_parallel(
         except Exception:
             return None
 
-    if chunk_paths and compression_mode != "lossless":
+    skip_chunk_probe = False
+    if micro_probe_success and micro_probe_delta is not None:
+        if micro_probe_delta <= -MICRO_PROBE_SKIP_REDUCTION_PCT:
+            skip_chunk_probe = True
+            logger.info(
+                "[PARALLEL_PROBE] Skipping chunk probe; micro-probe showed %.1f%% reduction",
+                abs(micro_probe_delta),
+            )
+            strategy_outcome["probe_status"] = "skipped_micro_probe"
+
+    if chunk_paths and compression_mode != "lossless" and not skip_chunk_probe:
         # Pick the smallest chunk by size for the probe to keep risk low.
         chunk_sizes = [get_file_size_mb(p) for p in chunk_paths]
         probe_idx = chunk_sizes.index(min(chunk_sizes))
@@ -1051,11 +1097,17 @@ def compress_parallel(
 
         # Early exit if probe inflates or is slow; avoid spending minutes on bad strategy.
         probe_out_mb = get_file_size_mb(probe_path) if probe_path.exists() else probe_mb
-        probe_inflated = success and probe_out_mb > probe_mb * (1 + PROBE_INFLATION_ABORT_PCT)
+        inflation_message = "Compression increased size" in (message or "")
+        probe_inflated = (
+            probe_out_mb > probe_mb * (1 + PROBE_INFLATION_ABORT_PCT)
+            or inflation_message
+        )
         probe_slow = probe_elapsed is not None and probe_elapsed > PROBE_TIME_BUDGET_SEC
         if probe_inflated:
             bailout_reason = []
-            if probe_inflated:
+            if inflation_message and probe_out_mb <= probe_mb:
+                bailout_reason.append("inflation detected by probe message")
+            else:
                 bailout_reason.append(
                     f"inflated {probe_mb:.1f}->{probe_out_mb:.1f}MB (+{(probe_out_mb/probe_mb-1)*100:.1f}%)"
                 )
@@ -1072,7 +1124,8 @@ def compress_parallel(
             ok_lossless = False
             msg_lossless = ""
             # Cap the lossless attempt to stay within the 1–5 minute SLA.
-            lossless_timeout = min(240, max(90, int(original_size_mb * 1.2)))
+            lossless_base_timeout = min(240, max(90, int(original_size_mb * 1.2)))
+            lossless_timeout = _scaled_fallback_timeout(lossless_base_timeout)
             try:
                 ok_lossless, msg_lossless = compress_pdf_lossless(
                     input_path,
@@ -1140,7 +1193,7 @@ def compress_parallel(
                 "note": "Probe showed inflation; applied lossless fallback before returning",
             }
         elif probe_slow and not probe_inflated and not success:
-            sla_pct_used = (probe_elapsed / PARALLEL_JOB_SLA_SEC * 100) if probe_elapsed else 0
+            sla_pct_used = (probe_elapsed / job_sla_sec * 100) if probe_elapsed else 0
             if sla_pct_used >= PROBE_TIMEOUT_BAILOUT_SLA_PCT:
                 # Probe used too much SLA budget on the SMALLEST chunk — file is
                 # likely incompressible within SLA. Bail to fallback chain.
@@ -1152,7 +1205,7 @@ def compress_parallel(
                     "(%.1fs / %ss); falling back to lossless + extreme",
                     sla_pct_used,
                     probe_elapsed,
-                    PARALLEL_JOB_SLA_SEC,
+                    job_sla_sec,
                 )
                 strategy_outcome["probe_status"] = "timeout_bailout"
                 strategy_outcome["timeouts"]["probe_timeout"] += 1
@@ -1169,7 +1222,8 @@ def compress_parallel(
                 merged_path.unlink(missing_ok=True)
 
                 # Try lossless with reduced timeout
-                lossless_timeout = min(120, max(60, int(original_size_mb * 0.5)))
+                lossless_base_timeout = min(120, max(60, int(original_size_mb * 0.5)))
+                lossless_timeout = _scaled_fallback_timeout(lossless_base_timeout)
                 lossless_used = False
                 try:
                     lossless_path = working_dir / f"{base_name}_lossless_bailout.pdf"
@@ -1194,7 +1248,7 @@ def compress_parallel(
                 # Try extreme fallback if lossless didn't help
                 extreme_used = False
                 if not lossless_used and allow_lossy:
-                    extreme_timeout = min(120, max(60, int(original_size_mb * 0.5)))
+                    extreme_timeout = _scaled_fallback_timeout(lossless_base_timeout)
                     extreme_path = working_dir / f"{base_name}_extreme_bailout.pdf"
                     try:
                         logger.info(
@@ -1507,7 +1561,7 @@ def compress_parallel(
     if sla_exceeded:
         logger.warning(
             "[PARALLEL] SLA %.0fs exceeded (elapsed %.1fs); minimizing post-processing",
-            PARALLEL_JOB_SLA_SEC,
+            job_sla_sec,
             time.time() - start_ts,
         )
 
@@ -1895,7 +1949,7 @@ def compress_parallel(
 
             lossless_used = False
             lossless_path = working_dir / f"{input_path.stem}_lossless_fallback.pdf"
-            lossless_timeout = max(60, int(base_timeout * timeout_scale))
+            lossless_timeout = _scaled_fallback_timeout(base_timeout, timeout_scale)
             try:
                 ok_lossless, msg_lossless = compress_pdf_lossless(
                     input_path,
@@ -1932,7 +1986,7 @@ def compress_parallel(
             ultra_used = False
             if not lossless_used and allow_lossy:
                 ultra_path = working_dir / f"{input_path.stem}_ultra_parallel.pdf"
-                ultra_timeout = max(60, int(base_timeout * timeout_scale))
+                ultra_timeout = _scaled_fallback_timeout(base_timeout, timeout_scale)
                 try:
                     logger.info(
                         "[PARALLEL] Trying ultra fallback (%.1fMB, timeout=%ss, scale=%.1f)",
@@ -1982,7 +2036,7 @@ def compress_parallel(
             extreme_used = False
             if not lossless_used and not ultra_used and allow_lossy:
                 extreme_path = working_dir / f"{input_path.stem}_extreme_parallel.pdf"
-                extreme_timeout = max(60, int(base_timeout * timeout_scale))
+                extreme_timeout = _scaled_fallback_timeout(base_timeout, timeout_scale)
                 try:
                     logger.info(
                         "[EXTREME_FALLBACK] Bloat handler: JPEGQ=%s DPI=%s/%s/%s timeout=%ss",
@@ -2086,13 +2140,13 @@ def compress_parallel(
     )
 
     # SLA breach logging
-    if total_time > PARALLEL_JOB_SLA_SEC:
+    if total_time > job_sla_sec:
         logger.error(
             "[SLA_BREACH] file=%s size_mb=%.1f pages=%s total_time=%.1fs sla=%ss "
             "split=%.1fs compress=%.1fs merge=%.1fs fallback=%.1fs "
             "chunks=%s failed=%s bloat=%s action=%s early_terminated=%s",
             input_path.name, original_size_mb, total_pages, total_time,
-            PARALLEL_JOB_SLA_SEC,
+            job_sla_sec,
             split_time, compress_time, split_total, merge_fallback_time,
             num_chunks, len(failed_chunks),
             "yes" if bloat_detected else "no",
@@ -2107,8 +2161,8 @@ def compress_parallel(
         "merge_seconds": round(split_total, 2),
         "fallback_seconds": round(merge_fallback_time, 2),
         "probe_seconds": round(probe_elapsed, 2) if probe_elapsed else 0,
-        "sla_seconds": PARALLEL_JOB_SLA_SEC,
-        "sla_breached": total_time > PARALLEL_JOB_SLA_SEC,
+        "sla_seconds": job_sla_sec,
+        "sla_breached": total_time > job_sla_sec,
     }
 
     return {
