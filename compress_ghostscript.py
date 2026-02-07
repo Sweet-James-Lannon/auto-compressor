@@ -79,7 +79,7 @@ MICRO_PROBE_SKIP_REDUCTION_PCT = 20.0
 SLA_MAX_PARALLEL_CHUNKS = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS", 8))
 SLA_MAX_PARALLEL_CHUNKS_LARGE = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS_LARGE", 12))
 HARD_MAX_PARALLEL_CHUNKS = max(2, env_int("HARD_MAX_PARALLEL_CHUNKS", 24))
-PARALLEL_SPLIT_DELIVER_CHUNKS = env_bool("PARALLEL_SPLIT_DELIVER_CHUNKS", True)
+PARALLEL_SPLIT_DELIVER_CHUNKS = env_bool("PARALLEL_SPLIT_DELIVER_CHUNKS", False)
 
 # Extreme fallback: last resort when all other compression fails.
 # JPEGQ=30 at 50 DPI will force size reduction on any image-based PDF.
@@ -1640,9 +1640,15 @@ def compress_parallel(
         except Exception:
             direct_total_mb = None
 
+    direct_delivery_allowed = PARALLEL_SPLIT_DELIVER_CHUNKS and not force_split_dedup
+    if split_enabled and PARALLEL_SPLIT_DELIVER_CHUNKS and force_split_dedup:
+        logger.info(
+            "[PARALLEL] Direct split delivery disabled due to split inflation; using merge+split"
+        )
+
     if (
         split_enabled
-        and PARALLEL_SPLIT_DELIVER_CHUNKS
+        and direct_delivery_allowed
         and (effective_split_trigger_mb is None or (direct_total_mb and direct_total_mb > effective_split_trigger_mb))
     ):
         direct_delivery = True

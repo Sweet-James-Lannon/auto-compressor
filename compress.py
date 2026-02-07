@@ -492,19 +492,125 @@ def compress_pdf(
             micro_probe_success=probe_info.get("success") if probe_info else False,
         )
 
+    def _maybe_ultra_fallback_parallel(result: Dict) -> Dict:
+        if not result or not result.get("success", True):
+            return result
+        if not ALLOW_LOSSY_COMPRESSION or original_size < ULTRA_FALLBACK_MIN_SIZE_MB:
+            return result
+
+        reduction = result.get("reduction_percent")
+        if reduction is None:
+            try:
+                compressed_mb = result.get("compressed_size_mb", original_size)
+                reduction = ((original_size - compressed_mb) / original_size) * 100 if original_size > 0 else 0.0
+            except Exception:
+                reduction = 0.0
+
+        if reduction >= ULTRA_FALLBACK_MIN_REDUCTION_PCT:
+            return result
+
+        logger.warning(
+            "[compress] Parallel low savings (%.1f%%); running ultra fallback (JPEGQ=%s, DPI=%s/%s/%s)",
+            reduction,
+            ULTRA_FALLBACK_JPEGQ,
+            ULTRA_FALLBACK_COLOR_DPI,
+            ULTRA_FALLBACK_GRAY_DPI,
+            ULTRA_FALLBACK_MONO_DPI,
+        )
+
+        ultra_path = working_dir / f"{input_path.stem}_ultra.pdf"
+        ultra_timeout = max(
+            120,
+            int(original_size * compress_ghostscript.FALLBACK_MIN_SEC_PER_MB),
+        )
+        ultra_ok, ultra_msg = compress_ghostscript.compress_ultra_fallback(
+            input_path,
+            ultra_path,
+            jpeg_quality=ULTRA_FALLBACK_JPEGQ,
+            color_res=ULTRA_FALLBACK_COLOR_DPI,
+            gray_res=ULTRA_FALLBACK_GRAY_DPI,
+            mono_res=ULTRA_FALLBACK_MONO_DPI,
+            timeout_override=ultra_timeout,
+        )
+
+        if not ultra_ok or not ultra_path.exists():
+            logger.warning("[compress] Ultra fallback failed: %s; keeping parallel output", ultra_msg)
+            ultra_path.unlink(missing_ok=True)
+            return result
+
+        ultra_size = get_file_size_mb(ultra_path)
+        if ultra_size >= original_size:
+            logger.warning(
+                "[compress] Ultra fallback inflated (%.1fMB -> %.1fMB); keeping parallel output",
+                original_size,
+                ultra_size,
+            )
+            ultra_path.unlink(missing_ok=True)
+            return result
+
+        output_paths = [ultra_path]
+        if split_requested and effective_split_trigger and ultra_size > effective_split_trigger:
+            output_paths = split_pdf.split_for_delivery(
+                ultra_path,
+                working_dir,
+                f"{input_path.stem}_ultra",
+                threshold_mb=split_threshold_mb,
+                progress_callback=progress_callback,
+                skip_optimization_under_threshold=True,
+            )
+            if len(output_paths) > 1:
+                ultra_path.unlink(missing_ok=True)
+
+        for old_path in result.get("output_paths", []):
+            try:
+                old_file = Path(old_path)
+            except TypeError:
+                continue
+            if old_file.exists() and old_file.resolve() != input_path.resolve():
+                old_file.unlink(missing_ok=True)
+
+        combined_bytes = sum(p.stat().st_size for p in output_paths)
+        combined_mb = combined_bytes / (1024 * 1024)
+        new_reduction = ((original_size - combined_mb) / original_size) * 100 if original_size > 0 else 0.0
+
+        result.update(
+            {
+                "output_path": str(output_paths[0]),
+                "output_paths": [str(p) for p in output_paths],
+                "compressed_size_mb": round(combined_mb, 2),
+                "reduction_percent": round(new_reduction, 1),
+                "compression_method": "ghostscript_ultra",
+                "compression_mode": "aggressive",
+                "quality_mode": "aggressive_72dpi",
+                "was_split": len(output_paths) > 1,
+                "total_parts": len(output_paths),
+                "part_sizes": [p.stat().st_size for p in output_paths],
+                "note": "Parallel low-savings; ultra fallback applied",
+                "split_inflation": False,
+                "split_inflation_pct": 0.0,
+                "dedupe_parts": False,
+                "merge_fallback": False,
+                "merge_fallback_time": 0.0,
+                "rebalance_attempted": False,
+                "rebalance_applied": False,
+                "parallel_chunks": 0,
+            }
+        )
+        return result
+
     if force_parallel_by_pages:
         logger.info(
             "[compress] Page count %s >= %s; using parallel compression to avoid serial timeouts",
             page_count,
             PARALLEL_PAGE_THRESHOLD,
         )
-        return _augment(run_parallel("page_count"))
+        return _augment(_maybe_ultra_fallback_parallel(run_parallel("page_count")))
     if size_parallel:
         if split_requested:
             logger.info("[compress] Large file with split requested; using parallel compression for speed")
         else:
             logger.info("[compress] Large file detected; using parallel compression for speed")
-        return _augment(run_parallel("size"))
+        return _augment(_maybe_ultra_fallback_parallel(run_parallel("size")))
     if split_requested:
         logger.info(
             "[compress] Split requested; trying serial compression first for maximum savings "
@@ -545,7 +651,7 @@ def compress_pdf(
                 parts,
                 out_mb,
             )
-            return _augment(result)
+            return _augment(_maybe_ultra_fallback_parallel(result))
         if timed_out and not split_requested:
             logger.warning(
                 "[compress] Serial compression timed out; falling back to parallel for %s",
@@ -561,7 +667,7 @@ def compress_pdf(
                 parts,
                 out_mb,
             )
-            return _augment(result)
+            return _augment(_maybe_ultra_fallback_parallel(result))
         # Map error message to specific exception type
         if timed_out:
             raise ProcessingTimeoutError.for_file(input_path.name)
