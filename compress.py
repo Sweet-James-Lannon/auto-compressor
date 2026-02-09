@@ -146,6 +146,8 @@ def compress_pdf(
     quality_mode = "aggressive_72dpi" if compression_mode == "aggressive" else "lossless"
 
     probe_result = None
+    probe_bad = False
+    probe_action = None
     PROBE_SKIP_THRESHOLD_PCT = -5.0
 
     def _augment(response: Dict) -> Dict:
@@ -156,8 +158,8 @@ def compress_pdf(
                 "page_count": page_count,
                 "bytes_per_page": bytes_per_page,
                 "probe": probe_result,
-                "probe_bad": False,
-                "probe_action": None,
+                "probe_bad": probe_bad,
+                "probe_action": probe_action,
                 "composition": {
                     "already_compressed": already_compressed,
                     "already_reason": already_reason,
@@ -243,29 +245,12 @@ def compress_pdf(
                     probe_result.get("elapsed", 0),
                 )
                 if delta >= PROBE_SKIP_THRESHOLD_PCT:
-                    logger.info(
-                        "[PROBE] Incompressible — returning original (delta %.1f%% >= %.1f%%)",
+                    probe_bad = True
+                    probe_action = "continue_parallel"
+                    logger.warning(
+                        "[PROBE] Incompressible sample (delta %.1f%% >= %.1f%%) — advisory only, continuing to parallel",
                         delta,
                         PROBE_SKIP_THRESHOLD_PCT,
-                    )
-                    return _augment(
-                        {
-                            "output_path": str(input_path),
-                            "output_paths": [str(input_path)],
-                            "original_size_mb": round(original_size, 2),
-                            "compressed_size_mb": round(original_size, 2),
-                            "reduction_percent": 0.0,
-                            "compression_method": "none",
-                            "compression_mode": compression_mode,
-                            "was_split": False,
-                            "total_parts": 1,
-                            "success": True,
-                            "note": f"Probe showed {delta:.1f}% delta — not worth compressing",
-                            "page_count": page_count,
-                            "part_sizes": [input_path.stat().st_size],
-                            "probe_bailout": True,
-                            "probe_bailout_reason": f"delta {delta:.1f}% >= {PROBE_SKIP_THRESHOLD_PCT}%",
-                        }
                     )
             else:
                 logger.warning("[PROBE] Probe failed (%s); continuing to parallel", probe_result.get("message"))

@@ -1099,7 +1099,7 @@ def build_health_snapshot() -> Dict[str, Any]:
             "allow_lossy": utils.env_bool("ALLOW_LOSSY_COMPRESSION", True),
             "pdf_precheck_enabled": utils.env_bool("PDF_PRECHECK_ENABLED", True),
             "quality_warnings_enabled": utils.env_bool("ENABLE_QUALITY_WARNINGS", True),
-            "gs_fast_web_view": utils.env_bool("GS_FAST_WEB_VIEW", True),
+            "gs_fast_web_view": utils.env_bool("GS_FAST_WEB_VIEW", False),
             "gs_band_height": utils.env_int("GS_BAND_HEIGHT", 100),
             "gs_band_buffer_space_mb": utils.env_int("GS_BAND_BUFFER_SPACE_MB", 500),
             "gs_color_downsample_type": gs_cfg.GS_COLOR_DOWNSAMPLE_TYPE,
