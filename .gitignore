@@ -67,6 +67,10 @@ db.sqlite3-journal
 uploads/*
 !uploads/.gitkeep
 
+# Local benchmark outputs
+benchmarks/*
+!benchmarks/.gitkeep
+
 # Flask stuff:
 instance/
 .webassets-cache

@@ -34,7 +34,10 @@ SAFETY_BUFFER_MB: float = max(0.0, _safety_buffer)
 ALLOW_LOSSY_COMPRESSION: bool = os.environ.get("ALLOW_LOSSY_COMPRESSION", "1").lower() in ("1", "true", "yes")
 _opt_overage = float(os.environ.get("SPLIT_OPTIMIZE_MAX_OVERAGE_MB", "1.0"))
 SPLIT_OPTIMIZE_MAX_OVERAGE_MB: float = max(0.0, _opt_overage)
-SPLIT_MINIMIZE_PARTS: bool = os.environ.get("SPLIT_MINIMIZE_PARTS", "1").lower() in ("1", "true", "yes")
+# Reliability defaults are constants to avoid requiring new env vars.
+SPLIT_MINIMIZE_PARTS: bool = False
+SPLIT_ENABLE_BINARY_FALLBACK: bool = False
+SPLIT_ADAPTIVE_MAX_ATTEMPTS: int = 3
 _ultra_jpegq = os.environ.get("SPLIT_ULTRA_JPEGQ", "50")
 try:
     SPLIT_ULTRA_JPEGQ = max(20, min(90, int(_ultra_jpegq)))
@@ -196,6 +199,96 @@ def _maybe_fast_split(
 
     logger.warning("[split_by_size] Fast split failed (%s); falling back to size-based splitter...", reason)
     return None
+
+
+def gs_split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: str) -> Optional[List[Path]]:
+    """Split PDF by page ranges using Ghostscript.
+
+    Ghostscript page-range extraction avoids resource duplication seen in
+    PyPDF2 page-copy splits on some documents.
+    """
+    gs_cmd = get_ghostscript_command()
+    if not gs_cmd:
+        return None
+
+    pdf_path = Path(pdf_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        reader = PdfReader(pdf_path, strict=False)
+        total_pages = len(reader.pages)
+    except Exception as exc:
+        logger.warning("[gs_split_by_pages] Could not read pages for %s: %s", pdf_path.name, exc)
+        return None
+
+    if total_pages == 0:
+        raise StructureError.for_file(pdf_path.name, "PDF has no pages")
+
+    num_parts = max(1, min(num_parts, total_pages))
+    pages_per_part = total_pages // num_parts
+    input_mb = get_file_size_mb(pdf_path)
+    timeout = max(60, min(600, int(max(1.0, input_mb) * 2)))
+
+    created: List[Path] = []
+    for i in range(num_parts):
+        start = i * pages_per_part + 1
+        end = total_pages if i == num_parts - 1 else (i + 1) * pages_per_part
+        unique_id = str(uuid.uuid4())[:8]
+        chunk_path = output_dir / f"{base_name}_chunk{i+1}_{unique_id}.pdf"
+
+        cmd = [
+            gs_cmd,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/default",
+            "-dNOPAUSE",
+            "-dBATCH",
+            "-dQUIET",
+            "-dPassThroughJPEGImages=true",
+            "-dPassThroughJPXImages=true",
+            "-dDownsampleColorImages=false",
+            "-dDownsampleGrayImages=false",
+            "-dDownsampleMonoImages=false",
+            f"-dFirstPage={start}",
+            f"-dLastPage={end}",
+            f"-sOutputFile={chunk_path}",
+            str(pdf_path),
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0 or not chunk_path.exists() or chunk_path.stat().st_size == 0:
+                logger.warning(
+                    "[gs_split_by_pages] Failed chunk %s/%s pages %s-%s (code=%s), falling back to PyPDF2",
+                    i + 1,
+                    num_parts,
+                    start,
+                    end,
+                    result.returncode,
+                )
+                _cleanup_paths(created)
+                chunk_path.unlink(missing_ok=True)
+                return None
+        except Exception as exc:
+            logger.warning(
+                "[gs_split_by_pages] Exception chunk %s/%s pages %s-%s: %s. Falling back to PyPDF2",
+                i + 1,
+                num_parts,
+                start,
+                end,
+                exc,
+            )
+            _cleanup_paths(created)
+            chunk_path.unlink(missing_ok=True)
+            return None
+
+        created.append(chunk_path)
+        logger.info("Created chunk %s/%s: pages %s-%s -> %s (GS)", i + 1, num_parts, start, end, chunk_path.name)
+
+    return created
+
+
 def split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: str) -> List[Path]:
     """Split PDF into N parts by page count. Fast - no Ghostscript.
 
@@ -215,6 +308,10 @@ def split_by_pages(pdf_path: Path, output_dir: Path, num_parts: int, base_name: 
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    gs_chunks = gs_split_by_pages(pdf_path, output_dir, num_parts, base_name)
+    if gs_chunks:
+        return gs_chunks
 
     reader = PdfReader(pdf_path, strict=False)
     total_pages = len(reader.pages)
@@ -393,19 +490,10 @@ def split_by_size(
 ) -> List[Path]:
     """Split PDF into parts under threshold_mb each.
 
-    Simple approach: calculate number of parts needed, split evenly by pages.
-    Does NOT retry - just creates the calculated number of parts.
-
-    Args:
-        pdf_path: Path to source PDF.
-        output_dir: Directory for output parts.
-        base_name: Base filename for parts.
-        threshold_mb: Maximum size per part.
-        skip_optimization_under_threshold: Skip Ghostscript optimization when the raw part
-            is already under the threshold.
-
-    Returns:
-        List of paths to created part files.
+    Speed-first strategy:
+    1) Try Ghostscript page-range splitting with adaptive part counts.
+    2) Fall back to fast equal-page PyPDF2 splitting with adaptive part counts.
+    3) Optionally (env) fall back to slow binary-search splitter.
     """
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
@@ -424,214 +512,109 @@ def split_by_size(
     if total_pages == 0:
         raise StructureError.for_file(pdf_path.name, "PDF has no pages")
 
-    # Calculate parts needed based on actual threshold so we don't oversplit.
-    # Always round up (e.g., 79MB with 25MB threshold -> 4 parts).
-    num_parts = max(2, math.ceil(file_size_mb / threshold_mb))
+    # Calculate initial part count and run a few adaptive attempts.
+    attempt_parts = min(total_pages, max(2, math.ceil(file_size_mb / threshold_mb)))
+    max_attempts = SPLIT_ADAPTIVE_MAX_ATTEMPTS
 
-    if num_parts > 10:
-        logger.info("[split_by_size] Expected %s parts; large file split fallback", num_parts)
-        fast_parts = _maybe_fast_split(
-            pdf_path,
-            output_dir,
-            base_name,
+    def _validate(parts: List[Path]) -> tuple[bool, float]:
+        if not parts:
+            return False, 0.0
+        max_part = 0.0
+        oversize = 0
+        for part in parts:
+            size_mb = get_file_size_mb(part)
+            max_part = max(max_part, size_mb)
+            if size_mb > threshold_mb:
+                oversize += 1
+        if oversize == 0:
+            return True, max_part
+        logger.warning(
+            "[split_by_size] %s/%s parts exceed %.1fMB (max=%.1fMB)",
+            oversize,
+            len(parts),
             threshold_mb,
-            num_parts,
-            total_pages,
-            skip_optimization_under_threshold,
-            reason="num_parts",
+            max_part,
         )
-        if fast_parts:
-            return fast_parts
-        logger.info("[split_by_size] Switching to size-based splitter...")
-        return split_pdf(
-            pdf_path,
-            output_dir,
-            base_name,
+        return False, max_part
+
+    for attempt in range(1, max_attempts + 1):
+        logger.info(
+            "[split_by_size] Adaptive attempt %s/%s with %s parts (target %.1fMB)",
+            attempt,
+            max_attempts,
+            attempt_parts,
             threshold_mb,
-            skip_optimization_under_threshold=skip_optimization_under_threshold,
         )
 
-    # Ensure at least 1 page per part
-    num_parts = min(num_parts, total_pages)
-
-    pages_per_part = total_pages // num_parts
-
-    logger.info(f"[split_by_size] Splitting {file_size_mb:.1f}MB into {num_parts} parts ({pages_per_part} pages each)")
-
-    output_paths = []
-
-    for i in range(num_parts):
-        start = i * pages_per_part
-        # Last part gets all remaining pages
-        end = total_pages if i == num_parts - 1 else (i + 1) * pages_per_part
-
-        writer = PdfWriter()
-        for page_idx in range(start, end):
-            writer.add_page(reader.pages[page_idx])
-
-        # Write to temp file first (PyPDF2 duplicates resources)
-        temp_part_path = output_dir / f"{base_name}_part{i+1}_temp.pdf"
-        with open(temp_part_path, 'wb') as f:
-            writer.write(f)
-
-        raw_size = get_file_size_mb(temp_part_path)
-        overage_mb = raw_size - threshold_mb
-
-        if overage_mb > SPLIT_OPTIMIZE_MAX_OVERAGE_MB:
-            logger.warning(
-                f"[split_by_size] Part {i+1} is {raw_size:.2f}MB (>{threshold_mb:.2f}MB by {overage_mb:.2f}MB); "
-                "skipping optimization and switching to size-based splitter..."
-            )
-            temp_part_path.unlink(missing_ok=True)
-            for p in output_paths:
-                p.unlink(missing_ok=True)
-            fast_parts = _maybe_fast_split(
-                pdf_path,
-                output_dir,
-                base_name,
-                threshold_mb,
-                num_parts,
-                total_pages,
-                skip_optimization_under_threshold,
-                reason=f"overage_part_{i+1}",
-            )
-            if fast_parts:
-                return fast_parts
-            return split_pdf(
-                pdf_path,
-                output_dir,
-                base_name,
-                threshold_mb,
-                skip_optimization_under_threshold=skip_optimization_under_threshold,
-            )
-
-        part_path = output_dir / f"{base_name}_part{i+1}.pdf"
-        if raw_size <= threshold_mb and skip_optimization_under_threshold:
-            part_path.unlink(missing_ok=True)
-            temp_part_path.rename(part_path)
-            part_size = raw_size
-            logger.info(
-                "[split_by_size] Part %s under threshold (%.2fMB); skipping optimization",
-                i + 1,
-                raw_size,
-            )
+        # Preferred path: Ghostscript page-range split.
+        gs_parts = gs_split_by_pages(pdf_path, output_dir, attempt_parts, base_name)
+        if gs_parts:
+            renamed = _rename_split_parts(gs_parts, base_name, output_dir) if len(gs_parts) > 1 else gs_parts
+            ok, max_part = _validate(renamed)
+            if ok:
+                logger.info("[split_by_size] ✓ SUCCESS via GS split (%s parts)", len(renamed))
+                return renamed
+            _cleanup_paths(renamed)
         else:
-            # Optimize with Ghostscript to deduplicate resources (critical for size reduction)
-            if raw_size <= threshold_mb:
-                logger.info(
-                    "[split_by_size] Part %s under threshold (%.2fMB); optimizing to dedupe resources",
-                    i + 1,
-                    raw_size,
-                )
-            success, opt_message = optimize_split_part(temp_part_path, part_path)
-
-            if success and part_path.exists():
-                part_size = get_file_size_mb(part_path)
-
-                # If optimization made it bigger, keep the raw part (size limit matters most).
-                if part_size > raw_size:
-                    logger.warning(
-                        f"[split_by_size] Optimization increased size for part {i+1}: "
-                        f"{raw_size:.2f}MB -> {part_size:.2f}MB. Keeping raw output."
-                    )
-                    part_path.unlink(missing_ok=True)
-                    temp_part_path.rename(part_path)
-                    part_size = raw_size
-                else:
-                    temp_part_path.unlink(missing_ok=True)
-                    reduction_pct = ((raw_size - part_size) / raw_size) * 100 if raw_size > 0 else 0
-                    reduction_mb = raw_size - part_size
-
-                    logger.info(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZED:")
-                    logger.info(f"[split_by_size]   Pages: {start+1}-{end}")
-                    logger.info(f"[split_by_size]   Before: {raw_size:.2f}MB (raw PyPDF2)")
-                    logger.info(f"[split_by_size]   After:  {part_size:.2f}MB (Ghostscript optimized)")
-                    logger.info(f"[split_by_size]   Saved:  {reduction_pct:.1f}% (-{reduction_mb:.2f}MB)")
-            else:
-                # Optimization failed - use raw PyPDF2 output (may be bloated!)
-                logger.warning(f"[split_by_size] Part {i+1}/{num_parts} OPTIMIZATION FAILED:")
-                logger.warning(f"[split_by_size]   Pages: {start+1}-{end}")
-                logger.warning(f"[split_by_size]   Error: {opt_message}")
-                logger.warning(f"[split_by_size]   Using raw PyPDF2 output: {raw_size:.2f}MB")
-                logger.warning(f"[split_by_size]   ⚠️  This part may contain duplicated resources!")
-
+            # Fast fallback: equal-page PyPDF2 split (no optimization).
+            pages_per_part = max(1, total_pages // attempt_parts)
+            output_paths: List[Path] = []
+            for i in range(attempt_parts):
+                start = i * pages_per_part
+                end = total_pages if i == attempt_parts - 1 else min(total_pages, (i + 1) * pages_per_part)
+                if start >= end:
+                    break
+                writer = PdfWriter()
+                for page_idx in range(start, end):
+                    writer.add_page(reader.pages[page_idx])
+                part_path = output_dir / f"{base_name}_part{i+1}.pdf"
                 part_path.unlink(missing_ok=True)
-                temp_part_path.rename(part_path)
-                part_size = raw_size
+                with open(part_path, "wb") as handle:
+                    writer.write(handle)
+                output_paths.append(part_path)
 
-        output_paths.append(part_path)
+            ok, max_part = _validate(output_paths)
+            if ok and output_paths:
+                logger.info("[split_by_size] ✓ SUCCESS via fast PyPDF2 split (%s parts)", len(output_paths))
+                return output_paths
+            _cleanup_paths(output_paths)
 
-        status = "OK" if part_size <= threshold_mb else "OVER"
-        logger.info(f"[split_by_size] Part {i+1} final: {part_size:.1f}MB [{status}]")
+        # Increase part count aggressively to avoid many retry rounds.
+        ratio = max(1.05, max_part / max(0.1, threshold_mb))
+        proposed = max(attempt_parts + 1, int(math.ceil(attempt_parts * ratio * 1.15)))
+        proposed = min(total_pages, proposed)
+        if proposed <= attempt_parts:
+            break
+        logger.info("[split_by_size] Increasing part count: %s -> %s", attempt_parts, proposed)
+        attempt_parts = proposed
 
-        # Early exit: equal-page splitting won't work for this PDF. Switch immediately to the
-        # size-based splitter to avoid wasting time generating the remaining parts.
-        if part_size > threshold_mb:
-            logger.warning(
-                f"[split_by_size] Part {i+1} exceeds {threshold_mb}MB; switching to size-based splitter..."
-            )
-            for p in output_paths:
-                p.unlink(missing_ok=True)
-            fast_parts = _maybe_fast_split(
-                pdf_path,
-                output_dir,
-                base_name,
-                threshold_mb,
-                num_parts,
-                total_pages,
-                skip_optimization_under_threshold,
-                reason=f"oversize_part_{i+1}",
-            )
-            if fast_parts:
-                return fast_parts
-            return split_pdf(
-                pdf_path,
-                output_dir,
-                base_name,
-                threshold_mb,
-                skip_optimization_under_threshold=skip_optimization_under_threshold,
-            )
+    # Best-effort quick split before any slow fallback decision.
+    if attempt_parts >= 2:
+        logger.warning("[split_by_size] Strict threshold not met; returning best-effort %s-part split", attempt_parts)
+        gs_parts = gs_split_by_pages(pdf_path, output_dir, attempt_parts, base_name)
+        if gs_parts:
+            return _rename_split_parts(gs_parts, base_name, output_dir) if len(gs_parts) > 1 else gs_parts
 
-    # CRITICAL: Verify ALL parts are under threshold with detailed logging
-    oversize_parts = []
-    verified_count = 0
+        pages_per_part = max(1, total_pages // attempt_parts)
+        best_effort_parts: List[Path] = []
+        for i in range(attempt_parts):
+            start = i * pages_per_part
+            end = total_pages if i == attempt_parts - 1 else min(total_pages, (i + 1) * pages_per_part)
+            if start >= end:
+                break
+            writer = PdfWriter()
+            for page_idx in range(start, end):
+                writer.add_page(reader.pages[page_idx])
+            part_path = output_dir / f"{base_name}_part{i+1}.pdf"
+            part_path.unlink(missing_ok=True)
+            with open(part_path, "wb") as handle:
+                writer.write(handle)
+            best_effort_parts.append(part_path)
+        if best_effort_parts:
+            return best_effort_parts
 
-    for i, p in enumerate(output_paths):
-        part_size_mb = get_file_size_mb(p)
-        part_size_bytes = p.stat().st_size
-
-        if part_size_mb > threshold_mb:
-            oversize_parts.append((i + 1, p.name, part_size_mb))
-            logger.error(f"[split_by_size] ❌ Part {i+1} EXCEEDS THRESHOLD:")
-            logger.error(f"[split_by_size]    File: {p.name}")
-            logger.error(f"[split_by_size]    Size: {part_size_mb:.2f}MB ({part_size_bytes:,} bytes)")
-            logger.error(f"[split_by_size]    Limit: {threshold_mb}MB")
-        else:
-            verified_count += 1
-            logger.info(f"[split_by_size] ✓ Part {i+1} OK: {p.name} = {part_size_mb:.2f}MB")
-
-    if oversize_parts:
-        logger.warning(f"[split_by_size] {len(oversize_parts)}/{len(output_paths)} parts exceeded {threshold_mb}MB")
-        logger.warning(f"[split_by_size] Cleaning up and retrying with size-based splitter...")
-
-        # Clean up ALL parts before retrying
-        for p in output_paths:
-            p.unlink(missing_ok=True)
-
-        fast_parts = _maybe_fast_split(
-            pdf_path,
-            output_dir,
-            base_name,
-            threshold_mb,
-            num_parts,
-            total_pages,
-            skip_optimization_under_threshold,
-            reason="oversize_final",
-        )
-        if fast_parts:
-            return fast_parts
-
-        # Fallback to size-based splitter
+    if SPLIT_ENABLE_BINARY_FALLBACK:
+        logger.warning("[split_by_size] Adaptive split exhausted; using slow binary fallback")
         return split_pdf(
             pdf_path,
             output_dir,
@@ -640,8 +623,11 @@ def split_by_size(
             skip_optimization_under_threshold=skip_optimization_under_threshold,
         )
 
-    logger.info(f"[split_by_size] ✓ SUCCESS: All {verified_count} parts verified under {threshold_mb}MB")
-    return output_paths
+    logger.warning(
+        "[split_by_size] Adaptive split exhausted after %s attempts; returning unsplit file to preserve responsiveness",
+        max_attempts,
+    )
+    return [pdf_path]
 
 
 # =============================================================================
@@ -658,6 +644,44 @@ def split_for_delivery(
     skip_optimization_under_threshold: bool = False,
 ) -> List[Path]:
     """Split with optional ultra compression to minimize part count when close to a lower split."""
+    source_path = Path(pdf_path)
+    source_bytes = source_path.stat().st_size
+
+    def _finalize(candidate_parts: List[Path]) -> List[Path]:
+        if len(candidate_parts) <= 1:
+            return candidate_parts
+
+        total_bytes = 0
+        valid_parts: List[Path] = []
+        for part in candidate_parts:
+            part_path = Path(part)
+            if not part_path.exists():
+                continue
+            valid_parts.append(part_path)
+            total_bytes += part_path.stat().st_size
+
+        if not valid_parts:
+            return [source_path]
+
+        allowed_overhead = max(256 * 1024, int(source_bytes * 0.01))
+        max_allowed = source_bytes + allowed_overhead
+        if total_bytes > max_allowed:
+            logger.warning(
+                "[split_for_delivery] Split output is larger than allowed overhead (%s -> %s bytes, cap=%s); returning original",
+                source_bytes,
+                total_bytes,
+                max_allowed,
+            )
+            for part in valid_parts:
+                try:
+                    if part.resolve() != source_path.resolve():
+                        part.unlink(missing_ok=True)
+                except OSError:
+                    continue
+            return [source_path]
+
+        return valid_parts
+
     if prefer_binary:
         parts = split_pdf(
             pdf_path,
@@ -677,7 +701,7 @@ def split_for_delivery(
         )
 
     if not SPLIT_MINIMIZE_PARTS or not ALLOW_LOSSY_COMPRESSION:
-        return parts
+        return _finalize(parts)
 
     file_size_mb = get_file_size_mb(pdf_path)
     min_parts = max(1, math.ceil(file_size_mb / threshold_mb))
@@ -689,7 +713,7 @@ def split_for_delivery(
     )
 
     if not should_try_ultra:
-        return parts
+        return _finalize(parts)
 
     if progress_callback:
         progress_callback(90, "splitting", "Trying extra compression to reduce part count...")
@@ -699,7 +723,7 @@ def split_for_delivery(
     if not ok or not ultra_path.exists():
         logger.warning("[split_for_delivery] Ultra compression skipped: %s", msg)
         ultra_path.unlink(missing_ok=True)
-        return parts
+        return _finalize(parts)
 
     ultra_base = f"{base_name}_ultra"
     ultra_parts = split_by_size(
@@ -720,8 +744,8 @@ def split_for_delivery(
         if len(ultra_parts) > 1:
             renamed = _rename_split_parts(ultra_parts, base_name, output_dir)
             ultra_path.unlink(missing_ok=True)
-            return renamed
-        return ultra_parts
+            return _finalize(renamed)
+        return _finalize(ultra_parts)
 
     logger.info(
         "[split_for_delivery] Ultra did not reduce part count (%s parts); keeping original split",
@@ -729,7 +753,7 @@ def split_for_delivery(
     )
     _cleanup_paths(ultra_parts)
     ultra_path.unlink(missing_ok=True)
-    return parts
+    return _finalize(parts)
 
 
 # =============================================================================

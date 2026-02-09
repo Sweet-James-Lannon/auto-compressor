@@ -10,7 +10,9 @@ import queue
 import threading
 import time
 import uuid
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 # Import download_pdf from utils to avoid duplication
@@ -19,6 +21,7 @@ from utils import download_pdf  # noqa: F401 - re-exported for backwards compati
 # Constants
 JOB_TTL_SECONDS: int = 3600  # Jobs expire after 1 hour
 MAX_QUEUE_SIZE: int = int(os.environ.get("MAX_QUEUE_SIZE", "50"))  # Prevent unbounded growth
+JOB_STATE_FILE = os.environ.get("JOB_STATE_FILE", "").strip()
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,88 @@ _workers_started = False
 _worker_count = 0
 
 
+def _job_to_dict(job: Job) -> Dict[str, Any]:
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "created_at": job.created_at,
+        "result": job.result,
+        "error": job.error,
+        "progress": job.progress,
+    }
+
+
+def _job_from_dict(payload: Dict[str, Any]) -> Optional[Job]:
+    try:
+        job_id = str(payload["job_id"])
+        status = str(payload["status"])
+        created_at = float(payload.get("created_at", time.time()))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    return Job(
+        job_id=job_id,
+        status=status,
+        created_at=created_at,
+        result=payload.get("result"),
+        error=payload.get("error"),
+        progress=payload.get("progress"),
+    )
+
+
+def _persist_jobs() -> None:
+    if not JOB_STATE_FILE:
+        return
+
+    state_path = Path(JOB_STATE_FILE)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = state_path.with_suffix(".tmp")
+
+    with _job_lock:
+        payload = [_job_to_dict(job) for job in _jobs.values()]
+
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        tmp_path.replace(state_path)
+    except Exception as exc:
+        logger.warning("Failed to persist job state: %s", exc)
+        tmp_path.unlink(missing_ok=True)
+
+
+def _load_jobs() -> None:
+    if not JOB_STATE_FILE:
+        return
+
+    state_path = Path(JOB_STATE_FILE)
+    if not state_path.exists():
+        return
+
+    try:
+        with open(state_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        logger.warning("Failed to load job state: %s", exc)
+        return
+
+    if not isinstance(payload, list):
+        return
+
+    restored = 0
+    with _job_lock:
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            job = _job_from_dict(item)
+            if job is None:
+                continue
+            _jobs[job.job_id] = job
+            restored += 1
+
+    if restored:
+        logger.info("Restored %s job(s) from durable state", restored)
+
+
 def create_job() -> str:
     """Create a new job and return its ID.
 
@@ -63,6 +148,7 @@ def create_job() -> str:
 
     with _job_lock:
         _jobs[job_id] = job
+    _persist_jobs()
 
     logger.info(f"[{job_id}] Job created")
     return job_id
@@ -104,6 +190,7 @@ def update_job(
             _jobs[job_id].error = error
             if progress is not None:
                 _jobs[job_id].progress = progress
+    _persist_jobs()
 
     if progress:
         logger.debug(f"[{job_id}] Progress: {progress.get('percent', 0)}% - {progress.get('stage', 'unknown')}")
@@ -216,6 +303,8 @@ def _cleanup_expired_jobs() -> None:
             expired = [jid for jid, job in _jobs.items() if job.created_at < cutoff]
             for jid in expired:
                 del _jobs[jid]
+        if expired:
+            _persist_jobs()
 
         if expired:
             logger.info(f"Cleaned up {len(expired)} expired jobs")
@@ -241,3 +330,6 @@ def start_workers(num_workers: int = 8) -> None:
     _worker_count = num_workers
     logger.info(f"Started {num_workers} compression workers and cleanup thread")
     _workers_started = True
+
+
+_load_jobs()

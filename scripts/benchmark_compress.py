@@ -9,7 +9,7 @@ import json
 import platform
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,7 +29,7 @@ BAR_WIDTH = 28
 
 
 def _now_stamp() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _human_mb(value: float) -> str:
@@ -184,7 +184,7 @@ def main() -> int:
         print(_divider())
         print(f"[{label}] FILE: {_safe_relpath(input_path)} ({_human_mb(input_mb)})")
         print(f"        SPLIT: {args.split_threshold_mb or 'off'}  TRIGGER: {args.split_trigger_mb or 'off'}")
-        print(f"        START: {datetime.utcnow().strftime('%H:%M:%S UTC')}")
+        print(f"        START: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
 
         progress = ProgressPrinter(label, quiet=args.quiet)
         start_wall = time.perf_counter()

@@ -15,6 +15,18 @@ from PyPDF2.errors import PdfReadError
 
 logger = logging.getLogger(__name__)
 
+CHUNK_TIME_TARGET_SEC = int(os.environ.get("CHUNK_TIME_TARGET_SEC", "90"))
+PROFILE_ASSUMED_WORKERS = int(os.environ.get("PROFILE_ASSUMED_WORKERS", "4"))
+PROFILE_MIN_PAGES_PER_CHUNK = 50
+PROFILE_MAX_PAGES_PER_CHUNK = 400
+PROFILE_BASE_SLA_SEC = int(os.environ.get("PARALLEL_JOB_SLA_SEC", "300"))
+PROFILE_MAX_SLA_SEC = int(os.environ.get("PARALLEL_JOB_SLA_MAX_SEC", "1800"))
+CODEC_PROFILES = {
+    "fast": {"base_spp": 0.10, "codecs": {"DCTDecode", "FlateDecode", "None"}},
+    "medium": {"base_spp": 0.25, "codecs": {"CCITTFaxDecode"}},
+    "slow": {"base_spp": 0.50, "codecs": {"JBIG2Decode", "JPXDecode"}},
+}
+
 
 def analyze_pdf(pdf_path: Path) -> Dict[str, Any]:
     """Analyze a PDF file and return detailed information.
@@ -136,6 +148,77 @@ def detect_already_compressed(pdf_path: Path) -> Tuple[bool, str]:
             return True, f"Low bytes/page ratio ({bytes_per_page/1024:.1f}KB/page)"
 
     return False, ""
+
+
+def estimate_processing_profile(
+    fingerprint: Dict[str, Any],
+    file_size_mb: float,
+) -> Dict[str, Any]:
+    """Estimate processing cost and safe chunk/SLA settings for compression."""
+    image_filters = fingerprint.get("image_filters") or {}
+    if not isinstance(image_filters, dict):
+        image_filters = {}
+
+    codec_counts: Dict[str, int] = {}
+    for codec, count in image_filters.items():
+        try:
+            codec_counts[str(codec)] = int(count)
+        except (TypeError, ValueError):
+            codec_counts[str(codec)] = 0
+
+    dominant_codec = "None"
+    if codec_counts:
+        dominant_codec = max(codec_counts, key=lambda name: codec_counts[name])
+
+    tier = "fast"
+    if any(codec_counts.get(codec, 0) > 0 for codec in CODEC_PROFILES["slow"]["codecs"]):
+        tier = "slow"
+    elif any(codec_counts.get(codec, 0) > 0 for codec in CODEC_PROFILES["medium"]["codecs"]):
+        tier = "medium"
+
+    base_spp = float(CODEC_PROFILES[tier]["base_spp"])
+    avg_image_dpi = fingerprint.get("avg_image_dpi")
+    try:
+        dpi_value = float(avg_image_dpi) if avg_image_dpi is not None else 150.0
+    except (TypeError, ValueError):
+        dpi_value = 150.0
+    dpi_factor = max(1.0, dpi_value / 150.0)
+    sec_per_page = round(base_spp * dpi_factor, 3)
+
+    try:
+        page_count = int(fingerprint.get("page_count") or 0)
+    except (TypeError, ValueError):
+        page_count = 0
+
+    safe_target = max(30, CHUNK_TIME_TARGET_SEC)
+    pages_per_chunk = int(safe_target / max(sec_per_page, 0.01))
+    max_pages_per_chunk = max(
+        PROFILE_MIN_PAGES_PER_CHUNK,
+        min(PROFILE_MAX_PAGES_PER_CHUNK, pages_per_chunk),
+    )
+    if page_count > 0:
+        max_pages_per_chunk = max(1, min(max_pages_per_chunk, page_count))
+
+    chunk_timeout_sec = max(60, int(max_pages_per_chunk * sec_per_page * 2.5))
+
+    if page_count > 0:
+        workers = max(1, PROFILE_ASSUMED_WORKERS)
+        expected = (page_count * sec_per_page / workers) * 1.5 * 1.2
+        recommended_sla_sec = max(PROFILE_BASE_SLA_SEC, int(expected))
+    else:
+        size_scaled = int(max(1.0, file_size_mb) * 2.5)
+        recommended_sla_sec = max(PROFILE_BASE_SLA_SEC, size_scaled)
+
+    recommended_sla_sec = min(recommended_sla_sec, PROFILE_MAX_SLA_SEC)
+
+    return {
+        "tier": tier,
+        "sec_per_page": sec_per_page,
+        "max_pages_per_chunk": int(max_pages_per_chunk),
+        "chunk_timeout_sec": int(chunk_timeout_sec),
+        "recommended_sla_sec": int(recommended_sla_sec),
+        "dominant_codec": dominant_codec,
+    }
 
 
 def fingerprint_pdf(pdf_path: Path, max_pages: int = 5) -> Dict[str, Any]:
