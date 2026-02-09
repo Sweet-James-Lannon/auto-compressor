@@ -45,6 +45,12 @@ _work_queue: queue.Queue = queue.Queue()
 _processor: Optional[Callable] = None
 _workers_started = False
 _worker_count = 0
+_inflight_by_key: Dict[str, str] = {}
+_job_key: Dict[str, str] = {}
+
+
+def _is_inflight_status(status: str) -> bool:
+    return status in {"queued", "processing"}
 
 
 def _job_to_dict(job: Job) -> Dict[str, Any]:
@@ -135,23 +141,47 @@ def create_job() -> str:
     Returns:
         The unique job ID (16 characters for sufficient entropy).
     """
-    job_id = str(uuid.uuid4()).replace('-', '')[:16]
-    job = Job(
-        job_id=job_id,
-        status="queued",
-        progress={
-            "percent": 0,
-            "stage": "queued",
-            "message": "Waiting for worker",
-        },
-    )
-
-    with _job_lock:
-        _jobs[job_id] = job
-    _persist_jobs()
-
-    logger.info(f"[{job_id}] Job created")
+    job_id, _ = create_or_reuse_job()
     return job_id
+
+
+def create_or_reuse_job(dedupe_key: Optional[str] = None) -> tuple[str, bool]:
+    """Create a new job or reuse an in-flight job when dedupe_key matches.
+
+    Args:
+        dedupe_key: Optional stable key identifying equivalent work.
+
+    Returns:
+        Tuple of (job_id, reused_existing).
+    """
+    with _job_lock:
+        if dedupe_key:
+            existing_job_id = _inflight_by_key.get(dedupe_key)
+            if existing_job_id:
+                existing_job = _jobs.get(existing_job_id)
+                if existing_job and _is_inflight_status(existing_job.status):
+                    logger.info("[%s] Reusing in-flight job via dedupe key", existing_job_id)
+                    return existing_job_id, True
+                _inflight_by_key.pop(dedupe_key, None)
+
+        job_id = str(uuid.uuid4()).replace('-', '')[:16]
+        job = Job(
+            job_id=job_id,
+            status="queued",
+            progress={
+                "percent": 0,
+                "stage": "queued",
+                "message": "Waiting for worker",
+            },
+        )
+        _jobs[job_id] = job
+        if dedupe_key:
+            _inflight_by_key[dedupe_key] = job_id
+            _job_key[job_id] = dedupe_key
+
+    _persist_jobs()
+    logger.info(f"[{job_id}] Job created")
+    return job_id, False
 
 
 def get_job(job_id: str) -> Optional[Job]:
@@ -190,6 +220,12 @@ def update_job(
             _jobs[job_id].error = error
             if progress is not None:
                 _jobs[job_id].progress = progress
+            if not _is_inflight_status(status):
+                key = _job_key.pop(job_id, None)
+                if key:
+                    current = _inflight_by_key.get(key)
+                    if current == job_id:
+                        _inflight_by_key.pop(key, None)
     _persist_jobs()
 
     if progress:
@@ -241,6 +277,7 @@ def get_stats() -> Dict[str, Any]:
         "failed": status_counts.get("failed", 0),
         "workers_started": _workers_started,
         "worker_count": _worker_count,
+        "inflight_dedupe_keys": len(_inflight_by_key),
     }
 
 
@@ -302,6 +339,9 @@ def _cleanup_expired_jobs() -> None:
         with _job_lock:
             expired = [jid for jid, job in _jobs.items() if job.created_at < cutoff]
             for jid in expired:
+                key = _job_key.pop(jid, None)
+                if key and _inflight_by_key.get(key) == jid:
+                    _inflight_by_key.pop(key, None)
                 del _jobs[jid]
         if expired:
             _persist_jobs()

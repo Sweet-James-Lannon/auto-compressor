@@ -28,10 +28,12 @@ LARGE_FILE_MAX_CHUNK_MB = float(os.environ.get("LARGE_FILE_MAX_CHUNK_MB", "75"))
 LARGE_FILE_MAX_PARALLEL_CHUNKS = int(os.environ.get("LARGE_FILE_MAX_PARALLEL_CHUNKS", "12"))
 
 PARALLEL_SPLIT_INFLATION_PCT = 0.02
+DELIVERY_SPLIT_SKIP_INFLATION_PCT = max(0.0, env_float("DELIVERY_SPLIT_SKIP_INFLATION_PCT", 0.70))
 
 SLA_MAX_PARALLEL_CHUNKS = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS", 8))
 SLA_MAX_PARALLEL_CHUNKS_LARGE = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS_LARGE", 12))
 HARD_MAX_PARALLEL_CHUNKS = max(2, env_int("HARD_MAX_PARALLEL_CHUNKS", 96))
+HIGH_PAGE_COUNT_TIMEOUT_THRESHOLD = max(1000, env_int("HIGH_PAGE_COUNT_TIMEOUT_THRESHOLD", 3000))
 
 GS_FAST_WEB_VIEW = env_bool("GS_FAST_WEB_VIEW", False)
 GS_COLOR_DOWNSAMPLE_TYPE = env_choice(
@@ -108,6 +110,32 @@ def _resolve_parallel_sla(file_mb: float, processing_profile: Optional[Dict[str,
         raw = PARALLEL_JOB_SLA_SEC
 
     return min(max(PARALLEL_JOB_SLA_SEC, raw), PARALLEL_JOB_SLA_MAX_SEC)
+
+
+def _plan_parallel_chunks(
+    original_size_mb: float,
+    total_pages: Optional[int],
+    target_chunk_mb: float,
+    max_pages_per_chunk: int,
+    hard_parallel_chunks: int,
+) -> Tuple[int, int, int, int]:
+    """Plan chunk count while preventing page-driven fanout explosions."""
+    num_chunks_by_size = max(1, math.ceil(original_size_mb / max(target_chunk_mb, MIN_CHUNK_MB)))
+    num_chunks_by_pages = 1
+    if total_pages:
+        num_chunks_by_pages = max(1, math.ceil(total_pages / max(1, max_pages_per_chunk)))
+
+    sla_chunk_cap = (
+        SLA_MAX_PARALLEL_CHUNKS_LARGE
+        if original_size_mb >= PARALLEL_JOB_SLA_LARGE_MIN_MB
+        else SLA_MAX_PARALLEL_CHUNKS
+    )
+    page_chunk_cap = max(sla_chunk_cap, num_chunks_by_size * 2)
+    capped_chunks_by_pages = min(num_chunks_by_pages, page_chunk_cap)
+
+    requested_chunks = max(num_chunks_by_size, capped_chunks_by_pages)
+    final_chunks = max(2, min(requested_chunks, hard_parallel_chunks))
+    return final_chunks, num_chunks_by_size, num_chunks_by_pages, page_chunk_cap
 
 
 def optimize_split_part(
@@ -375,10 +403,10 @@ def compress_ultra_aggressive(
 def compress_ultra_fallback(
     input_path: Path,
     output_path: Path,
-    jpeg_quality: int = 55,
-    color_res: int = 120,
-    gray_res: int = 150,
-    mono_res: int = 300,
+    jpeg_quality: int = 30,
+    color_res: int = 50,
+    gray_res: int = 50,
+    mono_res: int = 150,
     num_threads: Optional[int] = None,
     timeout_override: Optional[int] = None,
 ) -> Tuple[bool, str]:
@@ -481,12 +509,22 @@ def compress_parallel(
     if total_pages:
         max_pages_per_chunk = max(1, min(max_pages_per_chunk, total_pages))
 
-    num_chunks_by_size = max(1, math.ceil(original_size_mb / effective_target_chunk))
-    num_chunks_by_pages = 1
-    if total_pages:
-        num_chunks_by_pages = max(1, math.ceil(total_pages / max_pages_per_chunk))
+    num_chunks, num_chunks_by_size, num_chunks_by_pages, page_chunk_cap = _plan_parallel_chunks(
+        original_size_mb=original_size_mb,
+        total_pages=total_pages,
+        target_chunk_mb=effective_target_chunk,
+        max_pages_per_chunk=max_pages_per_chunk,
+        hard_parallel_chunks=hard_parallel_chunks,
+    )
+    if num_chunks_by_pages > page_chunk_cap:
+        logger.info(
+            "[PARALLEL] Capping page-driven chunks from %s to %s (size_based=%s)",
+            num_chunks_by_pages,
+            page_chunk_cap,
+            num_chunks_by_size,
+        )
 
-    requested_chunks = max(num_chunks_by_size, num_chunks_by_pages)
+    requested_chunks = max(num_chunks_by_size, min(num_chunks_by_pages, page_chunk_cap))
     if requested_chunks > soft_parallel_chunks:
         logger.info(
             "[PARALLEL] Raising chunk count beyond MAX_PARALLEL_CHUNKS=%s to satisfy page budget (requested=%s, hard_cap=%s)",
@@ -494,7 +532,10 @@ def compress_parallel(
             requested_chunks,
             hard_parallel_chunks,
         )
-    num_chunks = max(2, min(requested_chunks, hard_parallel_chunks))
+
+    effective_pages_per_chunk = max_pages_per_chunk
+    if total_pages:
+        effective_pages_per_chunk = max(1, math.ceil(total_pages / num_chunks))
 
     job_sla_sec = _resolve_parallel_sla(original_size_mb, processing_profile=processing_profile)
     sla_deadline = start_ts + job_sla_sec
@@ -506,7 +547,7 @@ def compress_parallel(
         compression_mode,
         profile_tier,
         profile_spp,
-        max_pages_per_chunk,
+        effective_pages_per_chunk,
         max_workers,
         effective_target_chunk,
         effective_max_chunk,
@@ -533,6 +574,9 @@ def compress_parallel(
     )
 
     compress_fn = compress_pdf_lossless if compression_mode == "lossless" else compress_pdf_with_ghostscript
+    large_timeout_mode = original_size_mb >= LARGE_FILE_TUNE_MIN_MB or (
+        bool(total_pages) and int(total_pages) >= HIGH_PAGE_COUNT_TIMEOUT_THRESHOLD
+    )
 
     worker_count = max(1, min(max_workers, len(chunk_paths)))
     threads_per_worker = DEFAULT_GS_THREADS_PER_WORKER
@@ -553,12 +597,15 @@ def compress_parallel(
     def compress_single_chunk(idx: int, chunk_path: Path) -> Tuple[int, Path, bool]:
         chunk_mb = get_file_size_mb(chunk_path)
         chunk_pages = _read_pages(chunk_path)
-        timeout = profile_chunk_timeout or _chunk_timeout_seconds(
+        adaptive_timeout = _chunk_timeout_seconds(
             chunk_mb,
-            large_file=(original_size_mb >= LARGE_FILE_TUNE_MIN_MB),
+            large_file=large_timeout_mode,
             page_count=chunk_pages,
             sec_per_page=profile_spp,
         )
+        timeout = adaptive_timeout
+        if profile_chunk_timeout > 0:
+            timeout = max(profile_chunk_timeout, min(adaptive_timeout, profile_chunk_timeout * 2))
 
         out_path = working_dir / f"{chunk_path.stem}_{uuid.uuid4().hex[:8]}_compressed.pdf"
         ok, msg = compress_fn(
@@ -632,6 +679,7 @@ def compress_parallel(
     final_parts: List[Path] = [merged_path]
     bloat_detected = False
     bloat_action: Optional[str] = None
+    delivery_split_skipped = False
 
     combined_mb = merged_path.stat().st_size / (1024 * 1024)
 
@@ -654,17 +702,26 @@ def compress_parallel(
             final_parts = [merged_path]
             bloat_action = "return_original"
     elif split_enabled and effective_trigger is not None and combined_mb > effective_trigger:
-        report_progress(80, "splitting", "Splitting compressed output...")
-        final_parts = split_for_delivery(
-            merged_path,
-            working_dir,
-            f"{base_name}_merged",
-            split_threshold_mb,
-            progress_callback=progress_callback,
-            skip_optimization_under_threshold=True,
-        )
-        if len(final_parts) > 1:
-            merged_path.unlink(missing_ok=True)
+        split_inflation_pct = split_inflation_ratio - 1.0
+        if split_inflation_pct >= DELIVERY_SPLIT_SKIP_INFLATION_PCT:
+            delivery_split_skipped = True
+            logger.warning(
+                "[PARALLEL] Skipping compressed-output split: initial split inflation %.1f%% exceeds %.1f%% threshold",
+                split_inflation_pct * 100,
+                DELIVERY_SPLIT_SKIP_INFLATION_PCT * 100,
+            )
+        else:
+            report_progress(80, "splitting", "Splitting compressed output...")
+            final_parts = split_for_delivery(
+                merged_path,
+                working_dir,
+                f"{base_name}_merged",
+                split_threshold_mb,
+                progress_callback=progress_callback,
+                skip_optimization_under_threshold=True,
+            )
+            if len(final_parts) > 1:
+                merged_path.unlink(missing_ok=True)
 
     final_set = {part.resolve() for part in final_parts}
     for path in chunk_paths:
@@ -745,6 +802,7 @@ def compress_parallel(
         "bloat_detected": bloat_detected,
         "bloat_pct": bloat_pct,
         "bloat_action": bloat_action,
+        "delivery_split_skipped": delivery_split_skipped,
         "sla_exceeded": sla_exceeded,
         "early_terminated": False,
         "probe_bailout": False,

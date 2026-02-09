@@ -2,6 +2,7 @@
 
 import base64
 import contextlib
+import hashlib
 import logging
 import math
 import os
@@ -20,7 +21,11 @@ from flask import Flask, jsonify, request, render_template, send_file, has_reque
 from werkzeug.exceptions import RequestEntityTooLarge, HTTPException, NotFound
 from werkzeug.utils import secure_filename
 
-from compress import compress_pdf, PARALLEL_THRESHOLD_MB, DEFAULT_PARALLEL_MAX_WORKERS
+from compress import (
+    compress_pdf,
+    PARALLEL_THRESHOLD_MB,
+    resolve_parallel_compute_plan,
+)
 from compress_ghostscript import get_ghostscript_command
 from pdf_diagnostics import diagnose_for_job, get_quality_warnings, fingerprint_pdf
 from exceptions import (
@@ -98,17 +103,16 @@ API_TOKEN = os.environ.get('API_TOKEN')
 # Public base URL for download links (e.g., https://yourapp.azurewebsites.net)
 BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
 _EFFECTIVE_CPU = utils.get_effective_cpu_count()
-_DEFAULT_ASYNC_WORKERS = max(1, min(3, _EFFECTIVE_CPU // 2))
-try:
-    ASYNC_WORKERS = max(1, int(os.environ.get("ASYNC_WORKERS", str(_DEFAULT_ASYNC_WORKERS))))
-except ValueError:
-    ASYNC_WORKERS = _DEFAULT_ASYNC_WORKERS
+ASYNC_WORKERS = int(resolve_parallel_compute_plan(_EFFECTIVE_CPU)["async_workers"])
 MAX_ACTIVE_COMPRESSIONS = max(1, min(ASYNC_WORKERS, _EFFECTIVE_CPU))
 SMALL_JOB_THRESHOLD_MB = 20.0
 SMALL_JOB_RESERVED_SLOTS = 1 if MAX_ACTIVE_COMPRESSIONS > 1 else 0
 GENERAL_COMPRESSION_SLOTS = max(1, MAX_ACTIVE_COMPRESSIONS - SMALL_JOB_RESERVED_SLOTS)
 COMPRESSION_SEMAPHORE = threading.Semaphore(GENERAL_COMPRESSION_SLOTS)
 SMALL_JOB_SEMAPHORE = threading.Semaphore(SMALL_JOB_RESERVED_SLOTS) if SMALL_JOB_RESERVED_SLOTS else None
+DEDUPE_INFLIGHT_ENABLED = utils.env_bool("DEDUPE_INFLIGHT_ENABLED", True)
+DEDUPE_URL_ENABLED = utils.env_bool("DEDUPE_URL_ENABLED", True)
+DEDUPE_MIN_MB = max(PARALLEL_THRESHOLD_MB, utils.env_float("DEDUPE_MIN_MB", PARALLEL_THRESHOLD_MB))
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -188,17 +192,22 @@ def _log_effective_config() -> None:
     async_value = ASYNC_WORKERS
     async_display = f"{async_value} (env:{async_raw})" if async_raw else f"{async_value} (auto)"
 
-    parallel_raw = os.environ.get("PARALLEL_MAX_WORKERS")
-    parallel_display = parallel_raw or str(DEFAULT_PARALLEL_MAX_WORKERS)
-
-    gs_threads_raw = os.environ.get("GS_NUM_RENDERING_THREADS")
-    gs_threads_display = gs_threads_raw or str(gs_cfg.DEFAULT_GS_THREADS_PER_WORKER)
+    plan = resolve_parallel_compute_plan(_EFFECTIVE_CPU)
+    parallel_display = (
+        f"{plan['effective_parallel_workers']} "
+        f"(configured:{plan['configured_parallel_workers']})"
+    )
+    gs_threads_display = str(plan["gs_threads_per_worker"])
 
     rows_concurrency = [
         ("ASYNC_WORKERS", async_display),
         ("MAX_ACTIVE_COMPRESSIONS", str(MAX_ACTIVE_COMPRESSIONS)),
         ("PARALLEL_MAX_WORKERS", parallel_display),
         ("GS_NUM_RENDERING_THREADS", gs_threads_display),
+        ("PARALLEL_TOTAL_BUDGET", str(plan["total_parallel_budget"])),
+        ("PARALLEL_PER_JOB_BUDGET", str(plan["per_job_parallel_budget"])),
+        ("PARALLEL_BUDGET_ENFORCE", _format_env_value("PARALLEL_BUDGET_ENFORCE", plan["parallel_budget_enforce"])),
+        ("PARALLEL_CAPPED_BY_BUDGET", "yes" if plan["capped_by_budget"] else "no"),
     ]
 
     rows_chunking = [
@@ -401,8 +410,12 @@ def _log_job_snapshot(
     if split_trigger_mb is not None:
         trigger_label = f"{split_trigger_mb:.1f}MB (effective)"
 
-    parallel_workers = os.environ.get("PARALLEL_MAX_WORKERS") or str(DEFAULT_PARALLEL_MAX_WORKERS)
-    gs_threads = os.environ.get("GS_NUM_RENDERING_THREADS") or str(gs_cfg.DEFAULT_GS_THREADS_PER_WORKER)
+    plan = resolve_parallel_compute_plan(_EFFECTIVE_CPU)
+    parallel_workers = (
+        f"{plan['effective_parallel_workers']} "
+        f"(configured:{plan['configured_parallel_workers']})"
+    )
+    gs_threads = str(plan["gs_threads_per_worker"])
 
     rows_job = [
         ("JOB_ID", job_id),
@@ -423,8 +436,12 @@ def _log_job_snapshot(
     ]
 
     rows_parallel = [
-        ("PARALLEL_MAX_WORKERS", _format_env_value("PARALLEL_MAX_WORKERS", parallel_workers)),
-        ("GS_NUM_RENDERING_THREADS", _format_env_value("GS_NUM_RENDERING_THREADS", gs_threads)),
+        ("PARALLEL_MAX_WORKERS", parallel_workers),
+        ("GS_NUM_RENDERING_THREADS", gs_threads),
+        ("PARALLEL_TOTAL_BUDGET", str(plan["total_parallel_budget"])),
+        ("PARALLEL_PER_JOB_BUDGET", str(plan["per_job_parallel_budget"])),
+        ("PARALLEL_BUDGET_ENFORCE", "yes" if plan["parallel_budget_enforce"] else "no"),
+        ("PARALLEL_CAPPED_BY_BUDGET", "yes" if plan["capped_by_budget"] else "no"),
         ("TARGET_CHUNK_MB", _format_env_value("TARGET_CHUNK_MB", f"{gs_cfg.TARGET_CHUNK_MB:.1f}MB")),
         ("MAX_CHUNK_MB", _format_env_value("MAX_CHUNK_MB", f"{gs_cfg.MAX_CHUNK_MB:.1f}MB")),
         ("MAX_PARALLEL_CHUNKS", _format_env_value("MAX_PARALLEL_CHUNKS", gs_cfg.MAX_PARALLEL_CHUNKS)),
@@ -946,6 +963,63 @@ def _resolve_split_threshold_mb(raw_value: Any) -> float | None:
     return min(50.0, max(5.0, value))
 
 
+def _normalize_url_for_dedupe(raw_url: str) -> str:
+    value = (raw_url or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path}"
+    except Exception:
+        pass
+    return value
+
+
+def _build_inflight_dedupe_key(task_data: Dict[str, Any]) -> str | None:
+    """Build a stable key for deduping equivalent in-flight compression jobs."""
+    if not DEDUPE_INFLIGHT_ENABLED:
+        return None
+
+    split_threshold = _resolve_split_threshold_mb(task_data.get("split_threshold_mb") or task_data.get("splitSizeMB"))
+    split_label = f"{split_threshold:.1f}" if split_threshold is not None else "off"
+    pages_label = str(task_data.get("pages") or "").strip()
+    password = str(task_data.get("password") or "")
+    password_sig = hashlib.sha256(password.encode("utf-8")).hexdigest()[:12] if password else "none"
+    matter_label = str(task_data.get("matter_id") or "").strip()
+    callback_url = str(task_data.get("callback_url") or task_data.get("callbackUrl") or "").strip()
+    callback_sig = hashlib.sha256(callback_url.encode("utf-8")).hexdigest()[:12] if callback_url else "none"
+    mode = (os.environ.get("COMPRESSION_MODE", "aggressive") or "aggressive").strip().lower()
+
+    source_sig: str | None = None
+    pdf_bytes = task_data.get("pdf_bytes")
+    if isinstance(pdf_bytes, (bytes, bytearray)):
+        size_mb = len(pdf_bytes) / (1024 * 1024)
+        if size_mb < DEDUPE_MIN_MB:
+            return None
+        source_sig = f"bytes:{hashlib.sha256(bytes(pdf_bytes)).hexdigest()}"
+    elif isinstance(task_data.get("download_url"), str):
+        if not DEDUPE_URL_ENABLED:
+            return None
+        normalized = _normalize_url_for_dedupe(task_data["download_url"])
+        if normalized:
+            source_sig = f"url:{normalized}"
+
+    if not source_sig:
+        return None
+
+    return "|".join([
+        "v1",
+        source_sig,
+        f"mode:{mode}",
+        f"split:{split_label}",
+        f"pages:{pages_label}",
+        f"password:{password_sig}",
+        f"matter:{matter_label}",
+        f"callback:{callback_sig}",
+    ])
+
+
 def _extract_display_names(download_links: list[str]) -> list[str]:
     names = []
     for link in download_links:
@@ -1065,6 +1139,7 @@ def build_health_snapshot() -> Dict[str, Any]:
 
     queue_stats = job_queue.get_stats()
     effective_cpu = utils.get_effective_cpu_count()
+    compute_plan = resolve_parallel_compute_plan(effective_cpu)
     recent_jobs = []
     try:
         recent_limit = utils.env_int("DASHBOARD_RECENT_JOBS", 8)
@@ -1117,14 +1192,20 @@ def build_health_snapshot() -> Dict[str, Any]:
         },
         "parallel": {
             "threshold_mb": PARALLEL_THRESHOLD_MB,
-            "parallel_max_workers": os.environ.get("PARALLEL_MAX_WORKERS", str(DEFAULT_PARALLEL_MAX_WORKERS)),
-            "async_workers": ASYNC_WORKERS,
+            "configured_parallel_workers": compute_plan["configured_parallel_workers"],
+            "effective_parallel_workers": compute_plan["effective_parallel_workers"],
+            "parallel_max_workers": compute_plan["configured_parallel_workers"],  # Backward compatibility
+            "async_workers": compute_plan["async_workers"],
             "max_active_compressions": MAX_ACTIVE_COMPRESSIONS,
+            "total_parallel_budget": compute_plan["total_parallel_budget"],
+            "per_job_parallel_budget": compute_plan["per_job_parallel_budget"],
+            "parallel_budget_enforce": compute_plan["parallel_budget_enforce"],
+            "capped_by_budget": compute_plan["capped_by_budget"],
             "max_parallel_chunks": utils.env_int("MAX_PARALLEL_CHUNKS", 64),
             "target_chunk_mb": utils.env_float("TARGET_CHUNK_MB", 30.0),
             "max_chunk_mb": utils.env_float("MAX_CHUNK_MB", 50.0),
             "max_pages_per_chunk": utils.env_int("MAX_PAGES_PER_CHUNK", 600),
-            "gs_num_rendering_threads": os.environ.get("GS_NUM_RENDERING_THREADS", "1"),
+            "gs_num_rendering_threads": compute_plan["gs_threads_per_worker"],
         },
     }
 
@@ -1827,8 +1908,21 @@ def compress_async():
         if base_url_hint:
             task_data["base_url"] = base_url_hint
 
-    # Create job and enqueue for processing
-    job_id = job_queue.create_job()
+    # Create job (or reuse equivalent in-flight job) and enqueue for processing
+    dedupe_key = _build_inflight_dedupe_key(task_data)
+    job_id, reused_job = job_queue.create_or_reuse_job(dedupe_key=dedupe_key)
+    if reused_job:
+        logger.info("[%s] Reused in-flight job for duplicate request", job_id)
+        response = {
+            "success": True,
+            "job_id": job_id,
+            "status_url": f"/status/{job_id}",
+            "deduped": True,
+        }
+        if matter_id:
+            response["matterId"] = matter_id
+            response["message"] = "Attached to existing in-flight job"
+        return jsonify(response), 202
 
     # Pre-download URL-based PDFs immediately to prevent presigned URL expiration
     # while the job waits in queue. Falls back to worker-download on failure.
@@ -1862,6 +1956,10 @@ def compress_async():
         job_queue.enqueue(job_id, task_data)
     except Exception as e:
         logger.warning(f"[{job_id}] Queue full or enqueue failed: {e}")
+        job_queue.update_job(job_id, "failed", error=str(e), result={
+            "error_type": "ServerBusy",
+            "error_message": "Server is busy. Please retry shortly.",
+        })
         return jsonify({
             "success": False,
             "error": "Server is busy. Please retry shortly.",
