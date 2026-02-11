@@ -23,7 +23,8 @@ from pdf_diagnostics import (
     estimate_processing_profile,
     fingerprint_pdf,
 )
-from utils import env_bool, env_float, env_int, get_effective_cpu_count, get_file_size_mb
+from settings import resolve_parallel_compute_plan as resolve_parallel_compute_plan_settings
+from utils import env_bool, env_float, get_effective_cpu_count, get_file_size_mb
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,6 @@ PARALLEL_THRESHOLD_MB = SERIAL_THRESHOLD_MB
 MIN_COMPRESSION_SIZE_MB = env_float("MIN_COMPRESSION_SIZE_MB", 1.0)
 DEFAULT_TARGET_CHUNK_MB = env_float("TARGET_CHUNK_MB", 30.0)
 DEFAULT_MAX_CHUNK_MB = env_float("MAX_CHUNK_MB", 50.0)
-DEFAULT_PARALLEL_MAX_WORKERS = 8
-PARALLEL_BUDGET_ENFORCE = env_bool("PARALLEL_BUDGET_ENFORCE", True)
 
 COMPRESSION_MODE = os.environ.get("COMPRESSION_MODE", "aggressive").strip().lower()
 ALLOW_LOSSY_COMPRESSION = env_bool("ALLOW_LOSSY_COMPRESSION", True)
@@ -47,65 +46,9 @@ def _resolve_parallel_workers(effective_cpu: Optional[int] = None) -> Tuple[int,
     return int(plan["effective_parallel_workers"]), int(env_workers) if isinstance(env_workers, int) else None
 
 
-def _auto_async_workers(effective_cpu: int) -> int:
-    return max(1, min(3, effective_cpu // 2))
-
-
-def _parse_positive_int(raw: Optional[str]) -> Optional[int]:
-    if raw is None:
-        return None
-    try:
-        value = int(str(raw))
-    except (TypeError, ValueError):
-        return None
-    if value <= 0:
-        return None
-    return value
-
-
 def resolve_parallel_compute_plan(effective_cpu: Optional[int] = None) -> Dict[str, Any]:
-    """Build a CPU-safe parallel compute plan shared by runtime and diagnostics."""
-    if effective_cpu is None:
-        effective_cpu = get_effective_cpu_count()
-    effective_cpu = max(1, int(effective_cpu))
-
-    env_parallel_raw = os.environ.get("PARALLEL_MAX_WORKERS")
-    env_parallel_workers = _parse_positive_int(env_parallel_raw)
-    if env_parallel_raw is not None and env_parallel_workers is None:
-        logger.warning("[compress] Invalid PARALLEL_MAX_WORKERS=%s; using auto/default", env_parallel_raw)
-
-    env_async_raw = os.environ.get("ASYNC_WORKERS")
-    env_async_workers = _parse_positive_int(env_async_raw)
-    if env_async_raw is not None and env_async_workers is None:
-        logger.warning("[compress] Invalid ASYNC_WORKERS=%s; using auto", env_async_raw)
-
-    async_workers = min(effective_cpu, env_async_workers or _auto_async_workers(effective_cpu))
-    gs_threads = max(1, env_int("GS_NUM_RENDERING_THREADS", compress_ghostscript.DEFAULT_GS_THREADS_PER_WORKER))
-
-    configured_parallel_workers = (
-        env_parallel_workers
-        if env_parallel_workers is not None
-        else min(effective_cpu, DEFAULT_PARALLEL_MAX_WORKERS)
-    )
-    total_parallel_budget = max(1, effective_cpu // gs_threads)
-    per_job_parallel_budget = max(1, total_parallel_budget // max(1, async_workers))
-
-    effective_parallel_workers = min(configured_parallel_workers, total_parallel_budget)
-    if PARALLEL_BUDGET_ENFORCE:
-        effective_parallel_workers = min(effective_parallel_workers, per_job_parallel_budget)
-
-    return {
-        "effective_cpu": effective_cpu,
-        "async_workers": async_workers,
-        "gs_threads_per_worker": gs_threads,
-        "env_parallel_workers": env_parallel_workers,
-        "configured_parallel_workers": configured_parallel_workers,
-        "total_parallel_budget": total_parallel_budget,
-        "per_job_parallel_budget": per_job_parallel_budget,
-        "parallel_budget_enforce": PARALLEL_BUDGET_ENFORCE,
-        "effective_parallel_workers": max(1, effective_parallel_workers),
-        "capped_by_budget": effective_parallel_workers < configured_parallel_workers,
-    }
+    """Compatibility wrapper around centralized settings planner."""
+    return resolve_parallel_compute_plan_settings(effective_cpu=effective_cpu)
 
 
 def resolve_compression_mode() -> str:
@@ -279,7 +222,6 @@ def compress_pdf(
             target_chunk_mb=DEFAULT_TARGET_CHUNK_MB,
             max_chunk_mb=DEFAULT_MAX_CHUNK_MB,
             input_page_count=page_count,
-            allow_lossy=ALLOW_LOSSY_COMPRESSION,
             processing_profile=processing_profile,
         )
 

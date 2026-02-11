@@ -278,6 +278,11 @@ def _is_safe_url(url: str) -> bool:
         raise DownloadError.invalid_url(str(url)) from e
 
 
+def validate_external_url(url: str) -> None:
+    """Validate URL safety for outbound HTTP requests (download/callback)."""
+    _is_safe_url(url)
+
+
 def download_pdf(url: str, output_path: Path, max_download_size_bytes: int = MAX_DOWNLOAD_SIZE) -> None:
     """Download a PDF from a URL.
 
@@ -292,7 +297,7 @@ def download_pdf(url: str, output_path: Path, max_download_size_bytes: int = MAX
         DownloadError: If download fails, URL is blocked, or file is too large.
     """
     # Security: Validate URL to prevent SSRF
-    _is_safe_url(url)
+    validate_external_url(url)
 
     logger.info("Downloading PDF from %s...", redact_url_for_log(url, max_len=120))
 
@@ -314,7 +319,7 @@ def download_pdf(url: str, output_path: Path, max_download_size_bytes: int = MAX
             if not redirect_target:
                 raise DownloadError.invalid_url(url)
             redirect_url = urljoin(url, redirect_target)
-            _is_safe_url(redirect_url)  # Re-validate redirect destination
+            validate_external_url(redirect_url)  # Re-validate redirect destination
             logger.info("[URL_REDIRECT] Following redirect to %s", redact_url_for_log(redirect_url))
             try:
                 response.close()

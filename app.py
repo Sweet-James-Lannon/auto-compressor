@@ -13,7 +13,7 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import quote, urlparse, parse_qs, parse_qsl, urlencode
 
 import requests
 
@@ -24,7 +24,6 @@ from werkzeug.utils import secure_filename
 from compress import (
     compress_pdf,
     PARALLEL_THRESHOLD_MB,
-    resolve_parallel_compute_plan,
 )
 from compress_ghostscript import get_ghostscript_command
 from pdf_diagnostics import diagnose_for_job, get_quality_warnings, fingerprint_pdf
@@ -38,6 +37,7 @@ from exceptions import (
     ProcessingTimeoutError,
 )
 import job_queue
+from settings import resolve_parallel_compute_plan
 import utils
 from utils import MAX_DOWNLOAD_SIZE
 
@@ -195,7 +195,7 @@ def _log_effective_config() -> None:
     plan = resolve_parallel_compute_plan(_EFFECTIVE_CPU)
     parallel_display = (
         f"{plan['effective_parallel_workers']} "
-        f"(configured:{plan['configured_parallel_workers']})"
+        f"(requested:{plan['requested_parallel_workers']})"
     )
     gs_threads_display = str(plan["gs_threads_per_worker"])
 
@@ -208,6 +208,7 @@ def _log_effective_config() -> None:
         ("PARALLEL_PER_JOB_BUDGET", str(plan["per_job_parallel_budget"])),
         ("PARALLEL_BUDGET_ENFORCE", _format_env_value("PARALLEL_BUDGET_ENFORCE", plan["parallel_budget_enforce"])),
         ("PARALLEL_CAPPED_BY_BUDGET", "yes" if plan["capped_by_budget"] else "no"),
+        ("PARALLEL_CAP_REASONS", ",".join(plan.get("capped_reasons", [])) or "none"),
     ]
 
     rows_chunking = [
@@ -223,7 +224,9 @@ def _log_effective_config() -> None:
     rows_split = [
         ("SPLIT_THRESHOLD_MB", _format_env_value("SPLIT_THRESHOLD_MB", SPLIT_THRESHOLD_MB)),
         ("SPLIT_TRIGGER_MB", _format_env_value("SPLIT_TRIGGER_MB", SPLIT_TRIGGER_MB)),
-        ("SPLIT_MINIMIZE_PARTS", _format_const_value(split_cfg.SPLIT_MINIMIZE_PARTS)),
+        ("SPLIT_MINIMIZE_PARTS", _format_env_value("SPLIT_MINIMIZE_PARTS", split_cfg.SPLIT_MINIMIZE_PARTS)),
+        ("SPLIT_ENABLE_BINARY_FALLBACK", _format_env_value("SPLIT_ENABLE_BINARY_FALLBACK", split_cfg.SPLIT_ENABLE_BINARY_FALLBACK)),
+        ("SPLIT_ADAPTIVE_MAX_ATTEMPTS", _format_env_value("SPLIT_ADAPTIVE_MAX_ATTEMPTS", split_cfg.SPLIT_ADAPTIVE_MAX_ATTEMPTS)),
         ("MERGE_TIMEOUT_SEC", _format_env_value("MERGE_TIMEOUT_SEC", split_cfg.MERGE_TIMEOUT_SEC)),
         ("MERGE_FALLBACK_TIMEOUT_SEC", _format_env_value("MERGE_FALLBACK_TIMEOUT_SEC", split_cfg.MERGE_FALLBACK_TIMEOUT_SEC)),
     ]
@@ -413,7 +416,7 @@ def _log_job_snapshot(
     plan = resolve_parallel_compute_plan(_EFFECTIVE_CPU)
     parallel_workers = (
         f"{plan['effective_parallel_workers']} "
-        f"(configured:{plan['configured_parallel_workers']})"
+        f"(requested:{plan['requested_parallel_workers']})"
     )
     gs_threads = str(plan["gs_threads_per_worker"])
 
@@ -442,6 +445,7 @@ def _log_job_snapshot(
         ("PARALLEL_PER_JOB_BUDGET", str(plan["per_job_parallel_budget"])),
         ("PARALLEL_BUDGET_ENFORCE", "yes" if plan["parallel_budget_enforce"] else "no"),
         ("PARALLEL_CAPPED_BY_BUDGET", "yes" if plan["capped_by_budget"] else "no"),
+        ("PARALLEL_CAP_REASONS", ",".join(plan.get("capped_reasons", [])) or "none"),
         ("TARGET_CHUNK_MB", _format_env_value("TARGET_CHUNK_MB", f"{gs_cfg.TARGET_CHUNK_MB:.1f}MB")),
         ("MAX_CHUNK_MB", _format_env_value("MAX_CHUNK_MB", f"{gs_cfg.MAX_CHUNK_MB:.1f}MB")),
         ("MAX_PARALLEL_CHUNKS", _format_env_value("MAX_PARALLEL_CHUNKS", gs_cfg.MAX_PARALLEL_CHUNKS)),
@@ -783,6 +787,11 @@ def _log_output_page_counts(
 def send_salesforce_callback(callback_url: str, payload: dict, job_id: str, max_retries: int = 3, timeout: int = 5) -> bool:
     """Send callback to Salesforce with basic retry/backoff. Runs in a worker thread."""
     headers = {"Content-Type": "application/json"}
+    try:
+        utils.validate_external_url(callback_url)
+    except DownloadError as exc:
+        logger.error("[%s] Callback URL blocked: %s", job_id, exc)
+        return False
 
     for attempt in range(max_retries):
         try:
@@ -970,7 +979,20 @@ def _normalize_url_for_dedupe(raw_url: str) -> str:
     try:
         parsed = urlparse(value)
         if parsed.scheme and parsed.netloc:
-            return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path}"
+            scheme = parsed.scheme.lower()
+            host = (parsed.hostname or "").lower()
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            netloc = f"{host}:{parsed.port}" if parsed.port else host
+            base = f"{scheme}://{netloc}{parsed.path or '/'}"
+
+            query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            if not query_pairs:
+                return base
+
+            canonical_query = urlencode(sorted(query_pairs), doseq=True)
+            query_sig = hashlib.sha256(canonical_query.encode("utf-8")).hexdigest()[:16]
+            return f"{base}?qsig={query_sig}"
     except Exception:
         pass
     return value
@@ -1009,7 +1031,7 @@ def _build_inflight_dedupe_key(task_data: Dict[str, Any]) -> str | None:
         return None
 
     return "|".join([
-        "v1",
+        "v2",
         source_sig,
         f"mode:{mode}",
         f"split:{split_label}",
@@ -1189,9 +1211,12 @@ def build_health_snapshot() -> Dict[str, Any]:
             "base_threshold_mb": BASE_SPLIT_THRESHOLD_MB,
             "safety_buffer_mb": utils.env_float("SPLIT_SAFETY_BUFFER_MB", 0.0),
             "minimize_parts": split_cfg.SPLIT_MINIMIZE_PARTS,
+            "enable_binary_fallback": split_cfg.SPLIT_ENABLE_BINARY_FALLBACK,
+            "adaptive_max_attempts": split_cfg.SPLIT_ADAPTIVE_MAX_ATTEMPTS,
         },
         "parallel": {
             "threshold_mb": PARALLEL_THRESHOLD_MB,
+            "requested_parallel_workers": compute_plan["requested_parallel_workers"],
             "configured_parallel_workers": compute_plan["configured_parallel_workers"],
             "effective_parallel_workers": compute_plan["effective_parallel_workers"],
             "parallel_max_workers": compute_plan["configured_parallel_workers"],  # Backward compatibility
@@ -1201,6 +1226,8 @@ def build_health_snapshot() -> Dict[str, Any]:
             "per_job_parallel_budget": compute_plan["per_job_parallel_budget"],
             "parallel_budget_enforce": compute_plan["parallel_budget_enforce"],
             "capped_by_budget": compute_plan["capped_by_budget"],
+            "capped_reasons": compute_plan.get("capped_reasons", []),
+            "cap_chain": compute_plan.get("cap_chain", {}),
             "max_parallel_chunks": utils.env_int("MAX_PARALLEL_CHUNKS", 64),
             "target_chunk_mb": utils.env_float("TARGET_CHUNK_MB", 30.0),
             "max_chunk_mb": utils.env_float("MAX_CHUNK_MB", 50.0),
@@ -1903,6 +1930,14 @@ def compress_async():
             return _request_error("SALESFORCE_CALLBACK_URL not configured", status=500, error_type="ConfigError")
 
     if callback_url:
+        try:
+            utils.validate_external_url(callback_url)
+        except DownloadError as exc:
+            return _request_error(
+                f"Invalid callback URL: {exc}",
+                status=400,
+                error_type="InvalidCallbackURL",
+            )
         task_data["callback_url"] = callback_url
         base_url_hint = (BASE_URL or request.url_root.rstrip('/')).rstrip('/')
         if base_url_hint:

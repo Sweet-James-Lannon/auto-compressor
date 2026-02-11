@@ -6,10 +6,10 @@ the size threshold into smaller parts for delivery constraints.
 
 import logging
 import math
+import multiprocessing
 import os
 import shutil
 import subprocess
-import threading
 import uuid
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -24,6 +24,7 @@ from compress_ghostscript import (
     get_ghostscript_command,
 )
 from exceptions import EncryptionError, StructureError, SplitError
+from settings import get_split_runtime_settings
 from utils import get_file_size_mb, env_int
 
 # Constants - Size threshold defaults
@@ -34,23 +35,18 @@ SAFETY_BUFFER_MB: float = max(0.0, _safety_buffer)
 ALLOW_LOSSY_COMPRESSION: bool = os.environ.get("ALLOW_LOSSY_COMPRESSION", "1").lower() in ("1", "true", "yes")
 _opt_overage = float(os.environ.get("SPLIT_OPTIMIZE_MAX_OVERAGE_MB", "1.0"))
 SPLIT_OPTIMIZE_MAX_OVERAGE_MB: float = max(0.0, _opt_overage)
-# Reliability defaults are constants to avoid requiring new env vars.
-SPLIT_MINIMIZE_PARTS: bool = False
-SPLIT_ENABLE_BINARY_FALLBACK: bool = False
-SPLIT_ADAPTIVE_MAX_ATTEMPTS: int = 3
-_ultra_jpegq = os.environ.get("SPLIT_ULTRA_JPEGQ", "50")
-try:
-    SPLIT_ULTRA_JPEGQ = max(20, min(90, int(_ultra_jpegq)))
-except ValueError:
-    SPLIT_ULTRA_JPEGQ = 50
+_split_settings = get_split_runtime_settings()
+SPLIT_MINIMIZE_PARTS: bool = _split_settings.split_minimize_parts
+SPLIT_ENABLE_BINARY_FALLBACK: bool = _split_settings.split_enable_binary_fallback
+SPLIT_ADAPTIVE_MAX_ATTEMPTS: int = _split_settings.split_adaptive_max_attempts
+SPLIT_ULTRA_JPEGQ: int = _split_settings.split_ultra_jpegq
 MERGE_TIMEOUT_SEC = env_int("MERGE_TIMEOUT_SEC", 120)
 MERGE_FALLBACK_TIMEOUT_SEC = env_int("MERGE_FALLBACK_TIMEOUT_SEC", 120)
 MERGE_TIMEOUT_SEC_PER_MB = 0.8
 MERGE_TIMEOUT_MAX_SEC = 600
 MERGE_FALLBACK_TIMEOUT_MAX_SEC = 600
 MERGE_BLOAT_ABORT_PCT = 0.02
-_ultra_gap = float(os.environ.get("SPLIT_ULTRA_GAP_PCT", "0.12"))
-SPLIT_ULTRA_GAP_PCT: float = max(0.0, min(0.5, _ultra_gap))
+SPLIT_ULTRA_GAP_PCT: float = _split_settings.split_ultra_gap_pct
 FAST_SPLIT_ENABLED = True
 FAST_SPLIT_MIN_MB = 120.0
 FAST_SPLIT_MIN_PAGES = 2000
@@ -67,6 +63,18 @@ logger = logging.getLogger(__name__)
 def _cleanup_paths(paths: List[Path]) -> None:
     for path in paths:
         path.unlink(missing_ok=True)
+
+
+def _merge_with_pypdf2_worker(paths: List[str], out_path: str, result_queue) -> None:
+    try:
+        merger = PdfMerger()
+        for path in paths:
+            merger.append(path)
+        merger.write(out_path)
+        merger.close()
+        result_queue.put({"ok": True})
+    except Exception as exc:
+        result_queue.put({"ok": False, "error": str(exc)})
 
 
 def _rename_split_parts(parts: List[Path], base_name: str, output_dir: Path) -> List[Path]:
@@ -383,26 +391,44 @@ def merge_pdfs(pdf_paths: List[Path], output_path: Path) -> None:
     )
 
     def _merge_with_pypdf2(paths: List[Path], out: Path, timeout_sec: int) -> None:
-        """Run PyPDF2 merge with a timeout to avoid hangs on huge files."""
-        errors = []
+        """Run PyPDF2 merge in a killable subprocess with strict timeout cleanup."""
+        ctx = multiprocessing.get_context("spawn")
+        result_queue = ctx.Queue(maxsize=1)
+        proc = ctx.Process(
+            target=_merge_with_pypdf2_worker,
+            args=([str(p) for p in paths], str(out), result_queue),
+            daemon=True,
+        )
+        proc.start()
+        proc.join(timeout_sec)
 
-        def _run():
-            try:
-                merger = PdfMerger()
-                for path in paths:
-                    merger.append(str(path))
-                merger.write(str(out))
-                merger.close()
-            except Exception as exc:
-                errors.append(exc)
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        t.join(timeout_sec)
-        if t.is_alive():
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(1)
+            out.unlink(missing_ok=True)
             raise TimeoutError(f"PyPDF2 merge timed out after {timeout_sec}s")
-        if errors:
-            raise errors[0]
+
+        status = None
+        try:
+            status = result_queue.get_nowait()
+        except Exception:
+            status = None
+
+        if proc.exitcode not in (0, None):
+            out.unlink(missing_ok=True)
+            raise RuntimeError(f"PyPDF2 merge process exited with code {proc.exitcode}")
+
+        if not status or not status.get("ok"):
+            out.unlink(missing_ok=True)
+            detail = status.get("error") if isinstance(status, dict) else "unknown merge failure"
+            raise RuntimeError(f"PyPDF2 merge failed: {detail}")
+
+        if not out.exists() or out.stat().st_size == 0:
+            out.unlink(missing_ok=True)
+            raise RuntimeError("PyPDF2 merge produced no output")
 
     gs_cmd = get_ghostscript_command()
     if not gs_cmd:
@@ -646,39 +672,146 @@ def split_for_delivery(
     """Split with optional ultra compression to minimize part count when close to a lower split."""
     source_path = Path(pdf_path)
     source_bytes = source_path.stat().st_size
+    split_required = source_bytes > int(max(0.1, threshold_mb) * 1024 * 1024)
+
+    def _collect_valid_parts(candidate_parts: List[Path]) -> tuple[List[Path], int, float]:
+        valid_parts: List[Path] = []
+        total_bytes = 0
+        max_part_mb = 0.0
+        for part in candidate_parts:
+            part_path = Path(part)
+            if not part_path.exists():
+                continue
+            size_bytes = part_path.stat().st_size
+            size_mb = size_bytes / (1024 * 1024)
+            valid_parts.append(part_path)
+            total_bytes += size_bytes
+            max_part_mb = max(max_part_mb, size_mb)
+        return valid_parts, total_bytes, max_part_mb
+
+    def _cleanup_non_source(parts: List[Path]) -> None:
+        for part in parts:
+            try:
+                if part.resolve() != source_path.resolve():
+                    part.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def _tighten_parts(parts: List[Path], reason: str, force_all: bool = False) -> None:
+        if not parts:
+            return
+
+        for idx, part in enumerate(parts, start=1):
+            part_path = Path(part)
+            if not part_path.exists():
+                continue
+
+            current_mb = get_file_size_mb(part_path)
+            if not force_all and current_mb <= threshold_mb:
+                continue
+            if force_all and current_mb < max(1.0, threshold_mb * 0.4):
+                continue
+
+            def try_replace(label: str, fn, tag: str) -> None:
+                nonlocal current_mb
+                candidate = output_dir / f"{part_path.stem}_{tag}_{uuid.uuid4().hex[:6]}.pdf"
+                candidate.unlink(missing_ok=True)
+                ok, msg = fn(part_path, candidate)
+                if not ok or not candidate.exists():
+                    candidate.unlink(missing_ok=True)
+                    logger.debug(
+                        "[split_for_delivery] %s failed for part %s (%s): %s",
+                        label,
+                        idx,
+                        reason,
+                        msg,
+                    )
+                    return
+
+                new_mb = get_file_size_mb(candidate)
+                if new_mb + 0.01 < current_mb:
+                    part_path.unlink(missing_ok=True)
+                    candidate.rename(part_path)
+                    logger.info(
+                        "[split_for_delivery] %s improved part %s (%s): %.1fMB -> %.1fMB",
+                        label,
+                        idx,
+                        reason,
+                        current_mb,
+                        new_mb,
+                    )
+                    current_mb = new_mb
+                else:
+                    candidate.unlink(missing_ok=True)
+
+            try_replace("Lossless optimize", optimize_split_part, "opt")
+
+            if ALLOW_LOSSY_COMPRESSION and (current_mb > threshold_mb or force_all):
+                try_replace("Aggressive recompress", compress_pdf_with_ghostscript, "tight")
+
+                def ultra_fn(inp: Path, out: Path):
+                    return compress_ultra_aggressive(inp, out, jpeg_quality=SPLIT_ULTRA_JPEGQ)
+
+                try_replace("Ultra recompress", ultra_fn, "ultra")
 
     def _finalize(candidate_parts: List[Path]) -> List[Path]:
         if len(candidate_parts) <= 1:
             return candidate_parts
 
-        total_bytes = 0
-        valid_parts: List[Path] = []
-        for part in candidate_parts:
-            part_path = Path(part)
-            if not part_path.exists():
-                continue
-            valid_parts.append(part_path)
-            total_bytes += part_path.stat().st_size
-
+        valid_parts, total_bytes, max_part_mb = _collect_valid_parts(candidate_parts)
         if not valid_parts:
             return [source_path]
+
+        if split_required and max_part_mb > threshold_mb:
+            logger.warning(
+                "[split_for_delivery] Parts exceed threshold %.1fMB (max=%.1fMB); tightening parts",
+                threshold_mb,
+                max_part_mb,
+            )
+            _tighten_parts(valid_parts, reason="threshold", force_all=False)
+            valid_parts, total_bytes, max_part_mb = _collect_valid_parts(valid_parts)
+
+        if split_required and max_part_mb > threshold_mb:
+            logger.warning(
+                "[split_for_delivery] Still above threshold after tightening (max=%.1fMB); forcing binary split",
+                max_part_mb,
+            )
+            _cleanup_non_source(valid_parts)
+            strict_parts = split_pdf(
+                source_path,
+                output_dir,
+                base_name,
+                threshold_mb=threshold_mb,
+                progress_callback=progress_callback,
+                skip_optimization_under_threshold=skip_optimization_under_threshold,
+            )
+            valid_parts, total_bytes, max_part_mb = _collect_valid_parts(strict_parts)
+            if not valid_parts:
+                return [source_path]
+
+            if split_required and max_part_mb > threshold_mb:
+                logger.warning(
+                    "[split_for_delivery] Threshold cannot be fully met after binary split (max=%.1fMB); returning best effort parts",
+                    max_part_mb,
+                )
 
         allowed_overhead = max(256 * 1024, int(source_bytes * 0.01))
         max_allowed = source_bytes + allowed_overhead
         if total_bytes > max_allowed:
             logger.warning(
-                "[split_for_delivery] Split output is larger than allowed overhead (%s -> %s bytes, cap=%s); returning original",
+                "[split_for_delivery] Split output exceeds overhead cap (%s -> %s bytes, cap=%s); tightening parts for smaller delivery",
                 source_bytes,
                 total_bytes,
                 max_allowed,
             )
-            for part in valid_parts:
-                try:
-                    if part.resolve() != source_path.resolve():
-                        part.unlink(missing_ok=True)
-                except OSError:
-                    continue
-            return [source_path]
+            _tighten_parts(valid_parts, reason="overhead", force_all=True)
+            valid_parts, total_bytes, _ = _collect_valid_parts(valid_parts)
+            if total_bytes > max_allowed:
+                logger.warning(
+                    "[split_for_delivery] Split output still above overhead cap after tightening (%s bytes > %s); honoring split anyway",
+                    total_bytes,
+                    max_allowed,
+                )
 
         return valid_parts
 
@@ -697,6 +830,21 @@ def split_for_delivery(
             output_dir,
             base_name,
             threshold_mb,
+            skip_optimization_under_threshold=skip_optimization_under_threshold,
+        )
+
+    if split_required and len(parts) <= 1:
+        logger.warning(
+            "[split_for_delivery] Primary split returned %s part; forcing binary split to honor threshold %.1fMB",
+            len(parts),
+            threshold_mb,
+        )
+        parts = split_pdf(
+            pdf_path,
+            output_dir,
+            base_name,
+            threshold_mb=threshold_mb,
+            progress_callback=progress_callback,
             skip_optimization_under_threshold=skip_optimization_under_threshold,
         )
 

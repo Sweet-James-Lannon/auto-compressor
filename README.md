@@ -38,7 +38,7 @@ Parallel compression is linear:
 
 ### 4) Size-safety guarantee
 - Compressed output is never intentionally returned worse than input.
-- Split delivery has a bloat guard and rejects materially inflated split results.
+- Split delivery prioritizes honoring requested split thresholds, with tightening/binary fallback when needed.
 
 ## What Is and Is Not Guaranteed
 ### Guaranteed
@@ -67,10 +67,10 @@ Parallel compression is linear:
 - `MAX_CHUNK_MB=50`
 - `MAX_PAGES_PER_CHUNK=600`
 - `SPLIT_THRESHOLD_MB=25` (request-level override still supported)
-- Split speed controls are code constants (no env required):
-  - `SPLIT_MINIMIZE_PARTS = False`
-  - `SPLIT_ADAPTIVE_MAX_ATTEMPTS = 3`
-  - `SPLIT_ENABLE_BINARY_FALLBACK = False`
+- Split controls support validated env overrides:
+  - `SPLIT_MINIMIZE_PARTS` (default `False`)
+  - `SPLIT_ADAPTIVE_MAX_ATTEMPTS` (default `3`)
+  - `SPLIT_ENABLE_BINARY_FALLBACK` (default `False`)
 - Request split threshold clamp in app: `5MB..50MB`
 
 ## Split Behavior

@@ -121,6 +121,7 @@ def _load_jobs() -> None:
         return
 
     restored = 0
+    restart_failed = 0
     with _job_lock:
         for item in payload:
             if not isinstance(item, dict):
@@ -128,11 +129,30 @@ def _load_jobs() -> None:
             job = _job_from_dict(item)
             if job is None:
                 continue
+            if _is_inflight_status(job.status):
+                job.status = "failed"
+                job.error = "Job interrupted by server restart. Please resubmit."
+                result = dict(job.result or {})
+                result.setdefault("error_type", "ServerRestarted")
+                result.setdefault(
+                    "error_message",
+                    "Job interrupted by server restart before completion. Please resubmit.",
+                )
+                job.result = result
+                job.progress = {
+                    "percent": 100,
+                    "stage": "failed",
+                    "message": "Interrupted by server restart",
+                }
+                restart_failed += 1
             _jobs[job.job_id] = job
             restored += 1
 
     if restored:
         logger.info("Restored %s job(s) from durable state", restored)
+    if restart_failed:
+        logger.warning("Marked %s in-flight restored job(s) as failed due to restart", restart_failed)
+        _persist_jobs()
 
 
 def create_job() -> str:
@@ -307,24 +327,27 @@ def _worker() -> None:
     while True:
         try:
             job_id, task_data = _work_queue.get()
-            update_job(job_id, "processing", progress={
-                "percent": 1,
-                "stage": "starting",
-                "message": "Starting worker",
-            })
-            logger.info(f"[{job_id}] Processing started")
-
-            if _processor is None:
-                update_job(job_id, "failed", error="No processor configured")
-                continue
-
             try:
-                _processor(job_id, task_data)
-            except Exception as e:
-                logger.exception(f"[{job_id}] Processing failed: {e}")
-                update_job(job_id, "failed", error=str(e))
+                update_job(job_id, "processing", progress={
+                    "percent": 1,
+                    "stage": "starting",
+                    "message": "Starting worker",
+                })
+                logger.info(f"[{job_id}] Processing started")
 
-            _work_queue.task_done()
+                if _processor is None:
+                    update_job(job_id, "failed", error="No processor configured")
+                else:
+                    try:
+                        _processor(job_id, task_data)
+                    except Exception as e:
+                        logger.exception(f"[{job_id}] Processing failed: {e}")
+                        update_job(job_id, "failed", error=str(e))
+            except Exception as e:
+                logger.exception(f"[{job_id}] Worker loop error: {e}")
+                update_job(job_id, "failed", error=str(e))
+            finally:
+                _work_queue.task_done()
 
         except Exception as e:
             logger.exception(f"Worker error: {e}")

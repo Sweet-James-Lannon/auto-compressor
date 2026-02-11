@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from exceptions import SplitError
-from utils import env_bool, env_choice, env_float, env_int, get_effective_cpu_count
+from settings import get_delivery_runtime_settings
+from utils import env_bool, env_choice, env_int, get_effective_cpu_count
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ LARGE_FILE_MAX_CHUNK_MB = float(os.environ.get("LARGE_FILE_MAX_CHUNK_MB", "75"))
 LARGE_FILE_MAX_PARALLEL_CHUNKS = int(os.environ.get("LARGE_FILE_MAX_PARALLEL_CHUNKS", "12"))
 
 PARALLEL_SPLIT_INFLATION_PCT = 0.02
-DELIVERY_SPLIT_SKIP_INFLATION_PCT = max(0.0, env_float("DELIVERY_SPLIT_SKIP_INFLATION_PCT", 0.70))
+DELIVERY_SPLIT_SKIP_INFLATION_PCT = get_delivery_runtime_settings().delivery_split_skip_inflation_pct
 
 SLA_MAX_PARALLEL_CHUNKS = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS", 8))
 SLA_MAX_PARALLEL_CHUNKS_LARGE = max(2, env_int("SLA_MAX_PARALLEL_CHUNKS_LARGE", 12))
@@ -445,7 +446,6 @@ def compress_parallel(
     target_chunk_mb: Optional[float] = None,
     max_chunk_mb: Optional[float] = None,
     input_page_count: Optional[int] = None,
-    allow_lossy: bool = False,
     micro_probe_delta: Optional[float] = None,
     micro_probe_success: bool = False,
     processing_profile: Optional[Dict[str, object]] = None,
@@ -679,7 +679,7 @@ def compress_parallel(
     final_parts: List[Path] = [merged_path]
     bloat_detected = False
     bloat_action: Optional[str] = None
-    delivery_split_skipped = False
+    delivery_split_guard_triggered = False
 
     combined_mb = merged_path.stat().st_size / (1024 * 1024)
 
@@ -704,24 +704,36 @@ def compress_parallel(
     elif split_enabled and effective_trigger is not None and combined_mb > effective_trigger:
         split_inflation_pct = split_inflation_ratio - 1.0
         if split_inflation_pct >= DELIVERY_SPLIT_SKIP_INFLATION_PCT:
-            delivery_split_skipped = True
+            delivery_split_guard_triggered = True
             logger.warning(
-                "[PARALLEL] Skipping compressed-output split: initial split inflation %.1f%% exceeds %.1f%% threshold",
+                "[PARALLEL] Initial split inflation %.1f%% exceeds %.1f%% threshold; proceeding anyway to honor split request",
                 split_inflation_pct * 100,
                 DELIVERY_SPLIT_SKIP_INFLATION_PCT * 100,
             )
-        else:
-            report_progress(80, "splitting", "Splitting compressed output...")
+        report_progress(80, "splitting", "Splitting compressed output...")
+        final_parts = split_for_delivery(
+            merged_path,
+            working_dir,
+            f"{base_name}_merged",
+            split_threshold_mb,
+            progress_callback=progress_callback,
+            skip_optimization_under_threshold=True,
+        )
+        if len(final_parts) <= 1 and original_size_mb > effective_trigger:
+            logger.warning(
+                "[PARALLEL] Compressed-output split produced %s part; splitting original output to honor request",
+                len(final_parts),
+            )
             final_parts = split_for_delivery(
-                merged_path,
+                input_path,
                 working_dir,
-                f"{base_name}_merged",
+                f"{base_name}_original",
                 split_threshold_mb,
                 progress_callback=progress_callback,
                 skip_optimization_under_threshold=True,
             )
-            if len(final_parts) > 1:
-                merged_path.unlink(missing_ok=True)
+        if len(final_parts) > 1:
+            merged_path.unlink(missing_ok=True)
 
     final_set = {part.resolve() for part in final_parts}
     for path in chunk_paths:
@@ -802,7 +814,7 @@ def compress_parallel(
         "bloat_detected": bloat_detected,
         "bloat_pct": bloat_pct,
         "bloat_action": bloat_action,
-        "delivery_split_skipped": delivery_split_skipped,
+        "delivery_split_guard_triggered": delivery_split_guard_triggered,
         "sla_exceeded": sla_exceeded,
         "early_terminated": False,
         "probe_bailout": False,
