@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 from PyPDF2 import PdfReader, PdfWriter
 
-import split_pdf
-from utils import get_file_size_mb
+import pdf_compressor.engine.split as split_pdf
+from pdf_compressor.core.utils import get_file_size_mb
 
 
 def _make_pdf(path: Path, pages: int) -> None:

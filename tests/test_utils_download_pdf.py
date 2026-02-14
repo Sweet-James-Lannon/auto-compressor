@@ -4,9 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from exceptions import DownloadError
-
-import utils
+from pdf_compressor.core.exceptions import DownloadError
+from pdf_compressor.core import utils
 
 
 class _FakeResponse:
@@ -34,8 +33,8 @@ class TestDownloadPdf(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "file.pdf"
-            with patch("utils.requests.get", return_value=response), \
-                 patch("utils._resolve_hostname_ips", return_value=[ipaddress.ip_address("93.184.216.34")]):
+            with patch("pdf_compressor.core.utils.requests.get", return_value=response), \
+                 patch("pdf_compressor.core.utils._resolve_hostname_ips", return_value=[ipaddress.ip_address("93.184.216.34")]):
                 with self.assertRaises(DownloadError) as ctx:
                     utils.download_pdf("https://example.com/file.pdf", out)
                 self.assertEqual(ctx.exception.status_code, 502)
@@ -49,8 +48,8 @@ class TestDownloadPdf(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "file.pdf"
-            with patch("utils.requests.get", return_value=response), \
-                 patch("utils._resolve_hostname_ips", return_value=[ipaddress.ip_address("93.184.216.34")]):
+            with patch("pdf_compressor.core.utils.requests.get", return_value=response), \
+                 patch("pdf_compressor.core.utils._resolve_hostname_ips", return_value=[ipaddress.ip_address("93.184.216.34")]):
                 with self.assertRaises(DownloadError) as ctx:
                     utils.download_pdf("https://example.com/file.pdf", out)
                 self.assertEqual(ctx.exception.status_code, 502)
@@ -64,8 +63,8 @@ class TestDownloadPdf(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "file.pdf"
-            with patch("utils.requests.get", return_value=response), \
-                 patch("utils._resolve_hostname_ips", return_value=[ipaddress.ip_address("93.184.216.34")]):
+            with patch("pdf_compressor.core.utils.requests.get", return_value=response), \
+                 patch("pdf_compressor.core.utils._resolve_hostname_ips", return_value=[ipaddress.ip_address("93.184.216.34")]):
                 utils.download_pdf("https://example.com/file.pdf", out)
                 self.assertTrue(out.exists())
                 self.assertEqual(out.stat().st_size, 10)
@@ -78,8 +77,8 @@ class TestDownloadPdf(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "file.pdf"
-            with patch("utils.requests.get", return_value=response), \
-                 patch("utils._resolve_hostname_ips", return_value=[ipaddress.ip_address("93.184.216.34")]):
+            with patch("pdf_compressor.core.utils.requests.get", return_value=response), \
+                 patch("pdf_compressor.core.utils._resolve_hostname_ips", return_value=[ipaddress.ip_address("93.184.216.34")]):
                 utils.download_pdf("https://example.com/file.pdf", out)
                 self.assertTrue(out.exists())
                 self.assertEqual(out.stat().st_size, 12)

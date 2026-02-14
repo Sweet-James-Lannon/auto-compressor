@@ -100,7 +100,7 @@ Note:
 ## Pre-Push Validation (Recommended)
 Before merging to `main`, run:
 ```bash
-python3 -m py_compile app.py compress.py compress_ghostscript.py split_pdf.py pdf_diagnostics.py job_queue.py
+python3 -m py_compile app.py $(find pdf_compressor -name '*.py')
 python3 -m pytest -q
 ```
 Then benchmark your real PDFs (same files you use in production) and compare:
@@ -110,10 +110,37 @@ Then benchmark your real PDFs (same files you use in production) and compare:
 - page match
 
 ## Code Map
-- `app.py` - API, queue wiring, dashboard/health snapshots
-- `job_queue.py` - async queue + optional local durable state file
-- `compress.py` - serial/parallel routing and result shaping
-- `compress_ghostscript.py` - Ghostscript compression + parallel pipeline
-- `split_pdf.py` - split/merge utilities for delivery constraints
-- `pdf_diagnostics.py` - fingerprinting + processing profile estimation
+- `app.py` - compatibility entrypoint (`gunicorn app:app`)
+- `pdf_compressor/factory.py` - Flask app factory + blueprint registration
+- `pdf_compressor/bootstrap.py` - one-time startup of cleanup daemon + async workers
+- `pdf_compressor/routes/web_routes.py` - `/`, `/health`, `/favicon.ico`
+- `pdf_compressor/routes/api_routes.py` - API endpoints (`/compress-async`, `/status/<job_id>`, etc.)
+- `pdf_compressor/services/compression_service.py` - request handlers + orchestration helpers
+- `pdf_compressor/services/status_service.py` - status/check/diagnose wrappers
+- `pdf_compressor/services/file_service.py` - file tracking/cleanup wrappers
+- `pdf_compressor/workers/job_queue.py` - async queue + worker threads
+- `pdf_compressor/engine/compress.py` - serial/parallel routing and result shaping
+- `pdf_compressor/engine/ghostscript.py` - Ghostscript compression + parallel pipeline
+- `pdf_compressor/engine/split.py` - split/merge utilities for delivery constraints
+- `pdf_compressor/engine/pdf_diagnostics.py` - fingerprinting + processing profile estimation
+- `pdf_compressor/core/utils.py` - shared helpers + download safeguards
+- `pdf_compressor/core/settings.py` - runtime setting resolution and guardrails
+- `pdf_compressor/core/exceptions.py` - typed exceptions across layers
 - `scripts/benchmark_compress.py` - reproducible benchmark harness
+
+## Package Layout
+```text
+pdf_compressor/
+  factory.py
+  config.py
+  bootstrap.py
+  routes/
+  services/
+  workers/
+  engine/
+  core/
+  templates/
+```
+
+Note:
+- Root modules like `compress.py` and `split_pdf.py` are temporary compatibility wrappers that re-export from `pdf_compressor/*`.

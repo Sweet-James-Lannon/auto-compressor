@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from compress import compress_pdf  # noqa: E402
+from pdf_compressor.engine.compress import compress_pdf  # noqa: E402
 
 try:
     from PyPDF2 import PdfReader
